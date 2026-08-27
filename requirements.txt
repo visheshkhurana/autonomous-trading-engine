@@ -1,0 +1,27 @@
+# Runtime dependencies for the trader package.
+#
+# Deliberately short. The ledger is stdlib sqlite3, the supervisor is stdlib
+# asyncio, and every price is a stdlib Decimal — nothing here is a numerical
+# library, because a float that has been through a third party is still a float.
+#
+# Install:  python3 -m pip install -r requirements.txt
+# Use python3. This project has no `python` binary.
+
+# --- the API surface -------------------------------------------------------
+fastapi>=0.115,<1.0
+pydantic>=2.7,<3.0
+
+# ASGI server. Not imported by any module — `runner.main()` imports it lazily
+# and prints instructions if it is missing, so the engine can still be run
+# alone with `python3 -m runner --no-api` on a box without it.
+uvicorn>=0.30,<1.0
+
+# --- live crypto only ------------------------------------------------------
+# adapters/okx.py takes its exchange by INJECTION and never imports ccxt, so
+# the whole test suite and all of paper mode run without this installed.
+# Required only when you construct a real OkxAdapter against a real exchange.
+ccxt>=4.3
+
+# --- tests -----------------------------------------------------------------
+# Run: python3 -m pytest tests/ -q
+pytest>=8.0

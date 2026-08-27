@@ -1,0 +1,963 @@
+"""
+OKX spot adapter (ccxt).
+
+Everything venue-specific about OKX lives here: symbol shapes, precision,
+minimum order sizes, fee reporting, and the fact that a spot account reports
+BALANCES, not positions.
+
+Four things in this file exist because their absence cost real money before:
+
+1. Precision and minimums come from the loaded ccxt market, never from a
+   constant in this file. The previous system carried hardcoded minimums and
+   six of them had drifted away from the venue.
+2. Symbol resolution walks a quote-currency fallback chain and is filtered
+   against the loaded markets FIRST. ccxt raises BadSymbol on an unknown pair,
+   and one delisted name would otherwise take down a whole batch of intents.
+3. equity() prices hard-pegged fiat from a table. An AED balance with no crypto
+   pair used to make the total unpriceable, which nulled equity and blocked
+   every buy indefinitely.
+4. A MARKET order re-checks the mark against the price the strategy decided on
+   and refuses to send if the market has run away from it.
+
+The adapter never invents a number. Anything it cannot establish is None, an
+explicit rejection carrying its reason, or an exception -- never a zero, never
+an empty list, never a "close enough" price.
+
+The exchange object is injected. Nothing here reads credentials, and nothing
+here is executed against a real venue by its tests.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import re
+import time
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from uuid import uuid4
+
+from core.types import (
+    AssetClass, Fill, Instrument, Intent, Mode, OrderRef, OrderStatus,
+    OrderType, Position, Side,
+)
+
+UTC = dt.timezone.utc
+
+__all__ = [
+    "OkxAdapter", "EquityBreakdown", "EquityComponent", "DriftCheck",
+    "OkxAdapterError", "MarketsUnavailable", "OrderSubmitFailed",
+    "OrderStateUnknown", "UnknownOrder", "CostBasisUnavailable",
+    "QUOTE_FALLBACK", "STABLE_FACE_VALUE", "FIAT_PER_USD",
+]
+
+# Tried in this order. USDT is where OKX liquidity is; USD and USDC exist for
+# names that were never listed against USDT or have been moved off it.
+QUOTE_FALLBACK: tuple[str, ...] = ("USDT", "USD", "USDC")
+
+# Counted at face value against a dollar base. This accepts depeg risk
+# deliberately: pricing them through a ticker would make total equity depend on
+# a network call for a balance already known to be ~1:1, and a failed call
+# there is what nulls equity.
+STABLE_FACE_VALUE: frozenset[str] = frozenset({
+    "USDT", "USDC", "USD", "DAI", "TUSD", "USDP", "PYUSD", "FDUSD",
+})
+
+# HARD pegs only, expressed the way the peg is quoted: units per USD.
+# A floating rate in a static table goes stale silently and shows up later as
+# an equity drift nobody can explain, so EUR/INR/GBP are deliberately absent --
+# a floating fiat balance is priced live or reported unpriceable.
+# HKD is also absent on purpose: it is a 7.75-7.85 band, not a peg.
+FIAT_PER_USD: Mapping[str, Decimal] = {
+    "AED": Decimal("3.6725"),   # UAE dirham, unchanged since 1997
+    "SAR": Decimal("3.75"),     # Saudi riyal
+}
+
+_CLIENT_ID_RE = re.compile(r"[^A-Za-z0-9]")
+
+
+class OkxAdapterError(RuntimeError):
+    """Base class. Every subclass means 'I could not establish this', never
+    'nothing happened'."""
+
+
+class MarketsUnavailable(OkxAdapterError):
+    """Markets could not be loaded. Distinct from 'this pair is not listed' --
+    with no market table we know nothing about any pair."""
+
+
+class OrderSubmitFailed(OkxAdapterError):
+    """create_order did not return a usable order id. An order MAY exist at the
+    venue. Deliberately not a REJECTED OrderRef: 'rejected' reads as 'no order
+    exists' and would invite a retry that doubles the position."""
+
+
+class OrderStateUnknown(OkxAdapterError):
+    """The order exists and we cannot read its state. Carries the order id so a
+    caller can reconcile."""
+
+    def __init__(self, order_id: str, message: str) -> None:
+        super().__init__(f"{message} (order_id={order_id!r})")
+        self.order_id = order_id
+
+
+class UnknownOrder(OkxAdapterError):
+    """cancel() was handed an id this adapter never placed, so the symbol OKX
+    requires for a cancel is unknown."""
+
+
+class CostBasisUnavailable(OkxAdapterError):
+    """A venue spot balance carries no entry price. See OkxAdapter.positions."""
+
+
+@dataclass(frozen=True)
+class DriftCheck:
+    reference: Decimal
+    mark: Decimal
+    drift_pct: Decimal
+    limit_pct: Decimal
+
+    @property
+    def ok(self) -> bool:
+        return self.drift_pct <= self.limit_pct
+
+
+@dataclass(frozen=True)
+class EquityComponent:
+    currency: str
+    amount: Decimal
+    rate: Decimal            # value of ONE unit in the base currency
+    value: Decimal
+    source: str              # base | stable | fiat-peg | market:SYMBOL
+
+
+@dataclass(frozen=True)
+class EquityBreakdown:
+    """Why this is not just a Decimal: a total that silently omits a balance is
+    indistinguishable from a drawdown, and that reads as a loss the circuit
+    acts on. So the total is None whenever anything was left out, and the
+    reason travels with it."""
+
+    base_currency: str
+    total: Optional[Decimal]
+    components: tuple[EquityComponent, ...] = ()
+    unpriceable: tuple[tuple[str, Decimal], ...] = ()
+    excluded: tuple[tuple[str, Decimal], ...] = ()
+    reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # The invariant that makes a short total unrepresentable.
+        if self.unpriceable and self.total is not None:
+            raise ValueError(
+                "equity total must be None while any balance is unpriceable; "
+                f"unpriced: {[c for c, _ in self.unpriceable]}"
+            )
+        if self.total is None and not self.reason:
+            raise ValueError("an unknown equity must carry its reason")
+
+
+def _dec_opt(value: Any) -> Optional[Decimal]:
+    """Decimal, or None for a genuinely absent field. A value that is present
+    but unparseable raises -- turning it into 0 here would fabricate a price or
+    a size."""
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, bool):
+        raise TypeError("refusing to read a bool as a number")
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return Decimal(text)
+        except InvalidOperation as exc:
+            raise ValueError(f"cannot read a number from {value!r}") from exc
+    raise TypeError(f"cannot read a number from {type(value).__name__}")
+
+
+def _client_order_id(idempotency_key: str) -> Optional[str]:
+    """OKX rejects clOrdId containing punctuation or longer than 32 chars, and
+    that rejection arrives looking like an ordinary venue rejection."""
+    cleaned = _CLIENT_ID_RE.sub("", idempotency_key or "")[:32]
+    return cleaned or None
+
+
+def _step_from_precision(value: Any) -> Optional[Decimal]:
+    """A ccxt precision field as a step size.
+
+    ccxt reports precision either as a step (0.00000001) or as a digit count
+    (8), depending on the exchange's precisionMode, so both shapes are read.
+    Informational only: every real quantization goes through the exchange's own
+    amount_to_precision / price_to_precision, never through this.
+    """
+    number = _dec_opt(value)
+    if number is None or number <= 0:
+        return None
+    if number >= 1 and number == number.to_integral_value():
+        return Decimal(1).scaleb(-int(number))
+    return number
+
+
+def _precision_digits(value: Any) -> Optional[int]:
+    step = _step_from_precision(value)
+    if step is None:
+        return None
+    exponent = step.normalize().as_tuple().exponent
+    return max(0, -int(exponent))
+
+
+class OkxAdapter:
+    """BrokerAdapter for OKX spot.
+
+    `exchange` is any object with the ccxt surface used here. It is injected so
+    this class can be exercised without a venue and without credentials.
+    """
+
+    asset_class: AssetClass = AssetClass.CRYPTO
+
+    def __init__(
+        self,
+        exchange: Any,
+        *,
+        mode: Mode,
+        base_currency: str = "USDT",
+        max_drift_pct: Decimal = Decimal("0.5"),
+        quote_fallback: Sequence[str] = QUOTE_FALLBACK,
+        require_reference_price: bool = True,
+        cancel_on_timeout: bool = True,
+        poll_interval_s: float = 0.5,
+        ignore_currencies: Iterable[str] = (),
+        cost_basis: Optional[Callable[[str], Optional[Decimal]]] = None,
+        extra_params: Optional[Mapping[str, Any]] = None,
+        sandbox: bool = False,
+        now: Callable[[], dt.datetime] = lambda: dt.datetime.now(UTC),
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        # This class reaches a real venue. A PAPER stamp on a real fill is how a
+        # live book gets recorded as paper and then traded against twice, so
+        # PAPER is only legal when the caller states the exchange is OKX demo.
+        if mode is Mode.PAPER and not sandbox:
+            raise ValueError(
+                "OkxAdapter places real orders; mode=PAPER is only permitted "
+                "with sandbox=True (an OKX demo-trading exchange). Use a paper "
+                "adapter instead of mis-stamping live fills."
+            )
+        if max_drift_pct < 0:
+            raise ValueError("max_drift_pct must be >= 0")
+        if not quote_fallback:
+            raise ValueError("quote_fallback must list at least one quote currency")
+
+        self._ex = exchange
+        self.mode = mode
+        self.sandbox = sandbox
+        self.base_currency = base_currency.upper()
+        self.max_drift_pct = max_drift_pct
+        self._quotes = tuple(q.upper() for q in quote_fallback)
+        self._require_reference_price = require_reference_price
+        self._cancel_on_timeout = cancel_on_timeout
+        self._poll_interval_s = poll_interval_s
+        self._ignore = frozenset(c.upper() for c in ignore_currencies)
+        self._cost_basis = cost_basis
+        self._extra_params = dict(extra_params or {})
+        self._now = now
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._markets: Optional[dict[str, Any]] = None
+        # OKX needs the symbol to cancel, and the protocol's cancel() only gets
+        # an id, so the mapping is kept here for orders this adapter placed.
+        self._order_symbols: dict[str, str] = {}
+
+    # ---------------------------------------------------------------- markets
+
+    def load_markets(self, reload: bool = False) -> int:
+        markets = self._ex.load_markets(reload) if reload else self._ex.load_markets()
+        if not isinstance(markets, dict) or not markets:
+            markets = getattr(self._ex, "markets", None)
+        # An exchange with zero markets is a failed read, not an empty venue.
+        # Accepting {} here would make every symbol resolve to "not listed" and
+        # quietly stand the whole strategy down.
+        if not isinstance(markets, dict) or not markets:
+            raise MarketsUnavailable(
+                "load_markets returned no markets; treating this as a failed "
+                "read rather than an exchange that lists nothing"
+            )
+        self._markets = markets
+        return len(markets)
+
+    @property
+    def markets(self) -> dict[str, Any]:
+        if self._markets is None:
+            self.load_markets()             # raises rather than leaving None
+        if self._markets is None:
+            raise MarketsUnavailable("market table is still unset after a load")
+        return self._markets
+
+    def _usable(self, symbol: str) -> bool:
+        market = self.markets.get(symbol)
+        if not isinstance(market, dict):
+            return False
+        # `spot is not True` also excludes OKX swaps such as BTC/USDT:USDT.
+        # Answering a spot intent with a perpetual is an unbounded-leverage bug.
+        if market.get("spot") is not True:
+            return False
+        if market.get("active") is False:      # delisted; absent means unknown, allow
+            return False
+        return True
+
+    def resolve_symbol(self, instrument: Instrument) -> Optional[str]:
+        """The ccxt market symbol to trade, or None when the venue lists no
+        active spot market for this instrument.
+
+        None is a determinate answer ("not listed") so one dead name cannot
+        drop a batch; an unreadable market table raises instead.
+        """
+        for candidate in self._candidates(instrument):
+            if self._usable(candidate):
+                return candidate
+        return None
+
+    def _candidates(self, instrument: Instrument) -> list[str]:
+        broker_id = (instrument.broker_id or "").strip().upper()
+        out: list[str] = []
+        if broker_id:
+            out.append(broker_id)
+        if "/" in broker_id:
+            base = broker_id.split("/", 1)[0]
+        else:
+            base = broker_id or instrument.symbol.strip().upper()
+        base = base.split(":", 1)[0]           # tolerate a swap-shaped broker_id
+        for quote in self._quotes:
+            out.append(f"{base}/{quote}")
+        seen: set[str] = set()
+        return [s for s in out if s and not (s in seen or seen.add(s))]
+
+    def instrument_for(self, currency: str, quote: Optional[str] = None) -> Optional[Instrument]:
+        """An Instrument for a held currency, with precision read off the venue.
+
+        Walks the same quote fallback chain as resolve_symbol, so a coin listed
+        only against USD still resolves instead of looking unheld.
+        """
+        quotes = (quote.upper(),) if quote else (self.base_currency,) + self._quotes
+        symbol = next(
+            (s for s in (f"{currency.upper()}/{q}" for q in quotes) if self._usable(s)),
+            None,
+        )
+        if symbol is None:
+            return None
+        market = self.markets[symbol]
+        precision = market.get("precision") or {}
+        limits = market.get("limits") or {}
+        min_cost = _dec_opt((limits.get("cost") or {}).get("min")) or Decimal("0")
+        return Instrument(
+            symbol=currency.upper(),
+            asset_class=AssetClass.CRYPTO,
+            broker_id=symbol,
+            qty_precision=_precision_digits(precision.get("amount")) or 8,
+            tick_size=_step_from_precision(precision.get("price")) or Decimal("0.01"),
+            min_notional=min_cost,
+        )
+
+    # ------------------------------------------------------------ quantization
+
+    def _quantize_amount(self, symbol: str, qty: Decimal) -> Decimal:
+        # ccxt's precision helpers take a number and return a string; the string
+        # is immediately re-wrapped in Decimal so no float arithmetic survives.
+        return Decimal(str(self._ex.amount_to_precision(symbol, float(qty))))
+
+    def _quantize_price(self, symbol: str, price: Decimal) -> Decimal:
+        return Decimal(str(self._ex.price_to_precision(symbol, float(price))))
+
+    def _min_amount(self, symbol: str) -> Optional[Decimal]:
+        limits = (self.markets[symbol].get("limits") or {})
+        return _dec_opt((limits.get("amount") or {}).get("min"))
+
+    def _min_cost(self, symbol: str, instrument: Instrument) -> Optional[Decimal]:
+        """The venue's own minimum notional, tightened (never loosened) by any
+        minimum the caller put on the Instrument."""
+        limits = (self.markets[symbol].get("limits") or {})
+        venue_min = _dec_opt((limits.get("cost") or {}).get("min"))
+        caller_min = instrument.min_notional if instrument.min_notional > 0 else None
+        candidates = [m for m in (venue_min, caller_min) if m is not None]
+        return max(candidates) if candidates else None
+
+    # ------------------------------------------------------------------ quotes
+
+    def _ticker_price(self, symbol: str) -> Optional[Decimal]:
+        ticker = self._ex.fetch_ticker(symbol)
+        if not isinstance(ticker, dict):
+            return None
+        for key in ("last", "close"):
+            price = _dec_opt(ticker.get(key))
+            if price is not None and price > 0:
+                return price
+        bid, ask = _dec_opt(ticker.get("bid")), _dec_opt(ticker.get("ask"))
+        if bid and ask and bid > 0 and ask > 0:
+            return (bid + ask) / 2
+        return None
+
+    def quote(self, instrument: Instrument) -> Optional[Decimal]:
+        """Last price in the quote currency, or None when the venue has no
+        price for it.
+
+        A transport failure propagates rather than becoming None: strategies
+        read None as "skip this name", and a network outage reading as a calm
+        market is how a book goes unmanaged while everything looks fine.
+        """
+        symbol = self.resolve_symbol(instrument)
+        if symbol is None:
+            return None
+        return self._ticker_price(symbol)
+
+    # ------------------------------------------------------------------ equity
+
+    def _rate_to_base(self, currency: str) -> tuple[Optional[Decimal], str]:
+        """Value of one unit of `currency` in the base currency, plus its
+        source. (None, reason) when it cannot be established."""
+        currency = currency.upper()
+        if currency == self.base_currency:
+            return Decimal("1"), "base"
+
+        # Face value and the peg table are only meaningful against a dollar
+        # base. Against a BTC base they would be nonsense, so fall through.
+        dollar_base = self.base_currency in STABLE_FACE_VALUE
+        if dollar_base and currency in STABLE_FACE_VALUE:
+            return Decimal("1"), "stable"
+        if dollar_base and currency in FIAT_PER_USD:
+            return Decimal("1") / FIAT_PER_USD[currency], "fiat-peg"
+
+        direct = f"{currency}/{self.base_currency}"
+        if self._usable(direct):
+            price = self._ticker_price(direct)
+            if price is not None and price > 0:
+                return price, f"market:{direct}"
+            return None, f"{direct} returned no usable price"
+
+        inverse = f"{self.base_currency}/{currency}"
+        if self._usable(inverse):
+            price = self._ticker_price(inverse)
+            if price is not None and price > 0:
+                return Decimal("1") / price, f"market:{inverse}"
+            return None, f"{inverse} returned no usable price"
+
+        # Last resort: one hop through a fallback quote whose own value in the
+        # base currency is known for certain (a stable, or a hard peg). A coin
+        # listed only against USD must not null the whole equity read.
+        for quote in self._quotes:
+            if quote == self.base_currency:
+                continue
+            if dollar_base and quote in STABLE_FACE_VALUE:
+                quote_rate = Decimal("1")
+            elif dollar_base and quote in FIAT_PER_USD:
+                quote_rate = Decimal("1") / FIAT_PER_USD[quote]
+            else:
+                continue                      # an unpriceable bridge is no bridge
+            bridge = f"{currency}/{quote}"
+            if not self._usable(bridge):
+                continue
+            price = self._ticker_price(bridge)
+            if price is not None and price > 0:
+                return price * quote_rate, f"market:{bridge}"
+            return None, f"{bridge} returned no usable price"
+
+        return None, f"no active spot market against {self.base_currency}"
+
+    def equity_breakdown(self) -> EquityBreakdown:
+        try:
+            raw = self._ex.fetch_balance()
+        except Exception as exc:
+            # Narrow, deliberate: the ONLY conversion allowed here is failure ->
+            # None, which is the documented "cannot establish" signal that fails
+            # the risk circuit closed. The reason travels with it.
+            return EquityBreakdown(
+                self.base_currency, None,
+                reason=f"fetch_balance failed: {exc!r}",
+            )
+
+        totals = raw.get("total") if isinstance(raw, dict) else None
+        if not isinstance(totals, dict):
+            return EquityBreakdown(
+                self.base_currency, None,
+                reason="fetch_balance returned no 'total' balance map",
+            )
+        if not totals:
+            # A wallet listing zero currencies is indistinguishable from a
+            # key that lost its read permission. Zero equity reads as a 100%
+            # drawdown, so this refuses to be that number.
+            return EquityBreakdown(
+                self.base_currency, None,
+                reason="fetch_balance returned an empty balance map; a venue "
+                       "listing no currencies at all is treated as a failed read",
+            )
+
+        components: list[EquityComponent] = []
+        unpriceable: list[tuple[str, Decimal]] = []
+        excluded: list[tuple[str, Decimal]] = []
+        notes: list[str] = []
+
+        for currency, value in sorted(totals.items()):
+            amount = _dec_opt(value)
+            if amount is None or amount == 0:
+                continue
+            code = str(currency).upper()
+            if code in self._ignore:
+                excluded.append((code, amount))
+                continue
+            try:
+                rate, source = self._rate_to_base(code)
+            except Exception as exc:
+                rate, source = None, f"pricing raised {exc!r}"
+            if rate is None:
+                unpriceable.append((code, amount))
+                notes.append(f"{code}: {source}")
+                continue
+            components.append(EquityComponent(code, amount, rate, amount * rate, source))
+
+        if unpriceable:
+            return EquityBreakdown(
+                self.base_currency, None, tuple(components), tuple(unpriceable),
+                tuple(excluded),
+                reason="unpriceable balances (" + "; ".join(notes) + ")",
+            )
+
+        total = sum((c.value for c in components), Decimal("0"))
+        return EquityBreakdown(
+            self.base_currency, total, tuple(components), (), tuple(excluded),
+        )
+
+    def equity(self) -> Optional[Decimal]:
+        """Account value in the base currency, or None if it cannot be
+        established. Call equity_breakdown() for the reason behind a None."""
+        return self.equity_breakdown().total
+
+    # --------------------------------------------------------------- holdings
+
+    def holdings(self) -> dict[str, Decimal]:
+        """Non-zero venue balances. Raw truth, no pricing, no interpretation."""
+        raw = self._ex.fetch_balance()
+        totals = raw.get("total") if isinstance(raw, dict) else None
+        if not isinstance(totals, dict) or not totals:
+            raise OkxAdapterError(
+                "fetch_balance returned no balance map; refusing to report an "
+                "empty wallet on an unreadable response"
+            )
+        out: dict[str, Decimal] = {}
+        for currency, value in totals.items():
+            amount = _dec_opt(value)
+            if amount is not None and amount != 0:
+                out[str(currency).upper()] = amount
+        return out
+
+    def positions(self) -> Sequence[Position]:
+        """Venue holdings as Positions.
+
+        OKX spot reports balances, which carry a quantity but no entry price,
+        and Position.avg_price is not optional. Rather than fill it with the
+        current mark -- a number that looks like a cost basis and would make
+        every P&L wrong -- this requires a `cost_basis` provider (normally
+        backed by the PositionStore) and raises when one is missing. An empty
+        list here would be read as "flat" while coins are actually held.
+        """
+        if self._cost_basis is None:
+            raise CostBasisUnavailable(
+                "OkxAdapter.positions() needs a cost_basis provider: OKX spot "
+                "balances carry no entry price. Use holdings() for venue "
+                "quantities, or wire cost_basis= from the PositionStore."
+            )
+        out: list[Position] = []
+        for currency, amount in sorted(self.holdings().items()):
+            # The base currency and stables are cash, not positions.
+            if currency == self.base_currency or currency in STABLE_FACE_VALUE \
+                    or currency in FIAT_PER_USD:
+                continue
+            instrument = self.instrument_for(currency)
+            if instrument is None:
+                raise CostBasisUnavailable(
+                    f"holding {amount} {currency} has no active spot market "
+                    f"against {self.base_currency}; it cannot be reported as a "
+                    "position and must not be silently dropped"
+                )
+            basis = self._cost_basis(currency)
+            if basis is None:
+                raise CostBasisUnavailable(
+                    f"no cost basis for {currency} ({amount} held); refusing to "
+                    "report a position with a fabricated entry price"
+                )
+            out.append(Position(
+                instrument=instrument, qty=amount, avg_price=basis,
+                mode=self.mode, strategy_id="okx:venue",
+            ))
+        return tuple(out)
+
+    # ----------------------------------------------------------- drift guard
+
+    def drift_check(self, symbol: str, reference: Decimal) -> DriftCheck:
+        """How far the mark has moved from the price the strategy decided on."""
+        if reference <= 0:
+            raise ValueError("reference price must be > 0")
+        mark = self._ticker_price(symbol)
+        if mark is None:
+            raise OkxAdapterError(f"{symbol}: no usable mark price for the drift guard")
+        drift = abs(mark - reference) / reference * Decimal("100")
+        return DriftCheck(reference, mark, drift, self.max_drift_pct)
+
+    # ---------------------------------------------------------------- placing
+
+    def place(self, intent: Intent, timeout_s: float = 30.0) -> OrderRef:
+        if intent.instrument.asset_class is not AssetClass.CRYPTO:
+            raise ValueError(
+                f"OkxAdapter cannot place {intent.instrument.asset_class} orders"
+            )
+
+        symbol = self.resolve_symbol(intent.instrument)
+        if symbol is None:
+            return self._unplaced(
+                intent,
+                f"{intent.instrument.symbol}: no active OKX spot market against "
+                f"any of {', '.join(self._quotes)}",
+            )
+
+        reference = intent.limit_price
+        if intent.order_type is OrderType.MARKET:
+            if reference is None:
+                if self._require_reference_price:
+                    return self._unplaced(
+                        intent,
+                        "MARKET intent carries no reference price, so the drift "
+                        "guard cannot run; refusing to send an unbounded order",
+                    )
+                try:
+                    mark = self._ticker_price(symbol)
+                except Exception as exc:
+                    return self._unplaced(intent, f"ticker fetch failed: {exc!r}")
+                if mark is None or mark <= 0:
+                    return self._unplaced(intent, f"{symbol}: no usable mark price")
+                trade_price = mark
+            else:
+                try:
+                    check = self.drift_check(symbol, reference)
+                except Exception as exc:
+                    # No order was created, so a rejection here states a fact.
+                    return self._unplaced(
+                        intent, f"drift guard could not price {symbol}: {exc!r}"
+                    )
+                if not check.ok:
+                    return self._unplaced(
+                        intent,
+                        f"price drift {check.drift_pct:.4f}% from reference "
+                        f"{check.reference} to mark {check.mark} exceeds "
+                        f"{check.limit_pct}%",
+                    )
+                trade_price = check.mark
+        else:
+            # Intent.__post_init__ guarantees this; re-checked rather than
+            # asserted because `python -O` strips asserts and a None here would
+            # become a market order in all but name.
+            if reference is None:
+                raise ValueError("LIMIT intent reached the adapter with no limit price")
+            # No drift check: the limit price is itself the bound.
+            trade_price = self._quantize_price(symbol, reference)
+            if trade_price <= 0:
+                return self._unplaced(
+                    intent, f"limit price {reference} quantized to {trade_price}"
+                )
+
+        amount = self._quantize_amount(symbol, intent.qty)
+        if amount <= 0:
+            return self._unplaced(
+                intent,
+                f"qty {intent.qty} quantized to {amount} at the venue's amount "
+                "precision",
+            )
+        min_amount = self._min_amount(symbol)
+        if min_amount is not None and amount < min_amount:
+            return self._unplaced(
+                intent, f"amount {amount} below the venue minimum {min_amount}"
+            )
+        min_cost = self._min_cost(symbol, intent.instrument)
+        notional = amount * trade_price
+        if min_cost is not None and notional < min_cost:
+            return self._unplaced(
+                intent,
+                f"notional {notional} below the minimum {min_cost} for {symbol}",
+            )
+
+        params: dict[str, Any] = dict(self._extra_params)
+        if intent.order_type is OrderType.MARKET and intent.side is Side.BUY:
+            # OKX's raw API defaults a spot market BUY to tgtCcy=quote_ccy, in
+            # which `amount` means QUOTE units. Stated explicitly because a
+            # silent flip buys 0.05 USDT of BTC instead of 0.05 BTC -- or, on a
+            # sell-sized number, spends the whole balance.
+            params["tgtCcy"] = "base_ccy"
+        client_id = _client_order_id(intent.idempotency_key)
+        if client_id:
+            params["clOrdId"] = client_id
+
+        price_arg = float(trade_price) if intent.order_type is OrderType.LIMIT else None
+        try:
+            created = self._ex.create_order(
+                symbol, intent.order_type.value, intent.side.value,
+                float(amount), price_arg, params,
+            )
+        except Exception as exc:
+            raise OrderSubmitFailed(
+                f"create_order({symbol}, {intent.side.value}, {amount}) raised "
+                f"{exc!r}; an order may or may not exist at OKX. Reconcile "
+                "before retrying -- this is deliberately not a rejection."
+            ) from exc
+
+        order_id = str(created.get("id") or "") if isinstance(created, dict) else ""
+        if not order_id:
+            raise OrderSubmitFailed(
+                f"create_order({symbol}) returned no order id ({created!r}); the "
+                "order cannot be tracked and may be live"
+            )
+        self._order_symbols[order_id] = symbol
+        return self._await_terminal(intent, symbol, order_id, amount, timeout_s)
+
+    def _await_terminal(
+        self, intent: Intent, symbol: str, order_id: str,
+        requested: Decimal, timeout_s: float,
+    ) -> OrderRef:
+        deadline = self._monotonic() + timeout_s
+        last_error: Optional[BaseException] = None
+
+        while True:
+            try:
+                order = self._ex.fetch_order(order_id, symbol)
+                last_error = None
+            except Exception as exc:
+                # Retried until the deadline: a blip should not become a
+                # verdict. If it never clears, this raises rather than guessing.
+                last_error, order = exc, None
+            if isinstance(order, dict):
+                status = self._map_status(order, requested)
+                if status is not None:
+                    return self._build_ref(intent, order, order_id, status)
+            if self._monotonic() >= deadline:
+                break
+            self._sleep(self._poll_interval_s)
+
+        notes = [f"still working after {timeout_s}s"]
+
+        if last_error is not None:
+            # One more read before escalating. A poll window lost to a transient
+            # outage is not evidence about the order, and the venue's own view
+            # is cheap; only a read that also fails is genuinely unknown.
+            try:
+                recovered = self._ex.fetch_order(order_id, symbol)
+            except Exception as exc:
+                raise OrderStateUnknown(
+                    order_id,
+                    f"could not read the state of a live {symbol} order within "
+                    f"{timeout_s}s: {exc!r}",
+                ) from exc
+            unreadable = f"state was unreadable during the window: {last_error!r}"
+            status = self._map_status(recovered, requested)
+            if status is not None:
+                return self._build_ref(intent, recovered, order_id, status, [unreadable])
+            notes.append(unreadable)
+        if self._cancel_on_timeout:
+            try:
+                self._ex.cancel_order(order_id, symbol)
+            except Exception as exc:
+                notes.append(f"cancel after timeout failed: {exc!r}")
+        try:
+            final = self._ex.fetch_order(order_id, symbol)
+        except Exception as exc:
+            raise OrderStateUnknown(
+                order_id, f"timed out and could not confirm final state: {exc!r}"
+            ) from exc
+
+        status = self._map_status(final, requested)
+        if status is None:
+            # Genuinely still open at the venue. TIMEOUT says exactly that.
+            notes.append("order is still open at OKX")
+            status = OrderStatus.TIMEOUT
+        return self._build_ref(intent, final, order_id, status, notes)
+
+    @staticmethod
+    def _map_status(order: Mapping[str, Any], requested: Decimal) -> Optional[OrderStatus]:
+        """Terminal status, or None while the order is still working.
+
+        PARTIAL is never returned: OrderStatus.terminal excludes it, and
+        OrderRef refuses a non-terminal status. A part-filled order that the
+        venue has closed is CANCELLED carrying its real filled_qty.
+        """
+        filled = _dec_opt(order.get("filled")) or Decimal("0")
+        raw = str(order.get("status") or "").strip().lower()
+
+        if raw in ("rejected", "canceled", "cancelled", "expired"):
+            return OrderStatus.REJECTED if raw == "rejected" else OrderStatus.CANCELLED
+        if filled >= requested and requested > 0:
+            return OrderStatus.FILLED
+        if raw == "closed":
+            # Closed without the full amount: the remainder will never fill.
+            return OrderStatus.FILLED if filled >= requested else OrderStatus.CANCELLED
+        return None
+
+    def _build_ref(
+        self, intent: Intent, order: Mapping[str, Any], order_id: str,
+        status: OrderStatus, notes: Optional[list[str]] = None,
+    ) -> OrderRef:
+        notes = list(notes or [])
+        filled = _dec_opt(order.get("filled")) or Decimal("0")
+
+        avg = _dec_opt(order.get("average"))
+        if avg is None:
+            cost = _dec_opt(order.get("cost"))
+            if cost is not None and filled > 0:
+                avg = cost / filled
+        # order["price"] is deliberately NOT a fallback: on a market order it is
+        # the venue's reference, not a fill price, and reporting it as one
+        # invents a P&L.
+        if filled > 0 and avg is None:
+            notes.append(
+                f"venue reported {filled} filled with no average price; "
+                "avg_price is unknown, not zero"
+            )
+
+        base, _, quote = str(order.get("symbol") or "").partition("/")
+        base = base or intent.instrument.symbol.upper()
+        quote = quote or self.base_currency
+
+        fills: list[Fill] = []
+        trades = order.get("trades")
+        if isinstance(trades, list) and trades:
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    continue
+                t_qty = _dec_opt(trade.get("amount"))
+                t_price = _dec_opt(trade.get("price"))
+                if t_qty is None or t_price is None or t_qty <= 0:
+                    notes.append(f"unreadable trade on order {order_id}: {trade!r}")
+                    continue
+                t_fee, fee_note = self._fees_in_quote(
+                    self._fee_entries(trade), base, quote, t_price
+                )
+                if fee_note:
+                    notes.append(fee_note)
+                fills.append(Fill(
+                    order_id=order_id, instrument=intent.instrument,
+                    side=intent.side, qty=t_qty, price=t_price, fees=t_fee,
+                    at=self._timestamp(trade) or self._timestamp(order) or self._now(),
+                    mode=self.mode,
+                ))
+        elif filled > 0 and avg is not None:
+            fee, fee_note = self._fees_in_quote(
+                self._fee_entries(order), base, quote, avg
+            )
+            if fee_note:
+                notes.append(fee_note)
+            fills.append(Fill(
+                order_id=order_id, instrument=intent.instrument, side=intent.side,
+                qty=filled, price=avg, fees=fee,
+                at=self._timestamp(order) or self._now(), mode=self.mode,
+            ))
+
+        return OrderRef(
+            order_id=order_id, status=status, intent=intent, mode=self.mode,
+            filled_qty=filled, avg_price=avg, fills=tuple(fills),
+            error="; ".join(notes) if notes else None,
+        )
+
+    @staticmethod
+    def _fee_entries(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        entries = payload.get("fees")
+        out = [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+        single = payload.get("fee")
+        if isinstance(single, dict) and single not in out:
+            out.append(single)
+        return out
+
+    def _fees_in_quote(
+        self, entries: Sequence[Mapping[str, Any]], base: str, quote: str,
+        price: Decimal,
+    ) -> tuple[Decimal, Optional[str]]:
+        """Fee cost expressed in the quote currency.
+
+        OKX charges a spot BUY fee in the coin bought, so summing raw costs
+        across currencies would add coins to dollars. Anything that cannot be
+        converted is reported in the note rather than dropped -- an
+        understated fee is an overstated P&L.
+        """
+        total = Decimal("0")
+        unconverted: list[str] = []
+        for entry in entries:
+            cost = _dec_opt(entry.get("cost"))
+            if cost is None:
+                continue
+            # OKX reports a fee as a negative deduction. abs() would also turn a
+            # maker rebate into a cost, which errs toward under-reporting P&L.
+            cost = abs(cost)
+            currency = str(entry.get("currency") or "").upper()
+            if not currency or currency == quote.upper():
+                total += cost
+            elif currency == base.upper():
+                total += cost * price
+            else:
+                unconverted.append(f"{cost} {currency}")
+        note = (
+            "fees not converted to " + quote + ": " + ", ".join(unconverted)
+            if unconverted else None
+        )
+        return total, note
+
+    @staticmethod
+    def _timestamp(payload: Mapping[str, Any]) -> Optional[dt.datetime]:
+        millis = _dec_opt(payload.get("timestamp"))
+        if millis is None or millis <= 0:
+            return None
+        return dt.datetime.fromtimestamp(float(millis) / 1000.0, tz=UTC)
+
+    def _unplaced(self, intent: Intent, detail: str) -> OrderRef:
+        """A rejection for an order that was never sent. Safe to report as
+        REJECTED precisely because nothing exists at the venue."""
+        key = _client_order_id(intent.idempotency_key) or uuid4().hex
+        return OrderRef(
+            order_id=f"unplaced:{key}", status=OrderStatus.REJECTED, intent=intent,
+            mode=self.mode, filled_qty=Decimal("0"), avg_price=None, fills=(),
+            error=detail,
+        )
+
+    # --------------------------------------------------------------- cancelling
+
+    def cancel(self, order_id: str) -> bool:
+        """True only when OKX confirms the order is cancelled.
+
+        False can mean 'still working' OR 'it filled before the cancel landed';
+        those must not be conflated, so call cancel_detail() when the
+        difference matters.
+        """
+        return self.cancel_detail(order_id) is OrderStatus.CANCELLED
+
+    def cancel_detail(self, order_id: str, symbol: Optional[str] = None) -> Optional[OrderStatus]:
+        """The order's confirmed state after a cancel attempt. None means the
+        venue still shows it working."""
+        symbol = symbol or self._order_symbols.get(order_id)
+        if symbol is None:
+            raise UnknownOrder(
+                f"cancel({order_id!r}): this adapter did not place that order, so "
+                "the symbol OKX requires for a cancel is unknown; pass symbol="
+            )
+        cancel_error: Optional[BaseException] = None
+        try:
+            self._ex.cancel_order(order_id, symbol)
+        except Exception as exc:
+            # Not fatal on its own: ccxt raises OrderNotFound for an order that
+            # already resolved. The venue's own view below is what decides.
+            cancel_error = exc
+        try:
+            order = self._ex.fetch_order(order_id, symbol)
+        except Exception as exc:
+            raise OrderStateUnknown(
+                order_id,
+                f"cancel could not be confirmed: {exc!r}"
+                + (f" (cancel_order raised {cancel_error!r})" if cancel_error else ""),
+            ) from exc
+        requested = _dec_opt(order.get("amount")) or Decimal("0")
+        return self._map_status(order, requested)
