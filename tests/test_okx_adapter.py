@@ -235,7 +235,33 @@ def test_amount_is_quantized_with_the_venues_precision():
                       tickers={"BTC/USDT": {"last": 100.0}},
                       order_states=[FILLED_ORDER])
     adapter(ex).place(intent(qty="0.123456789"))
-    assert ex.create_calls[0][3] == pytest.approx(0.12345678)
+    sent = ex.create_calls[0][3]
+    assert sent == "0.12345678"
+    assert not isinstance(sent, float)
+
+
+def test_create_order_is_not_handed_a_float():
+    """float() at the ccxt boundary is silent rounding. The already-quantized
+    size must cross as a string (or Decimal), never as a binary float."""
+    ex = FakeExchange({"BTC/USDT": spot("BTC/USDT", amount_step="0.001",
+                                        price_step="0.1")},
+                      order_states=[FILLED_ORDER])
+    adapter(ex).place(intent(qty="1.2345", order_type=OrderType.LIMIT,
+                             limit_price="100.19"))
+    amount, price = ex.create_calls[0][3], ex.create_calls[0][4]
+    assert amount == "1.234"
+    assert price == "100.1"
+    assert isinstance(amount, str) and isinstance(price, str)
+
+
+def test_missing_market_precision_refuses_rather_than_float_rounding():
+    markets = {"BTC/USDT": spot("BTC/USDT")}
+    markets["BTC/USDT"]["precision"] = {}
+    ex = FakeExchange(markets, tickers={"BTC/USDT": {"last": 100.0}})
+    ref = adapter(ex).place(intent(qty="1"))
+    assert ref.status is OrderStatus.REJECTED
+    assert not ex.create_calls
+    assert "precision" in (ref.error or "")
 
 
 def test_dust_that_quantizes_to_zero_is_refused():
@@ -340,7 +366,7 @@ def test_limit_orders_skip_the_drift_guard():
     ref = adapter(ex).place(intent(order_type=OrderType.LIMIT, limit_price="100"))
     assert ref.status is OrderStatus.FILLED
     assert ex.ticker_calls == [], "a limit price is its own bound"
-    assert ex.create_calls[0][4] == pytest.approx(100.0)
+    assert ex.create_calls[0][4] == "100"
 
 
 def test_unlisted_symbol_is_rejected_without_touching_the_venue():
@@ -710,10 +736,17 @@ def test_holdings_report_raw_venue_truth():
 # ------------------------------------------------------------------ wiring
 
 def test_importing_the_adapter_needs_neither_ccxt_nor_credentials():
-    import sys
-    assert "ccxt" not in sys.modules, "the exchange is injected, never imported here"
+    import ast
     import adapters.okx as module
     source = open(module.__file__).read()
+    tree = ast.parse(source)
+    imported: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module.split(".")[0])
+    assert "ccxt" not in imported, "the exchange is injected, never imported here"
     assert "environ" not in source and "getenv" not in source
 
 

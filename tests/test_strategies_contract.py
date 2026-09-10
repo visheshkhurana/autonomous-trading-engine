@@ -10,10 +10,11 @@ from __future__ import annotations
 from core.protocols import Strategy
 from core.types import AssetClass, OrderType
 from strategies import (
-    CryptoBreakoutStrategy, CryptoEmaTrendStrategy, EquityMeanReversionStrategy,
-    IndexOptionTrendStrategy,
+    CryptoBreakoutStrategy, CryptoEmaTrendStrategy, CryptoMandateStrategy,
+    EquityMeanReversionStrategy, IndexOptionTrendStrategy,
 )
 from tests import test_crypto_breakout as bo
+from tests import test_crypto_mandate as md
 from tests import test_crypto_trend as ct
 from tests import test_equity_meanrev as mr
 from tests import test_equity_trend as et
@@ -26,6 +27,7 @@ def cases():
         (mr.strat(), mr.make_ctx()),
         (ct.strat(), ct.ctx_from(ct.CROSS_UP)[0]),
         (bo.strat(), bo.make_ctx(bo.RANGE_ROWS + [bo.BREAKOUT_ROW])[0]),
+        (md.strat([md.BTC]), md.execute_ctx()),
     ]
 
 
@@ -35,10 +37,11 @@ def test_every_strategy_satisfies_the_frozen_protocol():
         assert strategy.id and isinstance(strategy.asset_class, AssetClass)
 
 
-def test_the_package_exports_all_four_strategies():
+def test_the_package_exports_the_registered_and_legacy_strategies():
     built = [type(s) for s, _ in cases()]
     assert set(built) == {IndexOptionTrendStrategy, EquityMeanReversionStrategy,
-                          CryptoEmaTrendStrategy, CryptoBreakoutStrategy}
+                          CryptoEmaTrendStrategy, CryptoBreakoutStrategy,
+                          CryptoMandateStrategy}
 
 
 def test_every_intent_names_its_instrument_and_says_something_specific():
@@ -95,11 +98,12 @@ def test_an_empty_book_is_the_normal_case_and_is_cheap():
         (mr.strat(), mr.make_ctx([100, 100, 100, 100, 100], quote="100")),
         (ct.strat(), ct.ctx_from(ct.NO_CROSS)[0]),
         (bo.strat(), bo.make_ctx(bo.RANGE_ROWS + [(101, 102, 100, 101)])[0]),
+        (md.strat([md.BTC]), md.ctx_of(md.chop(80), extra={})),
     ]
     for strategy, ctx in quiet:
         assert list(strategy.propose(ctx)) == []
 
 
-def test_the_four_strategies_are_distinct_ids():
+def test_the_strategies_are_distinct_ids():
     ids = [s.id for s, _ in cases()]
-    assert len(set(ids)) == 4
+    assert len(set(ids)) == 5

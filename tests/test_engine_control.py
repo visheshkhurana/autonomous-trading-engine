@@ -459,6 +459,23 @@ def test_operator_and_session_flattens_do_not_share_an_idempotency_key(
     operator = runner._square_off(ctx, (), eng.IntentSource.OPERATOR)
     assert session and operator
     assert session[0][0].idempotency_key != operator[0][0].idempotency_key
+    # Crypto flatten is still MARKET, but the last quote is stamped so the
+    # drift guard can run. A missing stamp is the 2 Sep unbounded refuse.
+    assert session[0][0].order_type is OrderType.MARKET
+    assert session[0][0].limit_price == Decimal("60000")
+    assert operator[0][0].limit_price == Decimal("60000")
+
+
+def test_a_crypto_square_off_without_a_quote_is_not_emitted(harness) -> None:
+    """A MARKET flatten with no mark is unbounded. Fail closed; do not send."""
+    control = MemControl()
+    h = harness([], control)
+    h.open_long()
+    ctx = MarketContext(now=NOW, quotes={},
+                        positions=tuple(h.store.positions(Mode.PAPER)),
+                        equity=Decimal("5000000"))
+    runner = h.engine._runners[AssetClass.CRYPTO]
+    assert runner._square_off(ctx, (), eng.IntentSource.OPERATOR) == []
 
 
 # ==========================================================================

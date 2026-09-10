@@ -119,6 +119,35 @@ def test_short_history_blocks_entries_but_raises_for_an_open_position():
         p.bars_for(ctx, "BTC/USDT", min_bars=10, must_have=True)
 
 
+# --------------------------------------------------------------- quotes
+
+def test_a_missing_quote_is_no_signal_when_flat():
+    p = Probe()
+    ctx = context(NOW, bars={"BTC/USDT": bars_ending_at(NOW)})
+    assert p.known_quote(ctx, "BTC/USDT", must_have=False) is None
+
+
+def test_a_missing_quote_raises_when_the_position_is_open():
+    p = Probe()
+    ctx = context(NOW, bars={"BTC/USDT": bars_ending_at(NOW)})
+    with pytest.raises(MissingDataError, match="quote"):
+        p.known_quote(ctx, "BTC/USDT", must_have=True)
+
+
+def test_a_zero_quote_is_unknown_not_a_price():
+    p = Probe()
+    ctx = context(NOW, quotes={"BTC/USDT": Decimal("0")})
+    assert p.known_quote(ctx, "BTC/USDT", must_have=False) is None
+    with pytest.raises(MissingDataError, match="quote"):
+        p.known_quote(ctx, "BTC/USDT", must_have=True)
+
+
+def test_a_positive_decimal_quote_is_returned():
+    p = Probe()
+    ctx = context(NOW, quotes={"BTC/USDT": Decimal("65000")})
+    assert p.known_quote(ctx, "BTC/USDT", must_have=True) == Decimal("65000")
+
+
 # ------------------------------------------------------------- positions
 
 def test_own_positions_ignores_other_strategies_and_closed_rows():
@@ -146,13 +175,16 @@ def test_entry_is_blocked_by_another_strategys_position_in_the_same_symbol():
 
 # ---------------------------------------------------------------- intents
 
-def test_crypto_intents_are_market_orders_with_no_limit_price():
+def test_crypto_intents_are_market_orders_stamped_with_the_reference():
+    """OKX's drift guard reads limit_price as the MARKET reference. A
+    strategy that drops it produces the 2 Sep live reject: sized clip,
+    then 'no reference price' before the venue."""
     p = Probe()
     intent = p.make_intent(instrument=coin(), side=Side.BUY, qty=d(1),
                            reason="test", decision_ts=NOW, tag="entry",
                            ref_price=d(100))
     assert intent.order_type is OrderType.MARKET
-    assert intent.limit_price is None
+    assert intent.limit_price == d(100)
     assert intent.strategy_id == "probe"
     assert intent.idempotency_key
 
@@ -179,6 +211,18 @@ def test_a_limit_intent_without_a_reference_price_raises():
                       decision_ts=NOW, tag="entry", ref_price=None)
     with pytest.raises(StrategyInputError):
         p.make_intent(instrument=cash_equity(), side=Side.BUY, qty=d(1), reason="t",
+                      decision_ts=NOW, tag="entry", ref_price=d(0))
+
+
+def test_a_market_intent_without_a_reference_price_raises():
+    """A MARKET with no reference is an unbounded order. The adapter would
+    refuse it; the strategy must not emit it in the first place."""
+    p = Probe()
+    with pytest.raises(StrategyInputError):
+        p.make_intent(instrument=coin(), side=Side.BUY, qty=d(1), reason="t",
+                      decision_ts=NOW, tag="entry", ref_price=None)
+    with pytest.raises(StrategyInputError):
+        p.make_intent(instrument=coin(), side=Side.BUY, qty=d(1), reason="t",
                       decision_ts=NOW, tag="entry", ref_price=d(0))
 
 

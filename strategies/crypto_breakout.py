@@ -89,14 +89,19 @@ class CryptoBreakoutStrategy(StrategyBase):
                                  min_bars=self.min_bars, must_have=pos is not None)
             if bars is None:
                 continue
+            quote = self.known_quote(ctx, instrument.symbol,
+                                     must_have=pos is not None)
+            if quote is None:
+                continue
             if pos is not None:
-                exit_intent = self._exit(instrument, pos.avg_price, pos.qty, bars)
+                exit_intent = self._exit(instrument, pos.avg_price, pos.qty,
+                                         bars, quote)
                 if exit_intent is not None:
                     intents.append(exit_intent)
                 continue
             if self.held_by_anyone(ctx, instrument.symbol):
                 continue
-            entry = self._entry(instrument, bars)
+            entry = self._entry(instrument, bars, quote)
             if entry is not None:
                 intents.append(entry)
         return self.finalize(intents)
@@ -109,7 +114,8 @@ class CryptoBreakoutStrategy(StrategyBase):
         # close > 0 is enforced by Bar, so this division is safe.
         return vol, vol / close
 
-    def _entry(self, instrument: Instrument, bars: Sequence[Bar]) -> Optional[Intent]:
+    def _entry(self, instrument: Instrument, bars: Sequence[Bar],
+               quote: Decimal) -> Optional[Intent]:
         channel = donchian(bars, self.entry_period)
         if channel is None:
             return None
@@ -141,11 +147,11 @@ class CryptoBreakoutStrategy(StrategyBase):
         return self.make_intent(
             instrument=instrument, side=Side.BUY,
             qty=self.entry_unit_qty(instrument),
-            reason=reason, decision_ts=last.ts, tag="entry", ref_price=last.close,
+            reason=reason, decision_ts=last.ts, tag="entry", ref_price=quote,
         )
 
     def _exit(self, instrument: Instrument, entry_price: Decimal, qty: Decimal,
-              bars: Sequence[Bar]) -> Optional[Intent]:
+              bars: Sequence[Bar], quote: Decimal) -> Optional[Intent]:
         if entry_price <= 0:
             raise StrategyInputError(
                 f"{self.id}: {instrument.symbol} position carries avg_price {entry_price}; a "
@@ -179,5 +185,5 @@ class CryptoBreakoutStrategy(StrategyBase):
         return self.make_intent(
             instrument=instrument, side=Side.SELL,
             qty=abs(qty),
-            reason=reason, decision_ts=last.ts, tag="exit", ref_price=last.close,
+            reason=reason, decision_ts=last.ts, tag="exit", ref_price=quote,
         )

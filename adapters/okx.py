@@ -5,7 +5,7 @@ Everything venue-specific about OKX lives here: symbol shapes, precision,
 minimum order sizes, fee reporting, and the fact that a spot account reports
 BALANCES, not positions.
 
-Four things in this file exist because their absence cost real money before:
+Five things in this file exist because their absence cost real money before:
 
 1. Precision and minimums come from the loaded ccxt market, never from a
    constant in this file. The previous system carried hardcoded minimums and
@@ -18,6 +18,10 @@ Four things in this file exist because their absence cost real money before:
    every buy indefinitely.
 4. A MARKET order re-checks the mark against the price the strategy decided on
    and refuses to send if the market has run away from it.
+5. A spot SELL is sized to min(book qty, venue FREE base), never the engine
+   book alone. OKX takes a BUY fee in the coin bought, so free ETH is smaller
+   than the fill the ledger recorded; sending book qty is OKX 51008 and the
+   flatten sticks. Buys are not shrunk this way.
 
 The adapter never invents a number. Anything it cannot establish is None, an
 explicit rejection carrying its reason, or an exception -- never a zero, never
@@ -32,8 +36,8 @@ from __future__ import annotations
 import datetime as dt
 import re
 import time
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from uuid import uuid4
 
@@ -48,8 +52,41 @@ __all__ = [
     "OkxAdapter", "EquityBreakdown", "EquityComponent", "DriftCheck",
     "OkxAdapterError", "MarketsUnavailable", "OrderSubmitFailed",
     "OrderStateUnknown", "UnknownOrder", "CostBasisUnavailable",
+    "FundsMovementForbidden", "is_funds_movement", "clip_spot_sell_qty",
     "QUOTE_FALLBACK", "STABLE_FACE_VALUE", "FIAT_PER_USD",
 ]
+
+# The production OKX key has historically carried withdraw permission. This
+# adapter is a trade sleeve: it may load markets, fetch ticks/balances, and
+# place/cancel/fetch orders. It must never move funds off the account.
+_FUNDS_MOVE_TOKENS: tuple[str, ...] = (
+    "withdraw",
+    "transfer",
+    "earn",
+    "staking",
+    "savings",
+)
+
+
+def is_funds_movement(name: str) -> bool:
+    """True for ccxt/OKX methods that withdraw, transfer, or earn.
+
+    Compared collapsed (no `_` / `-`) so `private_post_asset_withdrawal`
+    and `withdrawCcxt` are the same kind of refusal as `withdraw`.
+    """
+    collapsed = name.lower().replace("-", "").replace("_", "")
+    return any(token in collapsed for token in _FUNDS_MOVE_TOKENS)
+
+
+def clip_spot_sell_qty(book_qty: Decimal, venue_free: Decimal) -> Decimal:
+    """Qty a spot SELL may send: never more than the venue can actually sell.
+
+    Buys must not go through this. Existing clip caps size those.
+    """
+    if book_qty <= 0 or venue_free <= 0:
+        return Decimal("0")
+    return book_qty if book_qty <= venue_free else venue_free
+
 
 # Tried in this order. USDT is where OKX liquidity is; USD and USDC exist for
 # names that were never listed against USDT or have been moved off it.
@@ -79,6 +116,39 @@ _CLIENT_ID_RE = re.compile(r"[^A-Za-z0-9]")
 class OkxAdapterError(RuntimeError):
     """Base class. Every subclass means 'I could not establish this', never
     'nothing happened'."""
+
+
+class FundsMovementForbidden(OkxAdapterError, AttributeError):
+    """The injected exchange was asked to move funds. Always a bug.
+
+    Also an AttributeError so `hasattr(exchange, "withdraw")` reports
+    missing rather than leaking the exception past the proxy.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"OkxAdapter refuses {name!r}: this process never withdraws, "
+            "transfers, or earns. The key may have those permissions; the "
+            "adapter does not use them."
+        )
+        self.name = name
+
+
+class _FundsMoveGuard:
+    """Proxy that raises on funds-movement method names and delegates the rest.
+
+    Attribute *access* is the refusal, not a later call: `hasattr` then
+    reports the method as missing, and `ex.withdraw(...)` never reaches
+    the inner client.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        object.__setattr__(self, "_inner", inner)
+
+    def __getattr__(self, name: str) -> Any:
+        if is_funds_movement(name):
+            raise FundsMovementForbidden(name)
+        return getattr(object.__getattribute__(self, "_inner"), name)
 
 
 class MarketsUnavailable(OkxAdapterError):
@@ -191,8 +261,8 @@ def _step_from_precision(value: Any) -> Optional[Decimal]:
 
     ccxt reports precision either as a step (0.00000001) or as a digit count
     (8), depending on the exchange's precisionMode, so both shapes are read.
-    Informational only: every real quantization goes through the exchange's own
-    amount_to_precision / price_to_precision, never through this.
+    Order sizes are quantized through this step in Decimal, never via
+    float() or via ccxt's amount_to_precision (which re-rounds a float).
     """
     number = _dec_opt(value)
     if number is None or number <= 0:
@@ -252,7 +322,7 @@ class OkxAdapter:
         if not quote_fallback:
             raise ValueError("quote_fallback must list at least one quote currency")
 
-        self._ex = exchange
+        self._ex = _FundsMoveGuard(exchange)
         self.mode = mode
         self.sandbox = sandbox
         self.base_currency = base_currency.upper()
@@ -365,16 +435,144 @@ class OkxAdapter:
     # ------------------------------------------------------------ quantization
 
     def _quantize_amount(self, symbol: str, qty: Decimal) -> Decimal:
-        # ccxt's precision helpers take a number and return a string; the string
-        # is immediately re-wrapped in Decimal so no float arithmetic survives.
-        return Decimal(str(self._ex.amount_to_precision(symbol, float(qty))))
+        """Venue amount precision, in Decimal, never via float().
+
+        `float(qty)` at this boundary is how a size that cleared the gate
+        silently changes before it is sent. The step comes from the already-
+        loaded market; if that information is missing we refuse rather than
+        inventing a precision or asking ccxt to round a float.
+        """
+        return self._quantize_to_market(symbol, qty, "amount")
 
     def _quantize_price(self, symbol: str, price: Decimal) -> Decimal:
-        return Decimal(str(self._ex.price_to_precision(symbol, float(price))))
+        return self._quantize_to_market(symbol, price, "price")
+
+    def _quantize_to_market(self, symbol: str, value: Decimal,
+                            field: str) -> Decimal:
+        market = self.markets.get(symbol)
+        if not isinstance(market, dict):
+            raise MarketsUnavailable(
+                f"{symbol}: no loaded market, cannot quantize {field} without "
+                "inventing a precision"
+            )
+        step = _step_from_precision((market.get("precision") or {}).get(field))
+        if step is None or step <= 0:
+            raise MarketsUnavailable(
+                f"{symbol}: market has no {field} precision; refusing to round "
+                "via float() rather than send an unquantized size"
+            )
+        quantized = (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+        return quantized.normalize() if quantized == 0 else quantized
+
+    @staticmethod
+    def _ccxt_decimal(value: Decimal) -> str:
+        """String form of an already-quantized Decimal.
+
+        ccxt's create_order historically took a float and re-precisioned it.
+        Passing a string of a value we already snapped to the market step
+        means a binary float cannot change the size between us and the wire.
+        """
+        return format(value, "f")
 
     def _min_amount(self, symbol: str) -> Optional[Decimal]:
         limits = (self.markets[symbol].get("limits") or {})
         return _dec_opt((limits.get("amount") or {}).get("min"))
+
+    @staticmethod
+    def _base_of(symbol: str) -> str:
+        return symbol.split("/", 1)[0].upper()
+
+    def _free_base(self, symbol: str) -> Optional[Decimal]:
+        """Spendable units of the base asset, or None if that cannot be read.
+
+        `total` is the wrong number: locked / frozen coins sit in total and
+        cannot be sold. Sizing a sell from total is how a fee-in-base leftover
+        becomes OKX 51008. A missing `free` map is unreadable, not zero: zero
+        would look like a flat wallet and invite a write-off.
+        """
+        raw = self._ex.fetch_balance()
+        if not isinstance(raw, dict):
+            return None
+        free_map = raw.get("free")
+        if not isinstance(free_map, dict):
+            return None
+        code = self._base_of(symbol)
+        amount: Optional[Decimal] = None
+        for key, value in free_map.items():
+            if str(key).upper() == code:
+                amount = _dec_opt(value)
+                break
+        if amount is None:
+            return Decimal("0")
+        if amount < 0:
+            return None
+        return amount
+
+    def _is_unplaceable_spot_qty(
+        self, symbol: str, qty: Decimal, price: Decimal, instrument: Instrument,
+    ) -> bool:
+        """True when this leftover cannot be sent: below venue min size or
+        min notional. That leftover must be written off or flatten sticks."""
+        if qty <= 0 or price <= 0:
+            return True
+        try:
+            quantized = self._quantize_amount(symbol, qty)
+        except MarketsUnavailable:
+            quantized = qty
+        if quantized <= 0:
+            return True
+        min_amount = self._min_amount(symbol)
+        if min_amount is not None and quantized < min_amount:
+            return True
+        min_cost = self._min_cost(symbol, instrument)
+        if min_cost is not None and quantized * price < min_cost:
+            return True
+        if instrument.min_notional > 0 and qty * price < instrument.min_notional:
+            return True
+        return False
+
+    def _annotate_spot_sell(
+        self, ref: OrderRef, symbol: str, clip_note: Optional[str],
+    ) -> OrderRef:
+        """Record a clip, and attach a dust write-off fill so the ledger can
+        match remaining venue qty instead of holding an unsellable stub.
+
+        The write-off is not a venue fill. filled_qty stays what OKX did.
+        Engine apply() nets every fill on the ref, which is how the leftover
+        fee-in-base gap leaves the book.
+        """
+        if ref.intent.side is not Side.SELL:
+            return ref
+        notes: list[str] = []
+        if clip_note:
+            notes.append(clip_note)
+        leftover = ref.intent.qty - ref.filled_qty
+        price = ref.avg_price
+        if price is None or price <= 0:
+            for fill in reversed(ref.fills):
+                if fill.price > 0:
+                    price = fill.price
+                    break
+        fills = ref.fills
+        if (leftover > 0 and ref.filled_qty > 0 and price is not None
+                and self._is_unplaceable_spot_qty(
+                    symbol, leftover, price, ref.intent.instrument)):
+            fills = fills + (Fill(
+                order_id=ref.order_id, instrument=ref.intent.instrument,
+                side=Side.SELL, qty=leftover, price=price, fees=Decimal("0"),
+                at=self._now(), mode=self.mode,
+            ),)
+            notes.append(
+                f"wrote off dust leftover {leftover} {self._base_of(symbol)} "
+                f"(below venue min size / min notional at {price}); ledger "
+                "matches remaining venue qty"
+            )
+            ref = replace(ref, fills=fills)
+        if not notes:
+            return ref
+        extra = "; ".join(notes)
+        error = f"{ref.error}; {extra}" if ref.error else extra
+        return replace(ref, error=error)
 
     def _min_cost(self, symbol: str, instrument: Instrument) -> Optional[Decimal]:
         """The venue's own minimum notional, tightened (never loosened) by any
@@ -660,19 +858,61 @@ class OkxAdapter:
             if reference is None:
                 raise ValueError("LIMIT intent reached the adapter with no limit price")
             # No drift check: the limit price is itself the bound.
-            trade_price = self._quantize_price(symbol, reference)
+            try:
+                trade_price = self._quantize_price(symbol, reference)
+            except MarketsUnavailable as exc:
+                return self._unplaced(intent, str(exc))
             if trade_price <= 0:
                 return self._unplaced(
                     intent, f"limit price {reference} quantized to {trade_price}"
                 )
 
-        amount = self._quantize_amount(symbol, intent.qty)
+        try:
+            amount = self._quantize_amount(symbol, intent.qty)
+        except MarketsUnavailable as exc:
+            return self._unplaced(intent, str(exc))
         if amount <= 0:
             return self._unplaced(
                 intent,
                 f"qty {intent.qty} quantized to {amount} at the venue's amount "
                 "precision",
             )
+
+        clip_note: Optional[str] = None
+        if intent.side is Side.SELL:
+            try:
+                free = self._free_base(symbol)
+            except Exception as exc:
+                return self._unplaced(
+                    intent,
+                    f"cannot read venue free {self._base_of(symbol)} for a "
+                    f"spot sell: {exc!r}; refusing to send book qty that may "
+                    "exceed spendable balance (OKX 51008)",
+                )
+            if free is None:
+                return self._unplaced(
+                    intent,
+                    f"venue free {self._base_of(symbol)} is unreadable; "
+                    "refusing to send a spot sell of book qty (OKX 51008)",
+                )
+            try:
+                sellable = self._quantize_amount(symbol, free)
+            except MarketsUnavailable as exc:
+                return self._unplaced(intent, str(exc))
+            clipped = clip_spot_sell_qty(amount, sellable)
+            if clipped < amount:
+                clip_note = (
+                    f"sell qty clipped from {amount} to {clipped} "
+                    f"(venue free {self._base_of(symbol)}={free})"
+                )
+                amount = clipped
+            if amount <= 0:
+                return self._unplaced(
+                    intent,
+                    f"venue free {self._base_of(symbol)}={free} quantizes to "
+                    f"{amount}; nothing sellable",
+                )
+
         min_amount = self._min_amount(symbol)
         if min_amount is not None and amount < min_amount:
             return self._unplaced(
@@ -697,11 +937,12 @@ class OkxAdapter:
         if client_id:
             params["clOrdId"] = client_id
 
-        price_arg = float(trade_price) if intent.order_type is OrderType.LIMIT else None
+        price_arg = (self._ccxt_decimal(trade_price)
+                     if intent.order_type is OrderType.LIMIT else None)
         try:
             created = self._ex.create_order(
                 symbol, intent.order_type.value, intent.side.value,
-                float(amount), price_arg, params,
+                self._ccxt_decimal(amount), price_arg, params,
             )
         except Exception as exc:
             raise OrderSubmitFailed(
@@ -717,7 +958,8 @@ class OkxAdapter:
                 "order cannot be tracked and may be live"
             )
         self._order_symbols[order_id] = symbol
-        return self._await_terminal(intent, symbol, order_id, amount, timeout_s)
+        ref = self._await_terminal(intent, symbol, order_id, amount, timeout_s)
+        return self._annotate_spot_sell(ref, symbol, clip_note)
 
     def _await_terminal(
         self, intent: Intent, symbol: str, order_id: str,

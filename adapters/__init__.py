@@ -1,10 +1,11 @@
 """Broker adapters — the only code in this package that talks to a venue.
 
-Only the PAPER adapter is re-exported. `DhanAdapter` and `OkxAdapter` must be
-imported from their own modules:
+Only the PAPER adapter is re-exported. `DhanAdapter`, `OkxAdapter`, and
+`KrakenAdapter` must be imported from their own modules:
 
     from adapters.dhan import DhanAdapter
     from adapters.okx import OkxAdapter
+    from adapters.kraken import KrakenAdapter
 
 That is not tidiness. Both live adapters are constructed with credentials and,
 once armed, place real orders; importing one should be a line a reviewer can

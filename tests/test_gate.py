@@ -87,11 +87,13 @@ class FakePositionStore:
 
 class FakeGateState:
     def __init__(self, *, seen: Sequence[str] = (), count: int = 0,
-                 fail_on: Sequence[str] = (), count_value: object = None) -> None:
+                 fail_on: Sequence[str] = (), count_value: object = None,
+                 spent_notional: Decimal = Decimal("0")) -> None:
         self._seen = set(seen)
         self._count = count
         self._fail_on = set(fail_on)
         self._count_value = count_value
+        self._spent_notional = spent_notional
         self.submissions: list[tuple[str, AssetClass, str]] = []
 
     def seen_recently(self, idempotency_key: str, window_s: float,
@@ -109,12 +111,19 @@ class FakeGateState:
             return self._count_value          # type: ignore[return-value]
         return self._count
 
+    def daily_notional(self, asset_class: AssetClass, day_key: str) -> Decimal:
+        if "daily_notional" in self._fail_on:
+            raise GateStateUnavailable("redis down")
+        return self._spent_notional
+
     def record_submission(self, idempotency_key: str, asset_class: AssetClass,
-                          day_key: str, now: dt.datetime) -> None:
+                          day_key: str, now: dt.datetime,
+                          notional: Decimal = Decimal("0")) -> None:
         if "record_submission" in self._fail_on:
             raise GateStateUnavailable("redis down")
         self._seen.add(idempotency_key)
         self._count += 1
+        self._spent_notional += notional
         self.submissions.append((idempotency_key, asset_class, day_key))
 
 
@@ -301,6 +310,70 @@ def test_approval_carries_the_snapped_qty_not_the_requested_one() -> None:
     assert approval.intent.qty == Decimal("25")
 
 
+def test_absolute_order_notional_is_tighter_than_the_equity_fraction() -> None:
+    """1 BTC at 78k would pass a 10% of 2M cap. The 50 USDT clip must bind."""
+    config = GateConfig(limits={
+        AssetClass.CRYPTO: ClassLimits(
+            max_order_notional=Decimal("50"),
+            max_daily_notional=Decimal("250"),
+            max_open_positions=1,
+        ),
+    })
+    intent = Intent(
+        instrument=BTC, side=Side.BUY, qty=Decimal("1"),
+        order_type=OrderType.MARKET, strategy_id="s1", reason="unit test",
+        idempotency_key="c1",
+    )
+    approval = build_gate(config=config).check(
+        intent, ctx(equity="2000000", quotes={BTC.symbol: Decimal("78000")}))
+    assert approval.approved, approval.reason
+    assert approval.intent.qty == Decimal("0.000641")
+    assert approval.intent.qty * Decimal("78000") <= Decimal("50")
+
+
+def test_a_reducing_crypto_exit_does_not_consume_daily_notional() -> None:
+    config = GateConfig(limits={
+        AssetClass.CRYPTO: ClassLimits(
+            max_order_notional=Decimal("50"),
+            max_daily_notional=Decimal("250"),
+            max_open_positions=1,
+        ),
+    })
+    state = FakeGateState(spent_notional=Decimal("250"))
+    book = [Position(instrument=BTC, qty=Decimal("0.000641"),
+                     avg_price=Decimal("78000"), mode=Mode.PAPER, strategy_id="s1")]
+    intent = Intent(
+        instrument=BTC, side=Side.SELL, qty=Decimal("0.000641"),
+        order_type=OrderType.MARKET, strategy_id="s1", reason="unit test",
+        idempotency_key="exit1",
+    )
+    approval = build_gate(positions=book, config=config, state=state).check(
+        intent, ctx(equity="2000000", quotes={BTC.symbol: Decimal("78000")}))
+    assert approval.approved, approval.reason
+    assert approval.intent.qty == Decimal("0.000641")
+    assert state._spent_notional == Decimal("250")
+
+
+def test_absolute_daily_notional_refuses_when_the_day_is_spent() -> None:
+    config = GateConfig(limits={
+        AssetClass.CRYPTO: ClassLimits(
+            max_order_notional=Decimal("50"),
+            max_daily_notional=Decimal("250"),
+            max_open_positions=1,
+        ),
+    })
+    state = FakeGateState(spent_notional=Decimal("250"))
+    intent = Intent(
+        instrument=BTC, side=Side.BUY, qty=Decimal("0.000641"),
+        order_type=OrderType.MARKET, strategy_id="s1", reason="unit test",
+        idempotency_key="c1",
+    )
+    approval = build_gate(config=config, state=state).check(
+        intent, ctx(equity="2000000", quotes={BTC.symbol: Decimal("78000")}))
+    assert not approval.approved
+    assert approval.rejections[0].name == "daily_notional_cap"
+
+
 def test_crypto_qty_is_snapped_to_precision() -> None:
     intent = Intent(
         instrument=BTC, side=Side.BUY, qty=Decimal("0.0123456789"),
@@ -409,21 +482,71 @@ def test_a_failure_to_record_refuses_rather_than_placing_an_unaccounted_order() 
 # --- 6/7. equity-denominated caps ---------------------------------------
 
 
-def test_order_above_the_notional_fraction_of_live_equity_is_refused() -> None:
-    # 10% of 1,000,000 = 100,000. 25 * 5000 = 125,000.
+def test_order_above_the_notional_fraction_of_live_equity_is_sized_down() -> None:
+    # 10% of 1,000,000 = 100,000. RELIANCE lot=1, 25 * 5000 = 125,000 -> 20.
+    approval = build_gate().check(
+        equity_intent(qty="25", price="5000", instrument=RELIANCE), ctx())
+    assert approval.approved, approval.reason
+    assert approval.intent.qty == Decimal("20")
+    cap = [c for c in approval.checks if c.name == "notional_cap"][0]
+    assert cap.passed
+    assert "20" in cap.detail
+
+
+def test_a_scale_that_snaps_to_zero_lots_is_still_refused() -> None:
+    """NIFTY lot=25. 100_000 cap / 5000 = 20, which is not a whole lot."""
     approval = build_gate().check(equity_intent(qty="25", price="5000"), ctx())
     assert not approval.approved
     assert approval.rejections[0].name == "notional_cap"
+    assert "nothing to place" in approval.rejections[0].detail
+
+
+def test_sizing_does_not_run_when_equity_is_unknown() -> None:
+    """Fail closed: a missing equity cannot be a licence to size against a guess."""
+    approval = build_gate().check(
+        equity_intent(qty="25", price="5000", instrument=RELIANCE),
+        ctx(equity=None))
+    assert not approval.approved
+    assert approval.rejections[0].name == "notional_cap"
+    assert "equity unavailable" in approval.rejections[0].detail
+
+
+def test_reducing_orders_are_not_sized_down_to_the_cap() -> None:
+    """Shrinking an exit leaves a tail on."""
+    book = [Position(instrument=RELIANCE, qty=Decimal("25"),
+                     avg_price=Decimal("5000"), mode=Mode.PAPER, strategy_id="s1")]
+    approval = build_gate(positions=book).check(
+        equity_intent(qty="25", price="5000", instrument=RELIANCE, side=Side.SELL),
+        ctx())
+    assert approval.approved, approval.reason
+    assert approval.intent.qty == Decimal("25")
+
+
+def test_sizing_does_not_change_paper_vs_live() -> None:
+    """Paper vs live is an adapter choice. Sizing an order must not arm it."""
+    approval = build_gate().check(
+        equity_intent(qty="25", price="5000", instrument=RELIANCE), ctx())
+    assert approval.approved
+    assert approval.mode is Mode.PAPER
+    live = build_gate(env={"EQUITY_LIVE": "true"},
+                      config=GateConfig(requested_mode=Mode.LIVE)).check(
+        equity_intent(qty="25", price="5000", instrument=RELIANCE, key="k2"),
+        ctx())
+    assert live.approved
+    assert live.mode is Mode.LIVE
+    assert live.intent.qty == Decimal("20")
 
 
 def test_the_notional_cap_shrinks_with_equity() -> None:
     """A cap that is a fraction of live equity, not a constant: the same order
-    that passes on a big account must fail on a halved one."""
-    intent = equity_intent(qty="25", price="300")          # notional 7,500
+    that passes on a big account is sized down (or refused, if it cannot
+    print a lot) on a halved one."""
+    intent = equity_intent(qty="25", price="300", instrument=RELIANCE)  # 7,500
     assert build_gate().check(intent, ctx(equity="100000")).approved
-    approval = build_gate().check(intent, ctx(equity="50000"))
-    assert not approval.approved
-    assert approval.rejections[0].name == "notional_cap"
+    approval = build_gate().check(intent, ctx(equity="50000"))  # cap 5,000
+    assert approval.approved, approval.reason
+    # 5000/300 = 16.666 -> 16 lots of 1.
+    assert approval.intent.qty == Decimal("16")
 
 
 def test_unavailable_equity_refuses_instead_of_assuming_headroom() -> None:
@@ -463,15 +586,16 @@ def test_the_daily_counter_rolls_on_the_asset_classes_own_day_boundary() -> None
     assert state.submissions == [("c1", AssetClass.CRYPTO, "2026-08-27")]
 
 
-def test_allocation_cap_counts_existing_exposure() -> None:
+def test_allocation_cap_sizes_down_to_remaining_room() -> None:
     book = [
         Position(instrument=RELIANCE, qty=Decimal("100"),
                  avg_price=Decimal("2500"), mode=Mode.PAPER, strategy_id="s1"),
-    ]  # 250,000 exposure; cap is 30% of 1,000,000 = 300,000
+    ]  # 250,000 exposure; cap is 30% of 1,000,000 = 300,000; room 50,000
     approval = build_gate(positions=book).check(
-        equity_intent(qty="25", price="3000"), ctx())      # +75,000
-    assert not approval.approved
-    assert approval.rejections[0].name == "allocation_cap"
+        equity_intent(qty="25", price="3000", instrument=RELIANCE), ctx())
+    assert approval.approved, approval.reason
+    # 50_000 / 3000 = 16.666 -> 16
+    assert approval.intent.qty == Decimal("16")
 
 
 def test_allocation_cap_sums_short_exposure_by_magnitude() -> None:

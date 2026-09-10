@@ -131,6 +131,49 @@ def test_the_count_is_per_class_and_per_day(state) -> None:
     assert state.order_count(AssetClass.CRYPTO, "2026-03-03") == 1
 
 
+def test_daily_notional_sums_entry_claims_and_ignores_other_days(state) -> None:
+    assert state.daily_notional(AssetClass.CRYPTO, DAY) == Decimal("0")
+    state.record_submission("a", AssetClass.CRYPTO, DAY, NOW, notional=Decimal("50"))
+    state.record_submission("b", AssetClass.CRYPTO, DAY, NOW, notional=Decimal("50"))
+    state.record_submission("c", AssetClass.EQUITY, DAY, NOW, notional=Decimal("999"))
+    state.record_submission("d", AssetClass.CRYPTO, "2026-03-03", NOW,
+                            notional=Decimal("50"))
+    assert state.daily_notional(AssetClass.CRYPTO, DAY) == Decimal("100")
+    assert state.daily_notional(AssetClass.EQUITY, DAY) == Decimal("999")
+    assert state.daily_notional(AssetClass.CRYPTO, "2026-03-03") == Decimal("50")
+
+
+def test_an_older_ledger_without_notional_is_migrated(db_path) -> None:
+    """A reused /data/trader.db from before the clip cap must still boot."""
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE gate_submissions (
+            idempotency_key TEXT NOT NULL,
+            mode            TEXT NOT NULL,
+            asset_class     TEXT NOT NULL,
+            day_key         TEXT NOT NULL,
+            claimed_at      TEXT NOT NULL,
+            PRIMARY KEY (mode, idempotency_key)
+        );
+    """)
+    conn.execute(
+        "INSERT INTO gate_submissions VALUES (?,?,?,?,?)",
+        ("old", "paper", "crypto", DAY, NOW.isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    store = SQLiteGateStateStore(db_path, Mode.PAPER)
+    try:
+        assert store.daily_notional(AssetClass.CRYPTO, DAY) == Decimal("0")
+        store.record_submission("new", AssetClass.CRYPTO, DAY, NOW,
+                                notional=Decimal("50"))
+        assert store.daily_notional(AssetClass.CRYPTO, DAY) == Decimal("50")
+        assert store.order_count(AssetClass.CRYPTO, DAY) == 2
+    finally:
+        store.close()
+
+
 # --------------------------------------------------------------------------
 # durability — the whole reason this is not a dict
 # --------------------------------------------------------------------------

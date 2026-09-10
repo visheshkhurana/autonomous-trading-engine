@@ -375,6 +375,40 @@ class StrategyBase:
             )
         return book
 
+    def known_quote(self, ctx: MarketContext, symbol: str, *,
+                    must_have: bool) -> Optional[Decimal]:
+        """A usable mark for `symbol`, or None when the name is unpriced.
+
+        The engine leaves an unfetchable quote *absent* from `ctx.quotes`,
+        never zero. A zero that still arrives is treated the same way: it is
+        unknown, not a free price. `must_have=True` (we hold this instrument)
+        converts that unknown into a raise — silence here is an unmanaged
+        open position.
+        """
+        raw = ctx.quote(symbol)
+        if raw is None:
+            if must_have:
+                raise MissingDataError(
+                    f"{self.id}: no quote for {symbol} but a position is open "
+                    "in it — refusing to manage an open position against an "
+                    "unknown mark"
+                )
+            return None
+        if isinstance(raw, bool) or isinstance(raw, float) or not isinstance(raw, Decimal):
+            raise StrategyInputError(
+                f"{self.id}: quote for {symbol} must be Decimal, got "
+                f"{type(raw).__name__}"
+            )
+        if not raw.is_finite() or raw <= 0:
+            if must_have:
+                raise MissingDataError(
+                    f"{self.id}: quote for {symbol} is {raw} (unknown, not a "
+                    "price) while a position is open — refusing to manage it "
+                    "blind"
+                )
+            return None
+        return raw
+
     def bars_for(self, ctx: MarketContext, symbol: str, *, min_bars: int,
                  must_have: bool) -> Optional[list[Bar]]:
         """Bars for `symbol`, or None when there is legitimately nothing to act
@@ -415,8 +449,8 @@ class StrategyBase:
 
     # -- intents -----------------------------------------------------------
     def entry_unit_qty(self, instrument: Instrument) -> Decimal:
-        """ONE unit. Not a sizing decision — the gate sizes. One lot for
-        equity, one unit of the base asset for crypto."""
+        """ONE unit. Not a sizing decision — the gate sizes down to the cap.
+        One lot for equity, one unit of the base asset for crypto."""
         raw = (Decimal(instrument.lot_size) if self.asset_class is AssetClass.EQUITY
                else Decimal(1))
         qty = self.profile.quantize_qty(instrument, raw)
@@ -433,17 +467,22 @@ class StrategyBase:
                     structure_id: Optional[str] = None) -> Intent:
         """Order type comes from the asset-class profile, never from a literal
         here — NFO rejects MARKET outright, so equity intents are marketable
-        LIMITs and crypto spot is MARKET."""
+        LIMITs and crypto spot is MARKET.
+
+        A MARKET still carries `limit_price`: that is the last known quote the
+        OKX drift guard compares against the live mark. Dropping it is how a
+        sized clip dies as an unbounded-order refuse before the venue.
+        """
         if qty <= 0:
             raise StrategyInputError(f"{self.id}: {instrument.symbol} qty must be > 0, got {qty}")
         order_type = self.profile.default_order_type
         limit_price: Optional[Decimal] = None
+        if ref_price is None or ref_price <= 0:
+            raise StrategyInputError(
+                f"{self.id}: {instrument.symbol} needs a positive reference price to build a "
+                f"{order_type.value} order, got {ref_price}"
+            )
         if order_type is OrderType.LIMIT:
-            if ref_price is None or ref_price <= 0:
-                raise StrategyInputError(
-                    f"{self.id}: {instrument.symbol} needs a positive reference price to build a "
-                    f"LIMIT order, got {ref_price}"
-                )
             edge = ref_price * self.slippage_bps / Decimal(10000)
             raw = ref_price + edge if side is Side.BUY else ref_price - edge
             limit_price = self.profile.quantize_price(instrument, raw)
@@ -451,6 +490,10 @@ class StrategyBase:
                 raise StrategyInputError(
                     f"{self.id}: {instrument.symbol} limit price quantized to {limit_price}"
                 )
+        else:
+            # Drift-guard reference, not a resting limit. Do not add a
+            # slippage edge — that would move the bound the adapter checks.
+            limit_price = ref_price
         return Intent(
             instrument=instrument,
             side=side,

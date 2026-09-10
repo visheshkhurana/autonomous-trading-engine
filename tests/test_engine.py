@@ -89,8 +89,14 @@ class FakeGateState:
             raise GateStateUnavailable("test")
         return self.counts.get((asset_class, day_key), 0)
 
+    def daily_notional(self, asset_class: AssetClass, day_key: str) -> Decimal:
+        if self.fail:
+            raise GateStateUnavailable("test")
+        return Decimal("0")
+
     def record_submission(self, idempotency_key: str, asset_class: AssetClass,
-                          day_key: str, now: dt.datetime) -> None:
+                          day_key: str, now: dt.datetime,
+                          notional: Decimal = Decimal("0")) -> None:
         if self.fail:
             raise GateStateUnavailable("test")
         self.seen[idempotency_key] = now

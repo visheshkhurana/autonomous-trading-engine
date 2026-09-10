@@ -761,6 +761,13 @@ class EngineHandle:
     # would let an operator believe they are watching paper.
     armed: Mapping[AssetClass, bool] = field(default_factory=dict)
     clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(UTC)
+    # Process shape. Defaults keep existing /ready tests honest: missing
+    # extras must not invent a Kraken venue or an armed live flag.
+    crypto_venue: str = "okx"
+    kraken_live: bool = False
+    feed: str = "synthetic"
+    live_adapter_names: Mapping[AssetClass, str] = field(default_factory=dict)
+    class_feeds: Mapping[AssetClass, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, Mode):
@@ -789,6 +796,8 @@ class EngineHandle:
         object.__setattr__(self, "asset_classes", tuple(self.asset_classes))
         object.__setattr__(self, "adapters", dict(self.adapters))
         object.__setattr__(self, "armed", dict(self.armed))
+        object.__setattr__(self, "live_adapter_names", dict(self.live_adapter_names))
+        object.__setattr__(self, "class_feeds", dict(self.class_feeds))
 
     def now(self) -> dt.datetime:
         moment = self.clock()
@@ -1263,6 +1272,9 @@ def _register_routes(app: FastAPI, handle: EngineHandle,
                 "adapter_mode": getattr(adapter_mode, "value", None),
                 "armed_live": handle.armed[asset_class],
             }
+            if asset_class is AssetClass.CRYPTO:
+                entry["live_adapter"] = handle.live_adapter_names.get(asset_class)
+                entry["feed"] = handle.class_feeds.get(asset_class) or handle.feed
             if adapter_mode is Mode.LIVE and not handle.armed[asset_class]:
                 # Not fatal — the gate coerces to paper — but an operator should
                 # never have to deduce this from two separate screens.
@@ -1284,6 +1296,9 @@ def _register_routes(app: FastAPI, handle: EngineHandle,
         payload = {
             "ready": not problems,
             "mode": handle.mode.value,
+            "crypto_venue": handle.crypto_venue,
+            "kraken_live": handle.kraken_live,
+            "feed": handle.feed,
             "classes": classes,
             "problems": problems,
         }

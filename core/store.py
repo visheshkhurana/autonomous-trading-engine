@@ -287,6 +287,7 @@ CREATE TABLE IF NOT EXISTS gate_submissions (
     asset_class     TEXT NOT NULL,
     day_key         TEXT NOT NULL,
     claimed_at      TEXT NOT NULL,
+    notional        TEXT NOT NULL DEFAULT '0',
     PRIMARY KEY (mode, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_gate_day
@@ -749,6 +750,19 @@ class SQLiteGateStateStore:
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
+        self._ensure_gate_notional_column()
+
+    def _ensure_gate_notional_column(self) -> None:
+        """Older ledgers created gate_submissions without `notional`. A missing
+        column would make daily_notional refuse every crypto entry after a
+        deploy that added the 250 USDT daily cap."""
+        cols = {row[1] for row in self._conn.execute(
+            "PRAGMA table_info(gate_submissions)")}
+        if "notional" not in cols:
+            self._conn.execute(
+                "ALTER TABLE gate_submissions "
+                "ADD COLUMN notional TEXT NOT NULL DEFAULT '0'"
+            )
 
     @property
     def path(self) -> str:
@@ -826,8 +840,45 @@ class SQLiteGateStateStore:
             raise GateStateUnavailable("order-count query returned no row")
         return int(row["n"])
 
+    def daily_notional(self, asset_class: AssetClass, day_key: str) -> Decimal:
+        """Approved entry notional claimed for this class on this trading day.
+
+        Summed from the claim rows themselves (same source as order_count). A
+        separate counter that can drift from the claims is one number too many.
+        """
+        if not isinstance(day_key, str) or not day_key.strip():
+            raise GateStateUnavailable(f"day_key must be a non-empty str, got {day_key!r}")
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT notional FROM gate_submissions "
+                    "WHERE mode = ? AND asset_class = ? AND day_key = ?",
+                    (self._mode, _asset_value(asset_class), day_key),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise GateStateUnavailable(
+                f"daily-notional read failed for {asset_class!r}/{day_key!r}: "
+                f"{exc!r}"
+            ) from exc
+        total = Decimal("0")
+        for row in rows:
+            raw = row["notional"]
+            try:
+                value = Decimal(str(raw))
+            except Exception as exc:
+                raise GateStateUnavailable(
+                    f"daily-notional row {raw!r} is not a Decimal: {exc!r}"
+                ) from exc
+            if not value.is_finite() or value < 0:
+                raise GateStateUnavailable(
+                    f"daily-notional row {raw!r} is not a non-negative finite Decimal"
+                )
+            total += value
+        return total
+
     def record_submission(self, idempotency_key: str, asset_class: AssetClass,
-                          day_key: str, now: dt.datetime) -> None:
+                          day_key: str, now: dt.datetime,
+                          notional: Decimal = Decimal("0")) -> None:
         """Claim the key and, by doing so, spend one of the day's orders.
 
         A plain INSERT, so a key already in the table raises. That raise is the
@@ -847,6 +898,9 @@ class SQLiteGateStateStore:
         key = self._key(idempotency_key)
         if not isinstance(day_key, str) or not day_key.strip():
             raise GateStateUnavailable(f"day_key must be a non-empty str, got {day_key!r}")
+        if not isinstance(notional, Decimal) or not notional.is_finite() or notional < 0:
+            raise GateStateUnavailable(
+                f"notional must be a non-negative finite Decimal, got {notional!r}")
         stamp = _utc_text(self._instant(now))
         try:
             with self._lock:
@@ -854,9 +908,10 @@ class SQLiteGateStateStore:
                 try:
                     self._conn.execute(
                         "INSERT INTO gate_submissions "
-                        "(idempotency_key, mode, asset_class, day_key, claimed_at) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (key, self._mode, _asset_value(asset_class), day_key, stamp),
+                        "(idempotency_key, mode, asset_class, day_key, claimed_at, notional) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (key, self._mode, _asset_value(asset_class), day_key, stamp,
+                         str(notional)),
                     )
                 except BaseException:
                     self._conn.execute("ROLLBACK")

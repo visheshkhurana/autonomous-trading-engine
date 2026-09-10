@@ -22,10 +22,16 @@ import pytest
 
 import engine as eng
 import runner
+from adapters.okx import OkxAdapter
+from adapters.paper import PaperAdapter
 from api import server as api_mod
 from core.gate import GateStateStoreProto
+from core.risk import DEFAULT_LIMITS
 from core.store import SQLiteGateStateStore, SQLitePositionStore
-from core.types import AssetClass, Mode
+from core.types import (
+    AssetClass, Intent, MarketContext, Mode, OrderType, Side,
+)
+from feeds.okx_feed import OkxFeed
 
 TOKEN = "t" * 32
 NOW = dt.datetime(2026, 3, 2, 12, 0, tzinfo=dt.timezone.utc)
@@ -111,10 +117,132 @@ def test_requesting_live_without_the_arm_flag_still_resolves_to_paper(stack) -> 
     assert s.handle.armed[AssetClass.CRYPTO] is False
 
 
-def test_no_live_adapter_is_constructed(stack) -> None:
-    s = stack(TRADER_MODE="live")
-    for wiring in [r.wiring for r in s.engine._runners.values()]:
-        assert wiring.live_adapter is None
+class _SpyTradeExchange:
+    """Any method call is a live venue touch. Paper must never reach this."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def __getattr__(self, name: str):
+        def boom(*_a, **_k):
+            self.calls.append(name)
+            raise AssertionError(
+                f"live OKX exchange.{name}() was called while crypto is disarmed")
+        return boom
+
+
+class _FakePublicOkx:
+    """Enough of the public ccxt surface for OkxFeed.bind()."""
+
+    def __init__(self) -> None:
+        self._markets = {
+            "BTC/USDT": {"spot": True, "active": True},
+            "ETH/USDT": {"spot": True, "active": True},
+            "SOL/USDT": {"spot": True, "active": True},
+        }
+
+    def load_markets(self, reload: bool = False):
+        return self._markets
+
+
+def test_crypto_live_adapter_is_wired_but_unused_while_disarmed(tmp_path) -> None:
+    """Constructing OkxAdapter is not arming. The engine must still place
+    on PaperAdapter until the owner sets both TRADER_MODE=live and CRYPTO_LIVE."""
+    spy = _SpyTradeExchange()
+    env = base_env(tmp_path, TRADER_MODE="live")
+    s = runner.build_stack(env=env, clock=lambda: NOW, okx_trade_exchange=spy)
+    try:
+        crypto = s.engine._runners[AssetClass.CRYPTO]
+        assert isinstance(crypto.wiring.live_adapter, OkxAdapter)
+        assert crypto.wiring.live_adapter.mode is Mode.LIVE
+        assert crypto.mode is Mode.PAPER
+        assert isinstance(crypto.adapter, PaperAdapter)
+        assert s.handle.armed[AssetClass.CRYPTO] is False
+        assert isinstance(s.handle.adapters[AssetClass.CRYPTO], PaperAdapter)
+
+        async def go() -> None:
+            for _ in range(3):
+                await s.engine.tick_once(AssetClass.CRYPTO)
+
+        asyncio.run(go())
+        assert spy.calls == [], (
+            "OkxAdapter.place (or any live venue call) ran without CRYPTO_LIVE")
+    finally:
+        s.close()
+        s.store.close()
+
+
+def test_crypto_live_flag_alone_does_not_route_place_to_okx(tmp_path) -> None:
+    """Arming takes BOTH TRADER_MODE=live and CRYPTO_LIVE. One of them is paper."""
+    spy = _SpyTradeExchange()
+    env = base_env(tmp_path, CRYPTO_LIVE="1")
+    s = runner.build_stack(env=env, clock=lambda: NOW, okx_trade_exchange=spy)
+    try:
+        crypto = s.engine._runners[AssetClass.CRYPTO]
+        assert isinstance(crypto.wiring.live_adapter, OkxAdapter)
+        assert crypto.mode is Mode.PAPER
+        asyncio.run(s.engine.tick_once(AssetClass.CRYPTO))
+        assert spy.calls == []
+    finally:
+        s.close()
+        s.store.close()
+
+
+def test_equity_live_adapter_is_not_wired(stack) -> None:
+    """Dhan's only permitted token sits on the live Fly engine. Do not mint."""
+    s = stack(TRADER_CLASSES="crypto,equity")
+    equity = s.engine._runners[AssetClass.EQUITY]
+    assert equity.wiring.live_adapter is None
+    assert isinstance(s.engine._runners[AssetClass.CRYPTO].wiring.live_adapter,
+                      OkxAdapter)
+
+
+def test_armed_crypto_resolves_to_okx_adapter_when_owner_flags_are_set(
+        tmp_path) -> None:
+    """The wiring the owner needs later: flags set, fakes injected, no real order."""
+    spy = _SpyTradeExchange()
+    env = base_env(tmp_path, TRADER_MODE="live", CRYPTO_LIVE="1")
+    s = runner.build_stack(
+        env=env, clock=lambda: NOW,
+        okx_exchange=_FakePublicOkx(),
+        okx_trade_exchange=spy,
+    )
+    try:
+        crypto = s.engine._runners[AssetClass.CRYPTO]
+        assert crypto.mode is Mode.LIVE
+        assert crypto.adapter is crypto.wiring.live_adapter
+        assert isinstance(crypto.adapter, OkxAdapter)
+        assert s.handle.armed[AssetClass.CRYPTO] is True
+        report = s.engine.arm_report_text()
+        assert "CRYPTO_LIVE=ARMED" in report
+        assert "OkxAdapter" in report
+        assert isinstance(s.feed.feed_for(AssetClass.CRYPTO), OkxFeed)
+        assert spy.calls == [], "construction and bind must not talk to the trade venue"
+    finally:
+        s.close()
+        s.store.close()
+
+
+def test_armed_crypto_without_okx_secrets_refuses_to_boot(tmp_path) -> None:
+    """An unsigned live adapter cannot place and cannot flatten. Fail closed."""
+    env = base_env(tmp_path, TRADER_MODE="live", CRYPTO_LIVE="1")
+    with pytest.raises(RuntimeError, match="OKX_API_KEY"):
+        runner.build_stack(env=env, clock=lambda: NOW,
+                           okx_exchange=_FakePublicOkx())
+
+
+def test_live_crypto_uses_okx_feed_even_when_trader_feed_is_synthetic() -> None:
+    """Owner arming must not require a third env var just to escape the sine wave."""
+    config = runner.RunnerConfig(
+        requested_mode=Mode.LIVE, asset_classes=(AssetClass.CRYPTO,),
+        feed=runner.FeedChoice.SYNTHETIC)
+    resolved = {AssetClass.CRYPTO: Mode.LIVE}
+    instruments = {AssetClass.CRYPTO: runner.default_instruments(AssetClass.CRYPTO)}
+    routes, reports = runner.select_feeds(
+        config, resolved, instruments, okx_exchange=_FakePublicOkx())
+    assert isinstance(routes[AssetClass.CRYPTO], OkxFeed)
+    assert reports[0].source == runner.FeedChoice.OKX.value
+    assert not isinstance(routes[AssetClass.CRYPTO], runner.SyntheticBarFeed)
 
 
 def test_an_unparseable_mode_raises_rather_than_defaulting_to_paper(tmp_path) -> None:
@@ -359,6 +487,86 @@ def test_the_api_reports_ready_against_the_real_stack(stack) -> None:
     client = TestClient(app)
     response = client.get("/ready", headers={"Authorization": f"Bearer {TOKEN}"})
     assert response.status_code == 200, response.json()
+    body = response.json()
+    crypto = body["classes"]["crypto"]
+    assert crypto["armed_live"] is False
+    assert crypto["adapter"] == "PaperAdapter"
+    assert crypto["adapter_mode"] == "paper"
+
+
+def test_boot_report_shows_crypto_disarmed_by_default(stack) -> None:
+    s = stack()
+    text = s.engine.arm_report_text()
+    assert "CRYPTO_LIVE=disarmed" in text
+    assert "mode=paper" in text
+    assert "PaperAdapter" in text
+    assert "OkxAdapter" not in text
+
+
+def test_crypto_notional_cap_is_fifty_usdt_not_ten_percent_of_equity(stack) -> None:
+    """A 2M paper float must not license a 1-coin (or 2-coin) BTC clip.
+    The operator clip is 50 USDT, tighter than 10% of equity (200_000)."""
+    s = stack()
+    limits = s.gate._OrderGate__config.limits_for(AssetClass.CRYPTO)
+    assert limits is runner.CRYPTO_CLASS_LIMITS
+    assert limits.max_order_notional == runner.CRYPTO_CLIP_USDT
+    assert limits.max_daily_notional == runner.CRYPTO_DAILY_USDT
+    assert limits.max_open_positions == 1
+
+    instrument = runner.default_instruments(AssetClass.CRYPTO)[0]
+    # 3 BTC at 100_000 = 300_000; 10% of 2_000_000 is 200_000; clip is 50.
+    intent = Intent(
+        instrument=instrument, side=Side.BUY, qty=Decimal("3"),
+        order_type=OrderType.MARKET, strategy_id="crypto_trend",
+        reason="size-cap probe", idempotency_key="notional-cap-probe")
+    ctx = MarketContext(
+        now=NOW, quotes={instrument.symbol: Decimal("100000")},
+        equity=Decimal("2000000"))
+    approval = s.gate.check(intent, ctx)
+    assert approval.approved, approval.reason
+    assert approval.intent.qty == Decimal("0.0005")   # 50 / 100_000
+    assert approval.intent.qty * Decimal("100000") <= runner.CRYPTO_CLIP_USDT
+    cap = [c for c in approval.checks if c.name == "notional_cap"][0]
+    assert cap.passed
+
+
+def test_crypto_has_a_fail_closed_drawdown_and_daily_loss_circuit(stack) -> None:
+    """A live crypto book must not run unbounded until liquidation."""
+    s = stack()
+    circuit = s.engine._runners[AssetClass.CRYPTO].wiring.risk
+    limits = circuit.limits_for(AssetClass.CRYPTO)
+    assert limits is DEFAULT_LIMITS[AssetClass.CRYPTO]
+    assert limits.flatten_drawdown == Decimal("0.25")
+    assert limits.flatten_daily_loss == Decimal("0.08")
+    assert limits.pause_drawdown == Decimal("0.15")
+    assert limits.pause_daily_loss == Decimal("0.05")
+
+    # Seed a high-water mark, then present a 50% drawdown — past the flatten
+    # rung. The gate must refuse a new entry (exits still have a path).
+    circuit.advance(AssetClass.CRYPTO, Decimal("2000000"))
+    instrument = runner.default_instruments(AssetClass.CRYPTO)[0]
+    intent = Intent(
+        instrument=instrument, side=Side.BUY, qty=Decimal("0.01"),
+        order_type=OrderType.MARKET, strategy_id="crypto_trend",
+        reason="circuit-flatten probe", idempotency_key="circuit-flatten-probe")
+    ctx = MarketContext(
+        now=NOW, quotes={instrument.symbol: Decimal("100000")},
+        equity=Decimal("1000000"))
+    approval = s.gate.check(intent, ctx)
+    assert not approval.approved, approval.reason
+    assert approval.rejections[0].name == "risk_circuit"
+
+
+def test_wired_crypto_strategies_carry_a_hard_stop(stack) -> None:
+    s = stack()
+    strategies = s.engine._runners[AssetClass.CRYPTO].wiring.strategies
+    assert strategies, "a class with no strategy is an unmanaged book"
+    for strategy in strategies:
+        assert getattr(strategy, "max_loss_pct", Decimal("0")) > 0, (
+            f"{strategy.id} has no hard stop; a live position would run to zero")
+        if strategy.id == "crypto_breakout":
+            # True 1h breakout vs 15m feed is pinned to 15m; do not revert.
+            assert strategy.bar_interval == dt.timedelta(minutes=15)
 
 
 def test_a_pause_through_the_api_stops_the_engine_opening_positions(stack) -> None:
@@ -429,3 +637,63 @@ def test_the_engine_places_a_paper_order_through_the_real_gate(stack) -> None:
     assert eng.EventKind.ERROR not in kinds, [
         e.message for e in s.engine.events.recent()
         if e.kind is eng.EventKind.ERROR]
+
+
+def test_equity_trend_is_not_registered_without_a_chain(stack) -> None:
+    s = stack(TRADER_CLASSES="equity")
+    types = [type(st).__name__ for st in
+             s.engine._runners[AssetClass.EQUITY].wiring.strategies]
+    assert "IndexOptionTrendStrategy" not in types
+    assert "EquityMeanReversionStrategy" in types
+
+
+def test_equity_trend_is_registered_only_when_a_chain_exists(tmp_path) -> None:
+    csv = (
+        "SEM_EXM_EXCH_ID,SEM_SEGMENT,SEM_SMST_SECURITY_ID,SEM_INSTRUMENT_NAME,"
+        "SEM_TRADING_SYMBOL,SEM_LOT_UNITS,SEM_EXPIRY_DATE,SEM_TICK_SIZE,"
+        "SEM_SERIES,SEM_STRIKE_PRICE,SEM_OPTION_TYPE\n"
+        "NSE,E,26000,INDEX,NIFTY,1,,0.05,EQ,,\n"
+        "NSE,D,43001,OPTIDX,NIFTY-Sep2026-24000-CE,75,2026-09-24,0.05,,24000,CE\n"
+        "NSE,D,43002,OPTIDX,NIFTY-Sep2026-24000-PE,75,2026-09-24,0.05,,24000,PE\n"
+        "NSE,D,43003,OPTIDX,NIFTY-Sep2026-24100-CE,75,2026-09-24,0.05,,24100,CE\n"
+        "NSE,D,43004,OPTIDX,NIFTY-Sep2026-24100-PE,75,2026-09-24,0.05,,24100,PE\n"
+    )
+    s = runner.build_stack(
+        env=base_env(tmp_path, TRADER_CLASSES="equity"),
+        clock=lambda: NOW,
+        scrip_master=csv,
+    )
+    try:
+        strategies = s.engine._runners[AssetClass.EQUITY].wiring.strategies
+        types = [type(st).__name__ for st in strategies]
+        assert "IndexOptionTrendStrategy" in types
+        assert "EquityMeanReversionStrategy" in types
+        ids = [st.id for st in strategies]
+        assert "equity_trend_nifty" in ids
+        from strategies.equity_trend import CHAIN_KEY
+        extra = s.engine._runners[AssetClass.EQUITY].wiring.extra_provider(
+            AssetClass.EQUITY, NOW)
+        assert CHAIN_KEY in extra
+        assert "NIFTY" in extra[CHAIN_KEY]
+        wired = {i.symbol for i in
+                 s.engine._runners[AssetClass.EQUITY].wiring.instruments}
+        assert "NIFTY" in wired, (
+            "the underlying must be on the watchlist or ctx.quote('NIFTY') "
+            "is absent and the strategy never enters"
+        )
+        assert any("24000-CE" in sym for sym in wired)
+        mean = [st for st in strategies
+                if type(st).__name__ == "EquityMeanReversionStrategy"][0]
+        assert {i.symbol for i in mean.instruments} == {"RELIANCE", "INFY"}
+        assert s.handle.armed.get(AssetClass.EQUITY) is False
+        assert s.engine.runner_modes()[AssetClass.EQUITY] is Mode.PAPER
+    finally:
+        s.close()
+        s.store.close()
+
+
+def test_a_missing_scrip_master_path_refuses_to_boot(tmp_path) -> None:
+    env = base_env(tmp_path, TRADER_CLASSES="equity",
+                   TRADER_SCRIP_MASTER=str(tmp_path / "no-such.csv"))
+    with pytest.raises(RuntimeError, match="scrip-master"):
+        runner.build_stack(env=env, clock=lambda: NOW)

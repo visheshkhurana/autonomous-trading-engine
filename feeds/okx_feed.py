@@ -545,6 +545,13 @@ class OkxFeed:
         value. A stale mark is the failure this whole module exists to prevent,
         and the paper adapter already rejects an order with no quote — absence
         is a defined, loud state, where a leftover price is not.
+
+        That applies to a TRANSPORT failure too, and it is the case that used
+        to slip through: the marks are retired BEFORE the blackout is raised.
+        Raising with the previous prices still sitting in the book is loud and
+        wrong at the same time — nothing trades on that tick, but the book is
+        still marked off frozen numbers by everything that reads the quote
+        source afterwards.
         """
         self._require_bound()
         if now.tzinfo is None or now.utcoffset() is None:
@@ -579,10 +586,22 @@ class OkxFeed:
         try:
             tickers = self._ex.fetch_tickers(sorted(wanted))
         except Exception as exc:
+            # Every mark this call was supposed to re-establish goes FIRST.
+            # Raising straight out would be loud and wrong at the same time:
+            # the tick that failed does not trade, but the quote source is
+            # what `adapter.equity()` marks the book against at the top of the
+            # NEXT tick, before anything refetches, and the risk circuit
+            # advances on whatever number that produces. A frozen mark there
+            # under-reports the drawdown for exactly as long as the venue is
+            # unreachable.
+            self._blackout(quotes, wanted, f"OKX fetch_tickers failed: {exc!r}")
             raise FeedUnavailableError(
                 f"OKX fetch_tickers({sorted(wanted)}) failed: {exc!r}"
             ) from exc
         if not isinstance(tickers, Mapping):
+            self._blackout(
+                quotes, wanted,
+                f"OKX fetch_tickers returned {type(tickers).__name__}")
             raise FeedUnavailableError(
                 f"OKX fetch_tickers returned {type(tickers).__name__}, not a mapping"
             )
@@ -644,6 +663,24 @@ class OkxFeed:
                 return None, f"crossed book: bid {bid} > ask {ask}"
             return (bid + ask) / 2, ""
         return None, "ticker carries no positive last, close or bid/ask"
+
+    def _blackout(self, quotes, wanted: Mapping[str, Instrument],
+                  why: str) -> None:
+        """Retire every mark a failed batch was supposed to re-establish.
+
+        Called on the paths that raise before any per-symbol answer exists. A
+        mark is a claim about right now; a transport failure is the moment we
+        stopped being able to make it, and leaving it in place turns "we lost
+        the venue" into "the price has not moved".
+        """
+        failures = dict(self._unpriced)
+        for instrument in wanted.values():
+            failures[instrument.symbol] = why
+            self._drop_quote(quotes, instrument)
+        with self._lock:
+            self._unpriced = failures
+        LOG.error("OkxFeed blackout, marks removed for %s: %s",
+                  ", ".join(sorted(i.symbol for i in wanted.values())), why)
 
     @staticmethod
     def _drop_quote(quotes, instrument: Instrument) -> None:

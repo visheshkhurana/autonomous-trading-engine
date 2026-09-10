@@ -73,6 +73,9 @@ python3 -m pip install -r requirements.txt
 export TRADER_DB=./var/trader.db
 export TRADER_CLASSES=crypto            # or: crypto,equity
 export ENGINE_API_TOKEN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+# Optional: local Dhan scrip-master CSV. No network, no Dhan token.
+# Unset = IndexOptionTrendStrategy is not registered.
+# export TRADER_SCRIP_MASTER=./var/scrip_master.csv
 
 python3 -m runner
 ```
@@ -98,6 +101,7 @@ curl -s localhost:8080/health                                     # no auth
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/ready
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/api/state
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/api/positions
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/api/orders
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/api/strategies
 curl -s -N -H "Authorization: Bearer $TOKEN" localhost:8080/api/events   # SSE
 ```
@@ -107,37 +111,63 @@ start** without `ENGINE_API_TOKEN` and refuses a CORS config containing `*`.
 There is no development mode that grants access — a fallback that only triggers
 in dev is a fallback that eventually ships.
 
-### The two operator levers
+---
 
-Both only ever *subtract*. Nothing an operator can POST widens what the engine
-may do, and `_ControlBody` forbids extra fields so a body carrying
-`{"mode":"live"}` is a 422 rather than a silently ignored field.
+## Deploying
+
+This repository is the engine. It runs anywhere Python 3.12 does; see
+`Dockerfile` for the image. Deployment specifics (hosting, regions, volumes,
+secrets) belong to whoever operates it and are deliberately not described here.
+
+---
+
+## Kraken paper smoke (one knob, still disarmed)
+
+One env var names the unused live adapter **and** couples the public
+Kraken feed. `KRAKEN_LIVE` stays **unset**. Signal path is the existing
+`crypto_mandate` regime+score (same as OKX) — no new scraper and no
+scrape-to-order trigger. A later paper/research source may fill
+`strategies/mandate/research.py` extras (`funding`, `oi_change`, …);
+that stub returns `{}` today and is not on the live path.
 
 ```bash
-curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-     -d '{"reason":"fills look wrong","actor":"me"}' localhost:8080/api/control/pause
+cd apps/trader
+export TRADER_DB=./var/trader-kraken-paper.db
+export TRADER_CLASSES=crypto
+export TRADER_CRYPTO_VENUE=kraken          # one knob; feed becomes kraken
+# Do not set KRAKEN_LIVE, CRYPTO_LIVE, or TRADER_MODE=live.
+export ENGINE_API_TOKEN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
 
-curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-     -d '{"reason":"closing for the day","actor":"me"}' localhost:8080/api/control/flatten
+python3 -m runner --status
+# crypto_venue=kraken  kraken_live=false  feed=kraken
+# adapter=PaperAdapter  live_adapter=KrakenAdapter  armed_live=false
+# signal=crypto_mandate
+
+python3 -m runner                          # engine + API on :8080
+curl -s -H "Authorization: Bearer $ENGINE_API_TOKEN" localhost:8080/ready
+# same four fields: crypto_venue, kraken_live, feed, classes.crypto.live_adapter
 ```
 
-`pause` stops new positions being opened and closes nothing. Exits keep working
-— refusing to let a strategy close a position because you paused would trap the
-book in exactly the state you reached for the button to get out of.
+Equivalent explicit recipe (the venue knob already implies the feed):
 
-`flatten` **records a request**; the API holds no gate and no order path. The
-engine picks it up on its next tick, routes the exits through the gate, and only
-then writes `flatten_acked_id` back. Until that lands, the response says
-`"executed": false` and `/api/state` shows the request as pending. **A 200 OK
-from `/api/control/flatten` does not mean the book is closed.**
+```bash
+TRADER_CRYPTO_VENUE=kraken TRADER_FEED=kraken   # KRAKEN_LIVE off
+```
 
-### Local market data is fake, and says so
+Public ticker (no keys): `curl -s 'https://api.kraken.com/0/public/Ticker?pair=XBTUSD'`
 
-`runner.SyntheticBarFeed` generates a deterministic triangle wave so the stack
-can be run end to end without credentials, a network, or a data vendor. It is
-**not market data**. It refuses to serve any class the engine resolved to live —
-`bind()` raises — so it cannot follow you into production. Replace it with a
-real feed before arming anything.
+**Today's paper caps stay 50 USDT / 250 daily / max 1 open** on the
+existing 1000 USDT `crypto_mandate` sleeve. Consecutive-loss halt is the
+shared mandate rule (3 losers / 2% daily), same as the OKX paper path.
+
+Later **Kraken live sleeve A** (Vishesh-locked, document only — do **not**
+arm in this PR): **1000 USDT sleeve / 100 USDT per clip / 500 per day /
+max 1 open**, same consecutive-loss halt. Apply those caps only when the
+owner later sets `KRAKEN_LIVE=1` *and* `TRADER_MODE=live` *and*
+`CRYPTO_LIVE=1` *and* Fly secrets `KRAKEN_API_KEY`/`KRAKEN_API_SECRET`.
+`CRYPTO_LIVE` still arms **OKX** when the venue is unset; naming kraken
+without `KRAKEN_LIVE` refuses to boot. Do not set those flags from this
+README.
 
 ---
 
@@ -165,22 +195,39 @@ What they actually do:
   disarmed engine, and the operator would never learn which one they had.
 * The flags are read **once, at construction**. A gate whose arming can change
   under it mid-session cannot be reasoned about from a log line.
-* Constructing a live adapter is **not** arming. `runner.py` builds none at all;
-  wiring one is a separate, deliberate edit.
+* Constructing a live adapter is **not** arming. `runner.py` wires `OkxAdapter`
+  as crypto's `live_adapter` so that when the owner later sets the flags there
+  is somewhere for a live-approved order to go. It is never called unless both
+  `TRADER_MODE=live` and `CRYPTO_LIVE` are set. Equity's live adapter is still
+  not constructed — that would need a Dhan token, and the live Fly engine holds
+  the only permitted one.
 
-Before you set either one, three things must be true:
+Crypto, once the owner arms it (and only then):
 
-1. **Replace `SyntheticBarFeed` with a real market data feed.** It will refuse
-   to start otherwise, which is the point.
-2. **Wire a `live_adapter` into the `ClassWiring`** for that class. The engine
-   refuses to start if a class is armed, live was requested, and no live adapter
-   is wired — rather than trading a live-approved order on paper.
-3. **Read `adapters/dhan.py` on F&O execution.** There is no bid/ask in the
-   quote path; a LIMIT order needs fill confirmation or a short leg can end up
-   naked.
+1. **`OkxFeed` serves the book.** A live crypto class is routed to the public
+   OKX feed even if `TRADER_FEED` is left at its paper default (`synthetic`).
+   `SyntheticBarFeed` still refuses to serve any live class; that refusal is
+   load-bearing and must not be reopened.
+2. **The live adapter is already wired.** No second code edit. Missing OKX
+   trade secrets (`OKX_API_KEY`, `OKX_API_SECRET`, `OKX_PASSPHRASE`) refuse to
+   boot an armed crypto class rather than start an unsigned live book.
+3. **Size is capped and sized down.** The gate's crypto `ClassLimits`: **10% of
+   equity per order**, **30% of equity for the class**, 5 open positions, 20
+   orders/day. An oversized entry is scaled down to the cap (lot-snapped,
+   ROUND_DOWN), not only refused. Live is not a reason to uncap. Unknown
+   equity, unknown exposure, a scale that prints nothing, and reducing orders
+   are still fail-closed.
+4. **Risk is bounded.** Crypto `RiskLimits` flatten at **25% drawdown** and
+   **8% daily loss** (pause at 15% / 5%, reduce at 8% / 3%). Each wired crypto
+   strategy also carries an 8% hard stop. Flatten and pause refuse new entries;
+   reducing exits still pass.
+
+Do not set `CRYPTO_LIVE` or `EQUITY_LIVE` in this README, in a deploy script,
+or in a test that would ship armed. Paper is the default and must stay the
+default.
 
 Check what you have armed without guessing — the boot report prints one line per
-class, and `/api/state` shows `armed_live` per class:
+class, and `/ready` / `/api/state` show `armed_live` per class:
 
 ```bash
 python3 -c "
@@ -212,14 +259,14 @@ is a test that fails if the rule is removed; several were verified by mutation
 
 These are real and unresolved. They are written down rather than smoothed over.
 
-**The gate CAPS, it does not SIZE.** `strategies/base.py` says "no sizing — the
-gate sizes and caps", but `core/gate.py` only ever *rejects* an order that
-breaches `max_order_notional_fraction` (10% of equity by default); the only path
-that scales a quantity down is the risk circuit's `size_multiplier`. So a crypto
-strategy proposing one unit of the base asset needs equity of roughly ten times
-that asset's price or every entry is refused with `notional_cap`. The paper
-float in `RunnerConfig` is sized for this. Symptom if you get it wrong: an
-engine that ticks forever, logs cleanly, and never trades.
+**The gate SIZES down to the cap, then refuses what cannot print.** Strategies
+propose a raw unit qty (one lot, one coin). An entry whose notional exceeds
+`max_order_notional_fraction` (10% of equity by default) is scaled down through
+the profile (ROUND_DOWN) rather than only rejected. A scale that snaps to zero
+lots, or under the min notional, is still a refusal. Reducing orders are never
+resized — shrinking an exit leaves a tail on. A structure short that would
+outrun its (possibly sized) hedge is still refused, not silently shrunk.
+Unknown equity still refuses; paper vs live remains an adapter choice.
 
 **A transient data gap can permanently disable a strategy.** When a strategy
 holds a position and its bars go missing or stale, it raises `MissingDataError`

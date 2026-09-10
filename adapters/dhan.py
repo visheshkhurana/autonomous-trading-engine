@@ -39,6 +39,7 @@ import csv
 import datetime as dt
 import io
 import logging
+import re
 import time
 from dataclasses import dataclass, replace
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
@@ -91,6 +92,11 @@ _DHAN_STATUS: dict[str, OrderStatus] = {
 
 # SEM_SEGMENT letter -> the suffix Dhan wants in `exchange_segment`.
 _SEGMENT_SUFFIX = {"E": "EQ", "D": "FNO", "C": "CURRENCY", "M": "COMM", "I": "INDEX"}
+_OPTION_KINDS = frozenset({"OPTIDX", "OPTSTK"})
+_OPTION_SYM_RE = re.compile(
+    r"^(?P<und>[A-Z0-9]+)-[A-Za-z]{3}\d{4}-(?P<strike>\d+(?:\.\d+)?)-(?P<right>CE|PE)$",
+    re.IGNORECASE,
+)
 
 
 # ── failures ────────────────────────────────────────────────────────────────
@@ -247,6 +253,21 @@ class ScripRecord:
     tick_size: Decimal
     instrument_kind: str    # EQUITY / OPTIDX / FUTIDX / OPTSTK / FUTSTK
     expiry: Optional[dt.date] = None
+    strike: Optional[Decimal] = None
+    option_type: Optional[str] = None   # CE / PE
+    underlying: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ScripMasterParse:
+    """Records plus the option rows that could not be indexed.
+
+    The option-chain builder refuses to publish if `skipped_option_rows` is
+    non-empty: dropping those rows silently is how a chain is short of the
+    strikes the strategy thinks exist.
+    """
+    records: tuple[ScripRecord, ...]
+    skipped_option_rows: tuple[str, ...]
 
 
 class DhanSecurityMap:
@@ -267,10 +288,12 @@ class DhanSecurityMap:
         records: Optional[Iterable[ScripRecord]] = None,
         *,
         loader: Optional[Callable[[], str]] = None,
+        skipped_option_rows: Sequence[str] = (),
     ) -> None:
         self._loader = loader
         self._by_symbol: dict[tuple[str, str], ScripRecord] = {}
         self._by_id: dict[str, ScripRecord] = {}
+        self._skipped_option_rows: tuple[str, ...] = tuple(skipped_option_rows)
         self._loaded = False
         if records is not None:
             self._index(records)
@@ -280,7 +303,9 @@ class DhanSecurityMap:
 
     @classmethod
     def from_csv(cls, text: str) -> "DhanSecurityMap":
-        return cls(records=parse_scrip_master(text))
+        parsed = parse_scrip_master_report(text)
+        return cls(records=parsed.records,
+                   skipped_option_rows=parsed.skipped_option_rows)
 
     def _index(self, records: Iterable[ScripRecord]) -> None:
         for rec in records:
@@ -295,7 +320,9 @@ class DhanSecurityMap:
                 "DhanSecurityMap has no records and no loader — cannot resolve "
                 "any symbol. Supply the scrip master."
             )
-        self._index(parse_scrip_master(self._loader()))
+        parsed = parse_scrip_master_report(self._loader())
+        self._index(parsed.records)
+        self._skipped_option_rows = parsed.skipped_option_rows
         self._loaded = True
 
     # -- lookup ------------------------------------------------------------
@@ -342,6 +369,14 @@ class DhanSecurityMap:
             expiry=rec.expiry,
         )
 
+    def records(self) -> tuple[ScripRecord, ...]:
+        self._ensure_loaded()
+        return tuple(self._by_id.values())
+
+    def skipped_option_rows(self) -> tuple[str, ...]:
+        self._ensure_loaded()
+        return self._skipped_option_rows
+
     def __len__(self) -> int:
         return len(self._by_symbol)
 
@@ -352,17 +387,43 @@ def parse_scrip_master(text: str) -> list[ScripRecord]:
     Rows missing an exchange, symbol or security_id are skipped: they cannot be
     traded and indexing them under a partial key would let a later lookup
     return the wrong contract. Everything else is kept, derivatives included.
+    Option-looking rows that cannot be fully parsed are counted by
+    `parse_scrip_master_report` so a chain builder can refuse a silently-short
+    book rather than this helper having to change its skip-unusable contract.
     """
+    return list(parse_scrip_master_report(text).records)
+
+
+def parse_scrip_master_report(text: str) -> ScripMasterParse:
+    """Parse the CSV and report option rows that were dropped."""
     out: list[ScripRecord] = []
-    for row in csv.DictReader(io.StringIO(text)):
+    skipped: list[str] = []
+    for index, row in enumerate(csv.DictReader(io.StringIO(text)), start=2):
         exch = (row.get("SEM_EXM_EXCH_ID") or "").strip().upper()
         symbol = (row.get("SEM_TRADING_SYMBOL") or "").strip().upper()
         sid = (row.get("SEM_SMST_SECURITY_ID") or "").strip()
+        kind = (row.get("SEM_INSTRUMENT_NAME") or "").strip().upper()
+        is_option = kind in _OPTION_KINDS
         if not (exch and symbol and sid):
+            if is_option:
+                skipped.append(
+                    f"line {index}: option row {symbol or '<no symbol>'} "
+                    f"kind={kind} dropped (missing exchange/symbol/security_id)"
+                )
             continue
         seg_letter = (row.get("SEM_SEGMENT") or "E").strip().upper()[:1]
         lot = _num(row.get("SEM_LOT_UNITS"))
         tick = _num(row.get("SEM_TICK_SIZE"))
+        expiry = _parse_expiry(row.get("SEM_EXPIRY_DATE"))
+        strike, right, underlying = _option_fields(row, symbol)
+        if is_option and (strike is None or right is None or expiry is None
+                          or not underlying):
+            skipped.append(
+                f"line {index}: option row {symbol} sid={sid} dropped "
+                f"(strike={strike} right={right} expiry={expiry} "
+                f"underlying={underlying})"
+            )
+            continue
         out.append(
             ScripRecord(
                 security_id=sid,
@@ -372,11 +433,38 @@ def parse_scrip_master(text: str) -> list[ScripRecord]:
                 series=(row.get("SEM_SERIES") or "").strip().upper(),
                 lot_size=int(lot) if (lot is not None and lot >= 1) else 1,
                 tick_size=tick if (tick is not None and tick > 0) else Decimal("0.05"),
-                instrument_kind=(row.get("SEM_INSTRUMENT_NAME") or "").strip().upper(),
-                expiry=_parse_expiry(row.get("SEM_EXPIRY_DATE")),
+                instrument_kind=kind,
+                expiry=expiry,
+                strike=strike,
+                option_type=right,
+                underlying=underlying,
             )
         )
-    return out
+    return ScripMasterParse(tuple(out), tuple(skipped))
+
+
+def _option_fields(row: Mapping[str, Any], symbol: str
+                   ) -> tuple[Optional[Decimal], Optional[str], Optional[str]]:
+    """Strike / right / underlying from dedicated columns, else the symbol."""
+    strike = _num(row.get("SEM_STRIKE_PRICE"))
+    right = (row.get("SEM_OPTION_TYPE") or "").strip().upper() or None
+    if right not in ("CE", "PE"):
+        right = None
+    underlying = (row.get("SEM_UNDERLYING") or row.get("SEM_CUSTOM_SYMBOL")
+                  or "").strip().upper() or None
+    if underlying and "-" in underlying:
+        underlying = underlying.split("-", 1)[0]
+    match = _OPTION_SYM_RE.match(symbol)
+    if match:
+        if strike is None or strike <= 0:
+            strike = Decimal(match.group("strike"))
+        if right is None:
+            right = match.group("right").upper()
+        if not underlying:
+            underlying = match.group("und").upper()
+    if strike is not None and strike <= 0:
+        strike = None
+    return strike, right, underlying
 
 
 def _parse_expiry(value: Any) -> Optional[dt.date]:

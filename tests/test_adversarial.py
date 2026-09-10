@@ -108,8 +108,14 @@ class Counters:
             raise GateStateUnavailable("state store down")
         return self.count
 
+    def daily_notional(self, asset_class: AssetClass, day_key: str) -> Decimal:
+        if "daily_notional" in self._fail_on:
+            raise GateStateUnavailable("state store down")
+        return Decimal("0")
+
     def record_submission(self, idempotency_key: str, asset_class: AssetClass,
-                          day_key: str, now: dt.datetime) -> None:
+                          day_key: str, now: dt.datetime,
+                          notional: Decimal = Decimal("0")) -> None:
         if "record_submission" in self._fail_on:
             raise GateStateUnavailable("state store down")
         self.seen.add(idempotency_key)
@@ -372,16 +378,28 @@ def _spread_legs(*, qty: str = "75", long_px: str = "200",
     return long_leg, short_leg
 
 
-def test_the_notional_cap_rejects_the_long_leg_of_a_debit_spread() -> None:
-    """Establishes the premise of the exploit, so the test below cannot pass
-    for the wrong reason."""
+def test_the_notional_cap_sizes_the_long_leg_of_a_debit_spread() -> None:
+    """The long leg of a debit spread is the expensive one. Sizing it down
+    (rather than refusing) is what lets the structure trade; the short at the
+    original qty must still be refused if it would outrun the sized hedge."""
     config = GateConfig(default_limits=ClassLimits(
         max_order_notional_fraction=D("0.10"), max_allocation_fraction=D("0.30")))
     long_leg, _ = _spread_legs()
     # 75 * 200 = 15,000 against a 10,000 cap (10% of 100,000).
+    # lot=25 so 10000/200 = 50, which is two lots.
     approval = gate(config=config).check(long_leg, market(equity="100000"))
+    assert approval.approved, approval.reason
+    assert approval.intent.qty == D("50")
+
+
+def test_the_short_leg_may_not_outrun_a_sized_down_hedge() -> None:
+    """After the long is sized to 50, selling the original 75 would be naked."""
+    book = [held(NIFTY_LONG, "50", strategy_id="trend", avg="200",
+                 structure_id="spread-1")]
+    _, short_leg = _spread_legs(qty="75")
+    approval = gate(book=book).check(short_leg, market(equity="1000000"))
     assert not approval.approved
-    assert approval.rejections[0].name == "notional_cap"
+    assert approval.rejections[0].name == "structure_legs"
 
 
 def test_the_short_leg_is_refused_when_no_other_leg_of_its_structure_is_open() -> None:
@@ -391,8 +409,8 @@ def test_the_short_leg_is_refused_when_no_other_leg_of_its_structure_is_open() -
     # 75 * 50 = 3,750 — comfortably under every cap on its own.
     approval = gate(config=config).check(short_leg, market(equity="100000"))
     assert not approval.approved, (
-        "the long leg was refused; placing this one alone leaves a naked "
-        "short call with unbounded loss"
+        "no hedge is in the book; placing this short alone leaves a naked "
+        "call with unbounded loss"
     )
     assert approval.rejections[0].name == "structure_legs"
 

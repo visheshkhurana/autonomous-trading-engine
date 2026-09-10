@@ -33,9 +33,12 @@ def strat(**kw) -> CryptoBreakoutStrategy:
     return CryptoBreakoutStrategy(**params)
 
 
-def make_ctx(rows, positions=(), now=None):
+def make_ctx(rows, positions=(), now=None, quotes=None):
     bars = ohlc_bars(rows, START, INTERVAL)
-    return context(now or bars[-1].ts, bars={"ETH/USDT": bars}, positions=positions), bars
+    if quotes is None:
+        quotes = {"ETH/USDT": bars[-1].close}
+    return (context(now or bars[-1].ts, bars={"ETH/USDT": bars},
+                    positions=positions, quotes=quotes), bars)
 
 
 # ------------------------------------------------------------------ entry
@@ -46,7 +49,9 @@ def test_a_close_through_the_range_high_opens_a_long():
     assert len(intents) == 1
     i = intents[0]
     assert i.side is Side.BUY
-    assert i.order_type is OrderType.MARKET and i.limit_price is None
+    assert i.order_type is OrderType.MARKET
+    assert i.limit_price == bars[-1].close
+    assert i.limit_price > 0
     assert "breakout" in i.reason and "5-bar high 102" in i.reason
 
 
@@ -92,6 +97,25 @@ def test_no_entry_while_already_holding_or_when_another_strategy_holds():
 def test_short_history_is_quiet():
     ctx, _ = make_ctx([(101, 102, 100, 101)] * 3)
     assert list(strat().propose(ctx)) == []
+
+
+def test_a_breakout_without_a_quote_is_not_an_entry():
+    ctx, _ = make_ctx(RANGE_ROWS + [BREAKOUT_ROW], quotes={})
+    assert list(strat().propose(ctx)) == []
+
+
+def test_a_zero_quote_is_unknown_and_does_not_enter():
+    ctx, _ = make_ctx(RANGE_ROWS + [BREAKOUT_ROW],
+                      quotes={"ETH/USDT": Decimal("0")})
+    assert list(strat().propose(ctx)) == []
+
+
+def test_an_open_position_with_no_quote_raises_rather_than_going_unmanaged():
+    rows = RANGE_ROWS + [BREAKOUT_ROW] + [(105, 105, 99, 99)]
+    ctx, _ = make_ctx(rows, positions=[position(ETH, 1, 105, strategy_id="crypto_breakout")],
+                      quotes={})
+    with pytest.raises(MissingDataError, match="quote"):
+        strat().propose(ctx)
 
 
 # ------------------------------------------------------------------- exit
@@ -150,9 +174,11 @@ def test_a_short_spot_position_raises():
 def test_repeating_the_tick_repeats_the_idempotency_key():
     rows = RANGE_ROWS + [BREAKOUT_ROW]
     bars = ohlc_bars(rows, START, INTERVAL)
-    a = strat().propose(context(bars[-1].ts, bars={"ETH/USDT": bars}))
+    a = strat().propose(context(bars[-1].ts, bars={"ETH/USDT": bars},
+                                quotes={"ETH/USDT": bars[-1].close}))
     b = strat().propose(context(bars[-1].ts + dt.timedelta(minutes=31),
-                                bars={"ETH/USDT": bars}))
+                                bars={"ETH/USDT": bars},
+                                quotes={"ETH/USDT": bars[-1].close}))
     assert a[0].idempotency_key == b[0].idempotency_key
 
 

@@ -87,7 +87,11 @@ class FakeOkx:
     def __init__(self, ohlcv=None, tickers=None, markets=None) -> None:
         self._ohlcv = [] if ohlcv is None else ohlcv
         self._tickers = {} if tickers is None else tickers
-        self._markets = markets or {"BTC/USDT": {"spot": True, "active": True}}
+        self._markets = markets or {
+            "BTC/USDT": {"spot": True, "active": True},
+            "ETH/USDT": {"spot": True, "active": True},
+            "SOL/USDT": {"spot": True, "active": True},
+        }
         self.ohlcv_calls = 0
 
     def load_markets(self):
@@ -415,7 +419,8 @@ def test_no_configuration_puts_a_live_class_on_generated_prices():
                 try:
                     routes, _ = runner.select_feeds(
                         config, resolved, instruments,
-                        dhan_client=FakeDhan(), okx_exchange=exchange)
+                        dhan_client=FakeDhan(), okx_exchange=exchange,
+                        kraken_exchange=exchange)
                     runner.CompositeFeed(routes, instruments).bind(resolved)
                 except Exception:
                     continue          # refused to boot: the correct outcome
@@ -502,3 +507,425 @@ def test_no_price_loses_precision_on_the_way_to_a_strategy():
         row[1] = row[2] = row[3] = row[4] = exact
     okx_bars = okx_feed(FakeOkx(ohlcv=okx_raw)).bars("BTC/USDT", CRYPTO_NOW)
     assert okx_bars[-1].close == Decimal(exact)
+
+
+# ===========================================================================
+# 3, second pass. The THIRD route onto SyntheticBarFeed.
+#
+# The direct route (`bars()` before `bind()`) and the composite route (a live
+# class in the mode map) both refuse. What neither of them proves is that a
+# bind which SUCCEEDED vouched for the class actually being served.
+#
+# `bind()` checked the modes it was handed and then set one boolean. It kept
+# no record of WHICH classes those were, so `_require_bound()` only ever
+# established that some bind had happened somewhere. Three consequences, all
+# reachable:
+#
+#   * `bind({})` vouches for nothing and unlocks everything;
+#   * a feed vouched for CRYPTO/paper prices EQUITY, and in the shipped wiring
+#     the synthetic instance is SHARED and holds every class's instruments
+#     (`select_feeds`'s `synthetic_universe`), so the equity names really are
+#     in there waiting to be priced;
+#   * a REBIND that is refused leaves the earlier vouch standing — the
+#     operator arms the class, the re-bind raises exactly as designed, and the
+#     feed carries on serving generated prices to a now-live book.
+# ===========================================================================
+
+def test_synthetic_bind_for_one_class_does_not_license_pricing_another():
+    """ATTACK: bind for the paper class, then ask it to price the live one.
+
+    This is the shared-instance shape `select_feeds` actually builds: crypto
+    falls back to synthetic, equity is armed and routed to Dhan, and the one
+    SyntheticBarFeed holds both universes.
+    """
+    universe = (runner.default_instruments(AssetClass.CRYPTO)
+                + runner.default_instruments(AssetClass.EQUITY))
+    feed = runner.SyntheticBarFeed(universe)
+    feed.bind({AssetClass.CRYPTO: Mode.PAPER})
+
+    quotes = InMemoryQuoteSource()
+    with pytest.raises(RuntimeError, match="equity"):
+        feed.refresh_quotes(quotes, AssetClass.EQUITY, CRYPTO_NOW)
+    assert len(quotes) == 0, "generated equity prices reached the quote source"
+
+    with pytest.raises(RuntimeError, match="equity"):
+        feed.extra_provider(AssetClass.EQUITY, CRYPTO_NOW)
+    with pytest.raises(RuntimeError, match="equity"):
+        feed.bars("RELIANCE", CRYPTO_NOW)
+
+
+def test_synthetic_bind_with_an_empty_mode_map_vouches_for_nothing():
+    """ATTACK: `bind({})`. No mode in the map is LIVE, so the live refusal has
+    nothing to refuse, and the feed comes back bound and willing to price
+    anything at all."""
+    feed = runner.SyntheticBarFeed(runner.default_instruments(AssetClass.CRYPTO))
+    with pytest.raises(RuntimeError, match="no modes"):
+        feed.bind({})
+    quotes = InMemoryQuoteSource()
+    with pytest.raises(RuntimeError):
+        feed.refresh_quotes(quotes, AssetClass.CRYPTO, CRYPTO_NOW)
+    assert len(quotes) == 0
+
+
+def test_a_refused_rebind_does_not_leave_the_earlier_vouch_standing():
+    """ATTACK: bind paper, arm the class, re-bind. The re-bind raises — and
+    the composite, already bound, keeps serving the synthetic feed to a class
+    the engine now resolves LIVE.
+
+    A bind() that fails must leave the feed UNUSABLE. Anything else means the
+    refusal was cosmetic.
+    """
+    instruments = runner.default_instruments(AssetClass.CRYPTO)
+    synthetic = runner.SyntheticBarFeed(instruments)
+    composite = runner.CompositeFeed(
+        {AssetClass.CRYPTO: synthetic}, {AssetClass.CRYPTO: instruments},
+    ).bind({AssetClass.CRYPTO: Mode.PAPER})
+
+    with pytest.raises(RuntimeError, match="live"):
+        composite.bind({AssetClass.CRYPTO: Mode.LIVE})
+
+    quotes = InMemoryQuoteSource()
+    with pytest.raises(RuntimeError, match="bind"):
+        composite.refresh_quotes(quotes, AssetClass.CRYPTO, CRYPTO_NOW)
+    assert len(quotes) == 0, "a live class was priced off generated data"
+    with pytest.raises(RuntimeError, match="bind"):
+        composite.bars("BTC/USDT", CRYPTO_NOW)
+
+
+def test_synthetic_feed_will_not_invent_a_series_for_a_symbol_it_never_had():
+    """`_series_shape()` hashes whatever string it is given, so every symbol
+    in the world has a price. Both real feeds refuse an unknown symbol by
+    name; this one answered a typo with a confident series."""
+    feed = runner.SyntheticBarFeed(
+        runner.default_instruments(AssetClass.CRYPTO)
+    ).bind({AssetClass.CRYPTO: Mode.PAPER})
+    with pytest.raises(RuntimeError, match="not in this feed"):
+        feed.bars("RELAINCE", CRYPTO_NOW)
+
+
+def test_synthetic_mark_is_not_a_way_round_the_live_check():
+    """`mark()` hands out a price and had no bind guard — the one public
+    price-producing method the live refusal did not cover."""
+    feed = runner.SyntheticBarFeed(runner.default_instruments(AssetClass.CRYPTO))
+    with pytest.raises(RuntimeError, match="before bind"):
+        feed.mark("BTC/USDT", CRYPTO_NOW)
+
+
+# ===========================================================================
+# 2 + 4. A mark that outlives the failure which retired it.
+#
+# DhanFeed drops every mark it cannot re-establish BEFORE it raises the
+# blackout ("a failure that left the last tick's prices sitting in the book
+# would be loud and wrong at the same time"). OkxFeed does not: a transport
+# failure on fetch_tickers raises straight out and every previous mark stays
+# in the quote source.
+#
+# The tick that failed does not trade — but `adapter.equity()` marks the book
+# off that quote source at the TOP of the next tick, before anything refetches,
+# and the risk circuit advances on the number it gets. A frozen mark there
+# under-reports the drawdown for as long as the venue is unreachable, which is
+# precisely when it matters.
+# ===========================================================================
+
+def test_okx_does_not_leave_a_mark_standing_through_the_blackout():
+    """ATTACK: price the book, then take the venue away. The blackout must
+    raise AND leave nothing behind that reads as a current mark."""
+    class Flaky(FakeOkx):
+        down = False
+
+        def fetch_tickers(self, symbols):
+            if self.down:
+                raise ConnectionError("okx unreachable")
+            return super().fetch_tickers(symbols)
+
+    exchange = Flaky(tickers={"BTC/USDT": {
+        "timestamp": int(CRYPTO_NOW.timestamp() * 1000), "last": "70000"}})
+    feed = okx_feed(exchange)
+    quotes = InMemoryQuoteSource()
+    feed.refresh_quotes(quotes, AssetClass.CRYPTO, CRYPTO_NOW)
+    assert price_of(quotes, BTC) == Decimal("70000")
+
+    exchange.down = True
+    with pytest.raises(FeedUnavailableError):
+        feed.refresh_quotes(quotes, AssetClass.CRYPTO,
+                            CRYPTO_NOW + dt.timedelta(hours=6))
+    assert price_of(quotes, BTC) is None, (
+        "the mark the feed can no longer vouch for outlived the failure that "
+        "retired it")
+
+
+def test_dhan_will_not_publish_an_empty_bar_book_for_a_live_class():
+    """ATTACK: an all-derivative universe — the defined-risk option book this
+    system is built to trade.
+
+    `extra_provider()` skips derivative legs (correctly: they have no equity
+    candle history), so with nothing else in the registry it published
+    `{bars: {}}`. That is not None and it does carry BARS_KEY, so
+    CompositeFeed's guard passes it through, and every bar-driven strategy
+    reads it as a market with nothing to say while `refresh_quotes` keeps the
+    legs priced and the class keeps trading.
+    """
+    leg = eq("NIFTY25JUN24000CE", "43211", expiry=dt.date(2025, 6, 26))
+    client = FakeDhan(quotes={"43211": {"ltp": "101.50"}})
+    feed = DhanFeed([leg], client).bind({AssetClass.EQUITY: Mode.LIVE})
+
+    with pytest.raises(FeedUnavailableError) as excinfo:
+        feed.extra_provider(AssetClass.EQUITY, OPEN_NOW)
+    assert "bar" in str(excinfo.value).lower()
+    assert client.ohlc_calls == [], "an option leg must never be asked for candles"
+
+
+def test_dhan_still_publishes_a_bar_book_when_it_has_one():
+    """The counterweight: the guard above must not fail a mixed universe."""
+    ins = [eq(), eq("NIFTY25JUN24000CE", "43211", expiry=dt.date(2025, 6, 26))]
+    client = FakeDhan(candles=dhan_rows(OPEN_NOW - INTERVAL, 40))
+    extra = DhanFeed(ins, client).bind(
+        {AssetClass.EQUITY: Mode.PAPER}).extra_provider(
+            AssetClass.EQUITY, OPEN_NOW)
+    assert set(extra[BARS_KEY]) == {"RELIANCE"}
+
+
+# ===========================================================================
+# 2, the engine seam. The marks a strategy is handed are the PREVIOUS tick's.
+#
+# `build_stack` wires the refresh into `extra_provider` and says so in a
+# comment: "Marks and bars come from ONE source and are refreshed together. A
+# quote from a different clock than the bars is how a strategy's stop is
+# evaluated against a price the entry never saw."
+#
+# The engine's tick does not honour that. `_trade()` snapshots the quotes off
+# the adapter FIRST and calls `extra_provider` — the thing that refreshes them
+# — second, so every ctx carries this tick's bars beside last tick's marks.
+# `IndexOptionTrendStrategy` and `EquityMeanReversionStrategy` both price
+# their marketable LIMITs off `ctx.quote()`, and the gate's notional caps and
+# exposure sum read the same stale numbers.
+#
+# The sharp edge is not the lag itself but what it does to a retirement: on
+# the tick where the feed decides it can no longer vouch for a mark and
+# REMOVES it, the strategy is still handed the removed price, because the
+# snapshot was taken before the removal.
+# ===========================================================================
+
+def _one_class_engine(feed, quotes, strategy, clock):
+    """The smallest engine that exercises the real build_stack seam."""
+    import engine as engine_mod
+    from adapters.paper import PaperAdapter
+    from core.gate import GateConfig, OrderGate
+    from core.risk import RiskCircuit
+    from core.store import SQLitePositionStore
+
+    class _NoGateState:
+        def seen_recently(self, *a, **k): return None
+        def record_submission(self, *a, **k): return None
+        def prune(self, *a, **k): return None
+
+    store = SQLitePositionStore(":memory:")
+    circuit = RiskCircuit(store, Mode.PAPER, clock=clock)
+    adapter = PaperAdapter(AssetClass.CRYPTO, quotes, Decimal("100000"),
+                           now=clock, sleep=lambda s: None)
+
+    def extra_provider(asset_class, now):
+        feed.refresh_quotes(quotes, asset_class, now)
+        return feed.extra_provider(asset_class, now)
+
+    wiring = engine_mod.ClassWiring(
+        asset_class=AssetClass.CRYPTO, paper_adapter=adapter, risk=circuit,
+        strategies=(strategy,), instruments=(BTC,), tick_interval_s=0.01,
+        extra_provider=extra_provider)
+    return engine_mod.Engine(
+        wirings=[wiring], store=store,
+        gate=OrderGate(position_store=store, gate_state=_NoGateState(),
+                       risk_circuit=circuit,
+                       config=GateConfig(requested_mode=Mode.PAPER), env={}),
+        config=engine_mod.EngineConfig(requested_mode=Mode.PAPER),
+        clock=clock, env={})
+
+
+def test_the_marks_a_strategy_sees_come_from_this_tick_not_the_last_one():
+    """ATTACK: move the price between ticks and read what the strategy got.
+
+    Tick 1 must not hand a strategy an empty quote map while the venue is
+    quoting, and tick 2 must not hand it tick 1's price.
+    """
+    import asyncio
+
+    class Clock:
+        def __init__(self, at): self.at = at
+        def __call__(self): return self.at
+
+    class MovingOkx(FakeOkx):
+        def __init__(self):
+            super().__init__(ohlcv=okx_rows(CRYPTO_NOW - INTERVAL, 60))
+            self.at = CRYPTO_NOW
+            self.last = "70000"
+
+        def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
+            self.ohlcv_calls += 1
+            return okx_rows(self.at - INTERVAL, 60)
+
+        def fetch_tickers(self, symbols):
+            return {s: {"timestamp": int(self.at.timestamp() * 1000),
+                        "last": self.last} for s in symbols}
+
+    class Spy:
+        id, asset_class = "spy", AssetClass.CRYPTO
+
+        def __init__(self): self.seen = []
+
+        def propose(self, ctx):
+            self.seen.append(ctx.quote("BTC/USDT"))
+            return []
+
+    exchange = MovingOkx()
+    feed = okx_feed(exchange)
+    quotes = InMemoryQuoteSource()
+    clock = Clock(CRYPTO_NOW)
+    spy = Spy()
+    eng = _one_class_engine(feed, quotes, spy, clock)
+
+    asyncio.run(eng.tick_once(AssetClass.CRYPTO))
+    exchange.last = "80000"
+    clock.at = exchange.at = CRYPTO_NOW + dt.timedelta(seconds=5)
+    asyncio.run(eng.tick_once(AssetClass.CRYPTO))
+
+    assert spy.seen == [Decimal("70000"), Decimal("80000")], (
+        "the strategy was handed the previous tick's marks alongside this "
+        f"tick's bars: {spy.seen}")
+
+
+def test_a_mark_the_feed_retired_this_tick_does_not_reach_the_strategy():
+    """The consequence that actually costs money.
+
+    Tick 1: the venue is quoting and the strategy must see that mark — not the
+    empty map a pre-refresh snapshot hands it. Tick 2: the ticker arrives with
+    no timestamp, the feed refuses it, removes the mark and raises, and no
+    strategy may be evaluated at all. What must never appear in `seen` is a
+    price on the tick the feed retired it.
+    """
+    import asyncio
+
+    class Clock:
+        def __init__(self, at): self.at = at
+        def __call__(self): return self.at
+
+    class GoesQuiet(FakeOkx):
+        def __init__(self):
+            super().__init__(ohlcv=okx_rows(CRYPTO_NOW - INTERVAL, 60))
+            self.at = CRYPTO_NOW
+            self.quiet = False
+
+        def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
+            self.ohlcv_calls += 1
+            return okx_rows(self.at - INTERVAL, 60)
+
+        def fetch_tickers(self, symbols):
+            if self.quiet:
+                # A ticker with no timestamp: present, unageable, refused.
+                return {s: {"last": "70000"} for s in symbols}
+            return {s: {"timestamp": int(self.at.timestamp() * 1000),
+                        "last": "70000"} for s in symbols}
+
+    class Spy:
+        id, asset_class = "spy", AssetClass.CRYPTO
+
+        def __init__(self): self.seen = []
+
+        def propose(self, ctx):
+            self.seen.append(ctx.quote("BTC/USDT"))
+            return []
+
+    exchange = GoesQuiet()
+    feed = okx_feed(exchange)
+    quotes = InMemoryQuoteSource()
+    clock = Clock(CRYPTO_NOW)
+    spy = Spy()
+    eng = _one_class_engine(feed, quotes, spy, clock)
+
+    asyncio.run(eng.tick_once(AssetClass.CRYPTO))
+    exchange.quiet = True
+    clock.at = exchange.at = CRYPTO_NOW + dt.timedelta(seconds=5)
+    # The feed empties the book and says so; the tick stops there.
+    with pytest.raises(FeedUnavailableError):
+        asyncio.run(eng.tick_once(AssetClass.CRYPTO))
+
+    assert price_of(quotes, BTC) is None
+    assert spy.seen == [Decimal("70000")], (
+        "tick 1 must hand the strategy the mark the venue was actually "
+        f"quoting, and tick 2 must not evaluate it at all: {spy.seen}")
+
+
+# ===========================================================================
+# 3, third pass. `Mode` is a str Enum, and every live refusal in the feed
+# layer is written `is Mode.LIVE`.
+#
+# `Mode("live") is Mode.LIVE` is True, so a map built through the enum is
+# safe. A map built from a config file, a JSON payload or an API round trip
+# carries the bare string `"live"` — which is EQUAL to Mode.LIVE everywhere it
+# is printed, logged or compared with `==`, and IS NOT it. Every identity
+# check in the feed layer then quietly answers "not live", and the refusal
+# that the whole synthetic feed is built around stops firing while every log
+# line still reads `crypto->live`.
+# ===========================================================================
+
+def test_a_mode_that_is_only_equal_to_live_does_not_get_past_the_refusal():
+    """ATTACK: hand bind() the string "live" instead of the enum member."""
+    instruments = runner.default_instruments(AssetClass.CRYPTO)
+    quotes = InMemoryQuoteSource()
+
+    feed = runner.SyntheticBarFeed(instruments)
+    with pytest.raises(RuntimeError, match="Mode"):
+        feed.bind({AssetClass.CRYPTO: "live"})
+    with pytest.raises(RuntimeError):
+        feed.refresh_quotes(quotes, AssetClass.CRYPTO, CRYPTO_NOW)
+    assert len(quotes) == 0
+
+    composite = runner.CompositeFeed(
+        {AssetClass.CRYPTO: runner.SyntheticBarFeed(instruments)},
+        {AssetClass.CRYPTO: instruments})
+    with pytest.raises((RuntimeError, ValueError), match="Mode"):
+        composite.bind({AssetClass.CRYPTO: "live"})
+
+    with pytest.raises((RuntimeError, ValueError), match="Mode"):
+        DhanFeed([eq()], FakeDhan()).bind({AssetClass.EQUITY: "live"})
+
+
+def test_the_shared_synthetic_select_feeds_builds_refuses_the_armed_class():
+    """The same hole, reached the way the shipped wiring actually reaches it.
+
+    `TRADER_FEED=okx` with both classes configured and crypto ARMED: OKX takes
+    crypto, equity has no OKX market so it falls back to synthetic — and
+    `select_feeds` builds that synthetic over `synthetic_universe`, which is
+    every class's instruments, crypto included. The composite binds it with
+    `{equity: paper}` alone, correctly, and it comes back holding BTC/USDT and
+    a boolean saying it had been checked.
+    """
+    exchange = FakeOkx(
+        ohlcv=okx_rows(CRYPTO_NOW - INTERVAL, 60),
+        tickers={"BTC/USDT": {"timestamp": int(CRYPTO_NOW.timestamp() * 1000),
+                              "last": "70000"},
+                 "ETH/USDT": {"timestamp": int(CRYPTO_NOW.timestamp() * 1000),
+                              "last": "2500"},
+                 "SOL/USDT": {"timestamp": int(CRYPTO_NOW.timestamp() * 1000),
+                              "last": "140"}},
+        markets={"BTC/USDT": {"spot": True, "active": True},
+                 "ETH/USDT": {"spot": True, "active": True},
+                 "SOL/USDT": {"spot": True, "active": True}})
+    classes = (AssetClass.CRYPTO, AssetClass.EQUITY)
+    config = runner.RunnerConfig(asset_classes=classes, feed=runner.FeedChoice.OKX)
+    resolved = {AssetClass.CRYPTO: Mode.LIVE, AssetClass.EQUITY: Mode.PAPER}
+    instruments = {a: runner.default_instruments(a) for a in classes}
+
+    routes, _ = runner.select_feeds(config, resolved, instruments,
+                                    okx_exchange=exchange)
+    runner.CompositeFeed(routes, instruments).bind(resolved)
+
+    synthetic = routes[AssetClass.EQUITY]
+    assert isinstance(synthetic, runner.SyntheticBarFeed)
+    assert any(i.asset_class is AssetClass.CRYPTO
+               for i in synthetic._instruments), (
+        "this test is not exercising the shared-universe shape any more")
+
+    quotes = InMemoryQuoteSource()
+    with pytest.raises(RuntimeError, match="crypto"):
+        synthetic.refresh_quotes(quotes, AssetClass.CRYPTO, CRYPTO_NOW)
+    assert len(quotes) == 0, "the ARMED class was priced off generated data"

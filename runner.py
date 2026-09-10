@@ -33,10 +33,12 @@ because each of them lives in the seam BETWEEN two modules:
 
 ARMING IS NOT HERE. `EQUITY_LIVE` and `CRYPTO_LIVE` are read by `core.gate` and
 by `engine.py`, from the environment, and this file never sets them, never
-defaults them, and never passes a value for them. Building a live adapter is
-also not arming: an adapter that is constructed but not armed is reported at
-boot and never called. Setting those variables is the owner's action and
-nobody else's.
+defaults them, and never passes a value for them. Crypto's live adapter IS
+constructed here (`OkxAdapter`) so that when the owner later sets the flags
+there is somewhere for a live-approved order to go. Constructing it is not
+arming: an adapter that is constructed but not armed is reported at boot and
+never called. Equity is not wired. Setting those variables is the owner's
+action and nobody else's.
 """
 
 from __future__ import annotations
@@ -50,26 +52,45 @@ import sys
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 import engine as engine_mod
+from adapters.kraken import KrakenAdapter
+from adapters.okx import OkxAdapter
 from adapters.paper import InMemoryQuoteSource, PaperAdapter
 from api import server as api_mod
-from core.gate import GateConfig, OrderGate
-from core.risk import RiskCircuit
+from core.gate import ClassLimits, GateConfig, OrderGate
+from core.profiles import IST
+from core.risk import DEFAULT_LIMITS, RiskCircuit
 from core.store import SQLiteGateStateStore, SQLitePositionStore
-from core.types import AssetClass, Instrument, Mode
+from core.types import AssetClass, Fill, Instrument, Mode, Side
 from engine import ClassWiring, Engine, EngineConfig, EventKind
 from feeds.base import FeedError
 from feeds.dhan_feed import DhanFeed
+from feeds.kraken_feed import KrakenFeed
 from feeds.okx_feed import OkxFeed
-from strategies import Bar, CryptoEmaTrendStrategy, EquityMeanReversionStrategy
+from feeds.option_chain import OptionChainIndex
+from strategies import (Bar, CryptoBreakoutStrategy, CryptoEmaTrendStrategy,
+                        CryptoMandateStrategy, EquityMeanReversionStrategy,
+                        IndexOptionTrendStrategy)
 from strategies.base import BARS_KEY
+from strategies.equity_trend import CHAIN_KEY
+from strategies.mandate.constants import STATE_KEY
+from strategies.mandate.ledger import MandateLedger, PersistingMandate
 
 LOG = logging.getLogger("trader.runner")
 UTC = dt.timezone.utc
 
 __all__ = [
+    "CRYPTO_CLIP_USDT",
+    "CRYPTO_DAILY_USDT",
+    "CRYPTO_CLASS_LIMITS",
+    "KRAKEN_SLEEVE_A_USDT",
+    "KRAKEN_SLEEVE_A_CLIP_USDT",
+    "KRAKEN_SLEEVE_A_DAILY_USDT",
+    "KRAKEN_SLEEVE_A_MAX_OPEN",
+    "reset_oversized_paper_crypto",
     "CompositeFeed",
     "FeedChoice",
     "FeedReport",
@@ -81,6 +102,7 @@ __all__ = [
     "create_asgi_app",
     "main",
     "select_feeds",
+    "status_report",
 ]
 
 # Env vars this file reads. The two arming flags are pointedly NOT in this list;
@@ -90,8 +112,51 @@ ENV_MODE = "TRADER_MODE"
 ENV_CLASSES = "TRADER_CLASSES"
 ENV_FEED = "TRADER_FEED"
 ENV_DHAN_IDS = "TRADER_DHAN_SECURITY_IDS"
+ENV_SCRIP_MASTER = "TRADER_SCRIP_MASTER"
+# Names only. Values are supplied by the owner into Fly, out of band. This
+# file never logs them, never defaults them, and never writes them.
+ENV_OKX_API_KEY = "OKX_API_KEY"
+ENV_OKX_API_SECRET = "OKX_API_SECRET"
+ENV_OKX_PASSPHRASE = "OKX_PASSPHRASE"
+# Crypto execution venue. Default okx — the live book. An unset or empty
+# value MUST resolve to okx so this file cannot retarget an armed OKX
+# class by accident. kraken is opt-in and still disarmed until KRAKEN_LIVE
+# and the existing CRYPTO_LIVE / TRADER_MODE gates all agree.
+ENV_CRYPTO_VENUE = "TRADER_CRYPTO_VENUE"
+ENV_KRAKEN_LIVE = "KRAKEN_LIVE"
+ENV_KRAKEN_API_KEY = "KRAKEN_API_KEY"
+ENV_KRAKEN_API_SECRET = "KRAKEN_API_SECRET"
+# Default OFF. The 15m EMA-spray pair (crypto_trend / crypto_breakout) is
+# no longer the registered crypto engine. Setting this to 1 re-registers
+# them behind the mandate for comparison only. Not an arming flag.
+ENV_CRYPTO_SPRAY = "CRYPTO_EMA_SPRAY"
 
 DEFAULT_DB_PATH = "./var/trader.db"
+
+# Operator clip for crypto (Vishesh/Tony): 50 USDT per entry, 250 USDT of
+# new entry notional per UTC day, at most one open symbol. Absolute USDT
+# ceilings bind on top of the equity-fraction caps so a 2M paper float —
+# or a later live book — cannot print qty 1 BTC (~78k USDT). Paper and
+# live share these limits; arming is not a reason to uncap.
+CRYPTO_CLIP_USDT = Decimal("50")
+CRYPTO_DAILY_USDT = Decimal("250")
+# Locked by Vishesh for a later Kraken *live* sleeve A arm, AFTER paper
+# smoke is green. NOT wired. CRYPTO_CLASS_LIMITS and the paper mandate
+# stay 50 / 250 / max 1. Consecutive-loss halt stays the shared mandate
+# rule (3 losers), same as the OKX paper path. Do not apply these until
+# the owner sets KRAKEN_LIVE out of band.
+KRAKEN_SLEEVE_A_USDT = Decimal("1000")
+KRAKEN_SLEEVE_A_CLIP_USDT = Decimal("100")
+KRAKEN_SLEEVE_A_DAILY_USDT = Decimal("500")
+KRAKEN_SLEEVE_A_MAX_OPEN = 1
+CRYPTO_CLASS_LIMITS = ClassLimits(
+    max_order_notional_fraction=Decimal("0.10"),
+    max_allocation_fraction=Decimal("0.30"),
+    max_open_positions=1,
+    max_orders_per_day=20,
+    max_order_notional=CRYPTO_CLIP_USDT,
+    max_daily_notional=CRYPTO_DAILY_USDT,
+)
 
 
 class FeedChoice(str, Enum):
@@ -104,6 +169,7 @@ class FeedChoice(str, Enum):
     """
     SYNTHETIC = "synthetic"     # default: generated prices, paper only
     OKX = "okx"                 # real OKX spot for crypto
+    KRAKEN = "kraken"           # real Kraken spot for crypto (explicit)
     DHAN = "dhan"               # real NSE cash/NFO for equity
     REAL = "real"               # OKX for crypto AND Dhan for equity
 
@@ -113,6 +179,7 @@ class FeedChoice(str, Enum):
 # warning, live refuses to boot.
 SOURCE_COVERS: Mapping[str, AssetClass] = {
     FeedChoice.OKX.value: AssetClass.CRYPTO,
+    FeedChoice.KRAKEN.value: AssetClass.CRYPTO,
     FeedChoice.DHAN.value: AssetClass.EQUITY,
 }
 
@@ -175,6 +242,10 @@ class RunnerConfig:
     # misconfiguration, and because the real feeds need a network (OKX) or the
     # owner's credentials (Dhan).
     feed: FeedChoice = FeedChoice.SYNTHETIC
+    # Execution venue for crypto's unused live_adapter. Default okx so the
+    # live OKX book cannot be retargeted by an absent variable. kraken is
+    # opt-in and still paper until KRAKEN_LIVE plus the existing dual gate.
+    crypto_venue: str = "okx"
     # symbol -> Dhan security_id, for the equity universe. The paper universe
     # carries deliberately fake broker ids ("PAPER-RELIANCE") and DhanFeed
     # rejects them, so real Dhan data needs the real scrip-master ids and this
@@ -183,10 +254,9 @@ class RunnerConfig:
     tick_interval_s: float = 5.0
     starting_paper_cash: Mapping[AssetClass, Decimal] = field(
         default_factory=lambda: {
-            # Sized so a one-unit crypto entry clears the gate's 10%-of-equity
-            # single-order cap at realistic BTC prices. See the README: the gate
-            # CAPS, it does not size down, so a paper float that is too small
-            # produces an engine that ticks forever and never trades.
+            # Headroom only. Crypto clips are hard-capped at CRYPTO_CLIP_USDT
+            # regardless of this float; shrinking the float is not what
+            # stops a 1-coin leftover from looking live-ready.
             AssetClass.CRYPTO: Decimal("2000000"),
             AssetClass.EQUITY: Decimal("1000000"),
         })
@@ -208,6 +278,10 @@ class RunnerConfig:
             raise ValueError("tick_interval_s must be > 0")
         if not isinstance(self.feed, FeedChoice):
             raise ValueError("feed must be a FeedChoice")
+        if self.crypto_venue not in {FeedChoice.OKX.value, FeedChoice.KRAKEN.value}:
+            raise ValueError(
+                f"crypto_venue={self.crypto_venue!r} is not a venue; use "
+                f"{FeedChoice.OKX.value!r} or {FeedChoice.KRAKEN.value!r}")
         for symbol, security_id in self.dhan_security_ids.items():
             if not str(security_id).strip().isdigit():
                 # A non-numeric id would be rejected by Dhan or, worse,
@@ -262,14 +336,16 @@ class RunnerConfig:
                 f"{ENV_FEED}={raw_feed!r} is not a feed; use one of "
                 + ", ".join(repr(c.value) for c in FeedChoice)) from None
 
-        return cls(
+        params: dict[str, Any] = dict(
             db_path=source.get(ENV_DB_PATH, DEFAULT_DB_PATH),
             requested_mode=mode,
             asset_classes=tuple(dict.fromkeys(classes)),
             feed=feed,
+            crypto_venue=parse_crypto_venue(source.get(ENV_CRYPTO_VENUE)),
             dhan_security_ids=_parse_security_ids(source.get(ENV_DHAN_IDS, "")),
-            **overrides,
         )
+        params.update(overrides)
+        return cls(**params)
 
 
 # ==========================================================================
@@ -319,6 +395,27 @@ class _PerClassCircuit:
 # local market data
 # ==========================================================================
 
+def _require_real_modes(resolved_modes: Mapping[AssetClass, Mode],
+                        where: str) -> None:
+    """Every value in a mode map must BE a `Mode`, not merely equal one.
+
+    `Mode` is a str Enum, so `"live" == Mode.LIVE` is True while
+    `"live" is Mode.LIVE` is False. Every live refusal in the feed layer is an
+    identity check — it has to be, since `is` is the only comparison a stray
+    string cannot satisfy by accident — and a map rebuilt from a config file,
+    a JSON payload or an API round trip carries the bare strings. Those maps
+    print, log and compare identically to the real thing, and disable the
+    refusal completely. Reject them at the seam, where it is still visible.
+    """
+    wrong = sorted(f"{a.value}={m!r}" for a, m in resolved_modes.items()
+                   if not isinstance(m, Mode))
+    if wrong:
+        raise RuntimeError(
+            f"{where}: {', '.join(wrong)} is not a Mode. `Mode` is a str Enum, "
+            "so a bare string compares EQUAL to Mode.LIVE and fails every "
+            "`is Mode.LIVE` refusal in this layer. Pass the enum member.")
+
+
 class SyntheticBarFeed:
     """Deterministic fake bars so the stack can be run end to end locally.
 
@@ -331,6 +428,25 @@ class SyntheticBarFeed:
     on a generated series is the single worst outcome this file could produce,
     so the check is here rather than in a comment: `bind()` is given the modes
     the engine actually resolved, and raises if any of them is live.
+
+    The refusal is only worth what `bind()` REMEMBERS. It used to record a
+    single boolean, so afterwards `_require_bound()` could establish that some
+    bind had happened and nothing more — not that this class's mode had ever
+    been looked at. Three routes onto a live book followed from that, and all
+    three were reachable:
+
+      * `bind({})` refuses nothing, because no mode in an empty map is live,
+        and comes back willing to price everything;
+      * a feed vouched for one class priced ANY class, and the instance
+        `select_feeds` builds is shared and holds every class's instruments —
+        so the armed class's names are sitting right there;
+      * a re-bind that was correctly REFUSED left the earlier vouch standing,
+        which is the operator arming a class, seeing the refusal work exactly
+        as designed, and being served generated prices anyway.
+
+    So bind() now records WHICH classes it vouched for, drops the previous
+    vouch before it checks anything, and every serving method asks about the
+    class in front of it rather than about history.
     """
 
     def __init__(self, instruments: Sequence[Instrument],
@@ -341,9 +457,24 @@ class SyntheticBarFeed:
         self._instruments = tuple(instruments)
         self._interval = bar_interval
         self._history = history
+        self._owner = {i.symbol: i.asset_class for i in self._instruments}
+        self._vouched: dict[AssetClass, Mode] = {}
         self._bound = False
 
     def bind(self, resolved_modes: Mapping[AssetClass, Mode]) -> "SyntheticBarFeed":
+        # Fail CLOSED first. A bind that is about to be refused must not leave
+        # an earlier one standing: the whole value of the refusal is that the
+        # feed stops serving, and a feed still serving on a previous vouch has
+        # refused nothing.
+        self._bound = False
+        self._vouched = {}
+
+        if not resolved_modes:
+            raise RuntimeError(
+                "SyntheticBarFeed.bind() was given no modes. An empty map "
+                "vouches for nothing while unlocking everything; name the "
+                "classes this feed is being asked to serve.")
+        _require_real_modes(resolved_modes, "SyntheticBarFeed.bind")
         live = sorted(a.value for a, m in resolved_modes.items() if m is Mode.LIVE)
         if live:
             raise RuntimeError(
@@ -351,6 +482,7 @@ class SyntheticBarFeed:
                 "This feed generates prices; it is for paper only. Wire a real "
                 "market data provider before arming anything."
             )
+        self._vouched = dict(resolved_modes)
         self._bound = True
         return self
 
@@ -365,10 +497,39 @@ class SyntheticBarFeed:
                 f"SyntheticBarFeed.{what} called before bind(); the live-mode "
                 "check has not run")
 
+    def _require_vouched(self, asset_class: AssetClass, what: str) -> None:
+        """The class in front of us must be one bind() actually looked at.
+
+        `_require_bound` alone proves a bind happened; it does not prove this
+        class was in it. The shared instance holds every class's instruments,
+        so a class that was never vouched for is a class whose mode nobody
+        checked — and it is exactly as likely to be the armed one.
+        """
+        self._require_bound(what)
+        if asset_class not in self._vouched:
+            raise RuntimeError(
+                f"SyntheticBarFeed.{what} was asked for {asset_class.value}, "
+                f"which bind() never vouched for (vouched: "
+                f"{', '.join(sorted(a.value for a in self._vouched)) or 'none'}). "
+                "This feed generates prices and will not serve a class whose "
+                "mode it has not been shown.")
+
+    def _class_of(self, symbol: str, what: str) -> AssetClass:
+        try:
+            return self._owner[symbol]
+        except KeyError:
+            raise RuntimeError(
+                f"SyntheticBarFeed.{what}: {symbol!r} is not in this feed's "
+                f"universe ({', '.join(sorted(self._owner)) or 'empty'}). The "
+                "series is derived from the symbol's own characters, so an "
+                "unknown name would be answered with a confident invented "
+                "price rather than an error."
+            ) from None
+
     # -- bars ------------------------------------------------------------
 
     def bars(self, symbol: str, now: dt.datetime) -> list[Bar]:
-        self._require_bound("bars")
+        self._require_vouched(self._class_of(symbol, "bars"), "bars")
         base, amplitude = _series_shape(symbol)
         step = self._interval
         # Snap to the bar grid so the last bar is never stamped ahead of
@@ -385,7 +546,13 @@ class SyntheticBarFeed:
         return out
 
     def mark(self, symbol: str, now: dt.datetime) -> Decimal:
-        """The current mark, consistent with the last bar's close."""
+        """The current mark, consistent with the last bar's close.
+
+        Guarded like every other method that hands out a price. It is public,
+        it produces the number that lands in the quote source, and it was the
+        one price-producing method the live refusal did not cover.
+        """
+        self._require_vouched(self._class_of(symbol, "mark"), "mark")
         base, amplitude = _series_shape(symbol)
         return _series_price(base, amplitude, _floor_to(now, self._interval)
                              - self._interval)
@@ -395,8 +562,9 @@ class SyntheticBarFeed:
     def extra_provider(self, asset_class: AssetClass,
                        now: dt.datetime) -> Mapping[str, Any]:
         """`ctx.extra` for one class. Raises if bind() has not vouched for the
-        modes: an unbound feed has not been checked against live."""
-        self._require_bound("extra_provider")
+        modes OF THIS CLASS: an unvouched class has not been checked against
+        live."""
+        self._require_vouched(asset_class, "extra_provider")
         return {BARS_KEY: {i.symbol: self.bars(i.symbol, now)
                          for i in self._instruments
                          if i.asset_class is asset_class}}
@@ -405,7 +573,7 @@ class SyntheticBarFeed:
                        asset_class: AssetClass, now: dt.datetime) -> None:
         # The path that actually reaches an adapter: generated prices land in
         # the quote source a live adapter would size against.
-        self._require_bound("refresh_quotes")
+        self._require_vouched(asset_class, "refresh_quotes")
         for instrument in self._instruments:
             if instrument.asset_class is asset_class:
                 quotes.set(instrument.symbol, self.mark(instrument.symbol, now))
@@ -530,6 +698,18 @@ class CompositeFeed:
     # -- bind --------------------------------------------------------------
 
     def bind(self, resolved_modes: Mapping[AssetClass, Mode]) -> "CompositeFeed":
+        # Fail CLOSED before anything is checked. A re-bind that is refused —
+        # the operator arms a class and the synthetic feed says no, exactly as
+        # designed — must not leave the composite serving on the vouch it got
+        # the first time round. Nor may a bind that dies partway through the
+        # sub-feeds leave the composite usable on a half-checked routing table.
+        self._bound = False
+
+        # Checked HERE as well as in each sub-feed: this is the seam that hands
+        # every sub-feed its subset, so a mode map full of bare strings would
+        # otherwise disable the live refusal in all of them at once.
+        _require_real_modes(resolved_modes, "CompositeFeed.bind")
+
         unrouted = sorted(a.value for a in resolved_modes if a not in self._routes)
         if unrouted:
             raise ValueError(
@@ -628,6 +808,8 @@ def select_feeds(
     *,
     dhan_client: Any = None,
     okx_exchange: Any = None,
+    kraken_exchange: Any = None,
+    option_instruments: Sequence[Instrument] = (),
 ) -> tuple[dict[AssetClass, Any], tuple[FeedReport, ...]]:
     """Pick one feed per class and say, per class, what it is.
 
@@ -642,6 +824,12 @@ def select_feeds(
     cannot see is a fault that gets worse.
     """
     synthetic_universe = [i for group in instruments.values() for i in group]
+    if option_instruments:
+        seen = {i.symbol for i in synthetic_universe}
+        for instrument in option_instruments:
+            if instrument.symbol not in seen:
+                synthetic_universe.append(instrument)
+                seen.add(instrument.symbol)
     shared_synthetic: list[Any] = []          # built at most once, lazily
 
     def synthetic() -> "SyntheticBarFeed":
@@ -661,6 +849,20 @@ def select_feeds(
                 "chosen for a class whose mode is unknown") from None
 
         source = _requested_source(config.feed, asset_class)
+        # One-knob paper recipe: naming Kraken as the venue also selects
+        # the public Kraken feed. Default venue stays okx, so the shipped
+        # OKX feed path is unchanged. This is not arming.
+        if (asset_class is AssetClass.CRYPTO
+                and config.crypto_venue == FeedChoice.KRAKEN.value):
+            source = FeedChoice.KRAKEN.value
+        # A live crypto book cannot be priced by the synthetic feed — that
+        # refusal is load-bearing. When the class actually resolved LIVE,
+        # the public OKX feed is the only legal source, even if TRADER_FEED
+        # was left at its paper default. This is not arming: the mode came
+        # from the engine's own resolver. Equity is unchanged.
+        if (mode is Mode.LIVE and asset_class is AssetClass.CRYPTO
+                and source == FeedChoice.SYNTHETIC.value):
+            source = FeedChoice.OKX.value
         if source == FeedChoice.SYNTHETIC.value:
             routes[asset_class] = synthetic()
             reports.append(FeedReport(
@@ -673,7 +875,9 @@ def select_feeds(
         try:
             feed, detail = _build_real_feed(
                 source, asset_class, instruments[asset_class], config,
-                dhan_client=dhan_client, okx_exchange=okx_exchange)
+                dhan_client=dhan_client, okx_exchange=okx_exchange,
+                kraken_exchange=kraken_exchange,
+                option_instruments=option_instruments)
         except FeedUnconfigured as exc:
             if mode is Mode.LIVE:
                 # The whole point. A live class whose real feed is missing does
@@ -717,7 +921,10 @@ def _requested_source(choice: FeedChoice, asset_class: AssetClass) -> str:
 
 def _build_real_feed(source: str, asset_class: AssetClass,
                      instruments: Sequence[Instrument], config: RunnerConfig,
-                     *, dhan_client: Any, okx_exchange: Any) -> tuple[Any, str]:
+                     *, dhan_client: Any, okx_exchange: Any,
+                     kraken_exchange: Any = None,
+                     option_instruments: Sequence[Instrument] = ()
+                     ) -> tuple[Any, str]:
     """Construct the real feed for one class, or raise FeedUnconfigured."""
     covers = SOURCE_COVERS[source]
     if asset_class is not covers:
@@ -734,6 +941,11 @@ def _build_real_feed(source: str, asset_class: AssetClass,
         return feed, (f"real OKX public spot, {len(instruments)} instruments "
                       f"@{feed.timeframe}, no credentials")
 
+    if source == FeedChoice.KRAKEN.value:
+        feed = KrakenFeed(instruments, exchange=kraken_exchange)
+        return feed, (f"real Kraken public spot, {len(instruments)} instruments "
+                      f"@{feed.timeframe}, no credentials")
+
     # Dhan. The client is INJECTED and never built here: minting a second Dhan
     # access token would invalidate the owner's live one, so this file has no
     # code path that could authenticate.
@@ -742,6 +954,15 @@ def _build_real_feed(source: str, asset_class: AssetClass,
             "no Dhan market-data client was injected (Dhan needs the owner's "
             "credentials; see the README)")
     universe = _dhan_universe(instruments, config.dhan_security_ids)
+    if option_instruments:
+        extra = []
+        seen = {i.symbol for i in universe}
+        for instrument in option_instruments:
+            if instrument.symbol in seen:
+                continue
+            extra.append(instrument)
+            seen.add(instrument.symbol)
+        universe = universe + tuple(extra)
     feed = DhanFeed(universe, dhan_client)
     return feed, (f"real Dhan NSE data via {type(dhan_client).__name__}, "
                   f"{len(universe)} instruments")
@@ -778,8 +999,227 @@ def _dhan_universe(instruments: Sequence[Instrument],
 
 
 # ==========================================================================
+# crypto live adapter — constructed, not armed
+# ==========================================================================
+
+def _okx_credentials_present(env: Mapping[str, str]) -> bool:
+    """True only when every OKX trade secret is a non-empty string.
+
+    Presence is not arming. Absence on a LIVE class is a reason not to boot:
+    an unsigned client cannot place, and a live book that cannot place is a
+    book nobody can flatten through the adapter either.
+    """
+    return all((env.get(name) or "").strip() for name in (
+        ENV_OKX_API_KEY, ENV_OKX_API_SECRET, ENV_OKX_PASSPHRASE))
+
+
+def _kraken_credentials_present(env: Mapping[str, str]) -> bool:
+    """True only when every Kraken trade secret is a non-empty string.
+
+    Names only. Values are never logged. Presence is not arming.
+    """
+    return all((env.get(name) or "").strip() for name in (
+        ENV_KRAKEN_API_KEY, ENV_KRAKEN_API_SECRET))
+
+
+class _LazyOkxTradeExchange:
+    """ccxt.okx, built on first use.
+
+    Paper never calls this. Constructing OkxAdapter at boot would otherwise
+    import ccxt (and, if keys were present, hold them) on every paper run,
+    which is the opposite of "paper mode does not need the live venue".
+    The adapter stores this object and only talks to it when the engine
+    actually routes a LIVE approval here — which requires both arm flags.
+    """
+
+    __slots__ = ("_env", "_inner")
+
+    def __init__(self, env: Mapping[str, str]) -> None:
+        object.__setattr__(self, "_env", env)
+        object.__setattr__(self, "_inner", None)
+
+    def _load(self) -> Any:
+        inner = object.__getattribute__(self, "_inner")
+        if inner is not None:
+            return inner
+        env = object.__getattribute__(self, "_env")
+        try:
+            import ccxt                      # local: ccxt is optional for paper
+        except ImportError as exc:           # pragma: no cover - environment problem
+            raise RuntimeError(
+                "ccxt is not installed; cannot construct the live OKX "
+                "exchange. Paper mode does not need it. Arming crypto does."
+            ) from exc
+        cfg: dict[str, Any] = {"enableRateLimit": True}
+        key = (env.get(ENV_OKX_API_KEY) or "").strip()
+        secret = (env.get(ENV_OKX_API_SECRET) or "").strip()
+        phrase = (env.get(ENV_OKX_PASSPHRASE) or "").strip()
+        if key:
+            cfg["apiKey"] = key
+        if secret:
+            cfg["secret"] = secret
+        if phrase:
+            cfg["password"] = phrase
+        inner = ccxt.okx(cfg)
+        object.__setattr__(self, "_inner", inner)
+        return inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+
+class _LazyKrakenTradeExchange:
+    """ccxt.kraken, built on first use.
+
+    Paper never calls this. Same laziness as `_LazyOkxTradeExchange`: a
+    paper boot must not import ccxt or hold keys just because Kraken is
+    wired as an unused live_adapter.
+    """
+
+    __slots__ = ("_env", "_inner")
+
+    def __init__(self, env: Mapping[str, str]) -> None:
+        object.__setattr__(self, "_env", env)
+        object.__setattr__(self, "_inner", None)
+
+    def _load(self) -> Any:
+        inner = object.__getattribute__(self, "_inner")
+        if inner is not None:
+            return inner
+        env = object.__getattribute__(self, "_env")
+        try:
+            import ccxt
+        except ImportError as exc:           # pragma: no cover - environment problem
+            raise RuntimeError(
+                "ccxt is not installed; cannot construct the live Kraken "
+                "exchange. Paper mode does not need it. Arming Kraken does."
+            ) from exc
+        cfg: dict[str, Any] = {"enableRateLimit": True}
+        key = (env.get(ENV_KRAKEN_API_KEY) or "").strip()
+        secret = (env.get(ENV_KRAKEN_API_SECRET) or "").strip()
+        if key:
+            cfg["apiKey"] = key
+        if secret:
+            cfg["secret"] = secret
+        inner = ccxt.kraken(cfg)
+        object.__setattr__(self, "_inner", inner)
+        return inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+
+def _load_option_chain(
+    env: Mapping[str, str],
+    clock: Callable[[], dt.datetime],
+    injected: Any,
+) -> Optional[OptionChainIndex]:
+    """Build an option chain from an injected master or a local CSV path.
+
+    Never fetches. `TRADER_SCRIP_MASTER` is a filesystem path the owner
+    supplies; a missing file refuses to boot rather than running without a
+    chain and looking like the strategy was never meant to exist.
+    """
+    if injected is not None:
+        if isinstance(injected, OptionChainIndex):
+            return injected
+        from adapters.dhan import DhanSecurityMap
+        if isinstance(injected, DhanSecurityMap):
+            return OptionChainIndex.from_security_map(injected, loaded_at=clock())
+        if isinstance(injected, str):
+            return OptionChainIndex.from_csv(injected, loaded_at=clock())
+        raise TypeError(
+            f"scrip_master must be OptionChainIndex, DhanSecurityMap, CSV text "
+            f"or None, got {type(injected).__name__}"
+        )
+    path = (env.get(ENV_SCRIP_MASTER) or "").strip()
+    if not path:
+        return None
+    file = Path(path)
+    if not file.is_file():
+        raise RuntimeError(
+            f"{ENV_SCRIP_MASTER}={path!r} is not a readable scrip-master file; "
+            "refusing to boot with a silently-missing option chain. Unset the "
+            "variable to run without IndexOptionTrendStrategy."
+        )
+    return OptionChainIndex.from_csv(file.read_text(), loaded_at=clock())
+
+
+def _build_crypto_live_adapter(
+    env: Mapping[str, str],
+    *,
+    exchange: Any = None,
+    kraken_exchange: Any = None,
+) -> Any:
+    """Wire the live crypto adapter. This is NOT arming.
+
+    Default venue is OKX. Kraken is constructed only when
+    `TRADER_CRYPTO_VENUE=kraken`. `exchange` is the injected OKX trade
+    client; `kraken_exchange` is the injected Kraken trade client.
+    """
+    venue = parse_crypto_venue(env.get(ENV_CRYPTO_VENUE))
+    if venue == FeedChoice.KRAKEN.value:
+        return KrakenAdapter(
+            kraken_exchange if kraken_exchange is not None
+            else _LazyKrakenTradeExchange(env),
+            mode=Mode.LIVE,
+        )
+    return OkxAdapter(exchange if exchange is not None
+                      else _LazyOkxTradeExchange(env),
+                      mode=Mode.LIVE)
+
+
+# ==========================================================================
 # the universe
 # ==========================================================================
+
+def reset_oversized_paper_crypto(
+    store: SQLitePositionStore,
+    *,
+    clip: Decimal = CRYPTO_CLIP_USDT,
+    now: Optional[dt.datetime] = None,
+) -> tuple[str, ...]:
+    """Flatten paper crypto rows whose notional exceeds the clip.
+
+    The Phase-0 leftover is ETH/USDT qty 1 @ 2460 — ~49x the clip and
+    enough to consume the single open slot. A reused `/data/trader.db`
+    must not inherit that 1-coin book. Clip-sized paper rows are kept so
+    a restart does not wipe a real 50 USDT position.
+
+    LIVE rows are never touched. Paper vs live isolation is the whole
+    point of the ledger.
+    """
+    if clip <= 0:
+        raise ValueError(f"clip must be > 0, got {clip}")
+    when = now if now is not None else engine_mod._utc_now()
+    closed: list[str] = []
+    for position in store.positions(Mode.PAPER, AssetClass.CRYPTO):
+        mark = position.avg_price
+        if not isinstance(mark, Decimal) or not mark.is_finite() or mark <= 0:
+            notional = clip + Decimal("1")   # unusable cost basis: treat as leftover
+        else:
+            notional = abs(position.qty) * mark
+        if notional <= clip:
+            continue
+        side = Side.SELL if position.qty > 0 else Side.BUY
+        fill = Fill(
+            order_id=f"paper-clip-reset-{position.instrument.symbol}-"
+                     f"{position.strategy_id}",
+            instrument=position.instrument,
+            side=side,
+            qty=abs(position.qty),
+            price=mark if mark > 0 else clip,
+            fees=Decimal("0"),
+            at=when,
+            mode=Mode.PAPER,
+        )
+        store.apply(fill, position.strategy_id, position.structure_id)
+        closed.append(position.instrument.symbol)
+        LOG.warning(
+            "boot: flattened inherited paper %s %s @ %s (notional %s > clip %s)",
+            position.instrument.symbol, position.qty, mark, notional, clip)
+    return tuple(closed)
+
 
 def default_instruments(asset_class: AssetClass) -> tuple[Instrument, ...]:
     """The paper universe. Broker ids are placeholders for crypto (ccxt uses the
@@ -793,6 +1233,9 @@ def default_instruments(asset_class: AssetClass) -> tuple[Instrument, ...]:
             Instrument("ETH/USDT", AssetClass.CRYPTO, "ETH/USDT",
                        lot_size=1, tick_size=Decimal("0.01"),
                        qty_precision=5, min_notional=Decimal("5")),
+            Instrument("SOL/USDT", AssetClass.CRYPTO, "SOL/USDT",
+                       lot_size=1, tick_size=Decimal("0.001"),
+                       qty_precision=4, min_notional=Decimal("5")),
         )
     return (
         Instrument("RELIANCE", AssetClass.EQUITY, "PAPER-RELIANCE",
@@ -802,11 +1245,129 @@ def default_instruments(asset_class: AssetClass) -> tuple[Instrument, ...]:
     )
 
 
+def parse_crypto_spray(raw: Optional[str]) -> bool:
+    """CRYPTO_EMA_SPRAY default OFF. Unrecognised values raise."""
+    if raw is None or raw.strip() == "":
+        return False
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{ENV_CRYPTO_SPRAY}={raw!r} is not a boolean; use 1 or 0")
+
+
+def parse_crypto_venue(raw: Optional[str]) -> str:
+    """TRADER_CRYPTO_VENUE default okx. Unrecognised values raise.
+
+    An unset variable is okx, which is the live book's venue. Naming kraken
+    is the only way crypto's live_adapter becomes KrakenAdapter.
+    """
+    if raw is None or raw.strip() == "":
+        return FeedChoice.OKX.value
+    value = raw.strip().lower()
+    if value in {FeedChoice.OKX.value, FeedChoice.KRAKEN.value}:
+        return value
+    raise ValueError(
+        f"{ENV_CRYPTO_VENUE}={raw!r} is not a venue; use "
+        f"{FeedChoice.OKX.value!r} or {FeedChoice.KRAKEN.value!r}")
+
+
+def parse_kraken_live(raw: Optional[str]) -> bool:
+    """KRAKEN_LIVE default OFF. Unrecognised values raise.
+
+    This is not CRYPTO_LIVE. CRYPTO_LIVE still arms the OKX path. Kraken
+    stays paper until this flag is an explicit on-value AND the existing
+    dual gate (TRADER_MODE=live and CRYPTO_LIVE) would otherwise arm crypto.
+    """
+    if raw is None or raw.strip() == "":
+        return False
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{ENV_KRAKEN_LIVE}={raw!r} is not a boolean; use 1 or 0")
+
+
 def default_strategies(asset_class: AssetClass,
-                       instruments: Sequence[Instrument]) -> tuple[Any, ...]:
+                       instruments: Sequence[Instrument],
+                       *,
+                       option_underlyings: Sequence[str] = (),
+                       enable_crypto_spray: bool = False) -> tuple[Any, ...]:
     if asset_class is AssetClass.CRYPTO:
-        return (CryptoEmaTrendStrategy(instruments=list(instruments)),)
-    return (EquityMeanReversionStrategy(instruments=list(instruments)),)
+        wired: list[Any] = [
+            CryptoMandateStrategy(instruments=list(instruments)),
+        ]
+        if enable_crypto_spray:
+            # Explicit opt-in only. These 15m EMA/Donchian sprays are not
+            # the paper default and must not re-arm themselves.
+            wired.append(CryptoEmaTrendStrategy(instruments=list(instruments)))
+            wired.append(CryptoBreakoutStrategy(
+                instruments=list(instruments),
+                bar_interval=dt.timedelta(minutes=15)))
+        return tuple(wired)
+    strategies: list[Any] = [
+        EquityMeanReversionStrategy(instruments=list(instruments)),
+    ]
+    # IndexOptionTrendStrategy is not registered unless a chain can actually
+    # be supplied. Registering it against an empty extra["option_chain"] would
+    # look like a quiet market every tick.
+    for underlying in option_underlyings:
+        strategies.append(IndexOptionTrendStrategy(underlying=str(underlying)))
+    return tuple(strategies)
+
+
+def _wire_strategies(
+    asset_class: AssetClass,
+    instruments: Sequence[Instrument],
+    *,
+    option_underlyings: Sequence[str],
+    enable_crypto_spray: bool,
+    ledger: Optional[MandateLedger],
+) -> tuple[Any, ...]:
+    raw = default_strategies(
+        asset_class, instruments,
+        option_underlyings=option_underlyings,
+        enable_crypto_spray=enable_crypto_spray,
+    )
+    if asset_class is not AssetClass.CRYPTO or ledger is None:
+        return raw
+    wrapped: list[Any] = []
+    for strategy in raw:
+        if getattr(strategy, "id", "") == "crypto_mandate":
+            wrapped.append(PersistingMandate(strategy, ledger))
+        else:
+            wrapped.append(strategy)
+    return tuple(wrapped)
+
+
+def _mandate_snapshot(
+    ledger: MandateLedger,
+    store: SQLitePositionStore,
+    now: dt.datetime,
+    mode: Mode,
+    instruments: Sequence[Instrument],
+    quotes: InMemoryQuoteSource,
+) -> Any:
+    marks: dict[str, Decimal] = {}
+    for inst in instruments:
+        q = quotes.quote(inst)
+        if q is not None and q.price > 0:
+            marks[inst.symbol] = q.price
+    day = now.astimezone(UTC).strftime("%Y-%m-%dT00:00:00+00:00")
+    return ledger.snapshot(
+        now,
+        mode=mode,
+        positions=store.positions(mode, AssetClass.CRYPTO),
+        quotes=marks,
+        realized_lifetime=store.realized_pnl(
+            mode, AssetClass.CRYPTO, "1970-01-01T00:00:00+00:00"),
+        realized_today=store.realized_pnl(mode, AssetClass.CRYPTO, day),
+        paper_derivatives=(mode is Mode.PAPER),
+    )
 
 
 # ==========================================================================
@@ -830,6 +1391,7 @@ class TraderStack:
     feed: Optional[Any] = None
     # What is serving each class, in the words the boot log used.
     feed_report: tuple[FeedReport, ...] = ()
+    mandate_ledger: Optional[MandateLedger] = None
     _bridge: Optional[asyncio.Task[None]] = None
 
     def feed_report_text(self) -> str:
@@ -865,6 +1427,11 @@ class TraderStack:
                 handle.close()
             except Exception as exc:            # pragma: no cover - shutdown path
                 LOG.critical("closing %s failed: %r", name, exc)
+        if self.mandate_ledger is not None:
+            try:
+                self.mandate_ledger.close()
+            except Exception as exc:            # pragma: no cover - shutdown path
+                LOG.critical("closing mandate_ledger failed: %r", exc)
 
 
 def build_stack(config: Optional[RunnerConfig] = None,
@@ -873,6 +1440,10 @@ def build_stack(config: Optional[RunnerConfig] = None,
                 *,
                 dhan_client: Any = None,
                 okx_exchange: Any = None,
+                okx_trade_exchange: Any = None,
+                kraken_exchange: Any = None,
+                kraken_trade_exchange: Any = None,
+                scrip_master: Any = None,
                 ) -> TraderStack:
     """Construct the whole system. Reads arming ONLY through gate/engine.
 
@@ -884,17 +1455,30 @@ def build_stack(config: Optional[RunnerConfig] = None,
     `dhan_client` is INJECTED and is never constructed here. Dhan permits one
     active access token at a time and the owner's live engine holds it, so a
     second one minted by this process would break real trading with real money.
-    Wiring it is a deliberate edit at this call site, exactly like wiring a
-    live adapter; see the README. `okx_exchange` is the same seam for OKX and
-    is only needed by tests — OKX market data is public, so the default
-    (a keyless ccxt client) is the right one in production.
+    Equity's live adapter is therefore also not wired. `okx_exchange` is the
+    public (unsigned) OKX market-data client; `okx_trade_exchange` is the
+    signed trade client. They are different objects on purpose: the feed must
+    not be able to sign an order. Tests inject both. Production builds the
+    trade client lazily from OKX_* env names and the feed from a keyless
+    ccxt.okx.
     """
     cfg = config or RunnerConfig.from_env(env)
     source: Mapping[str, str] = os.environ if env is None else env
 
     store = SQLitePositionStore(cfg.db_path)
     gate_state = SQLiteGateStateStore(cfg.db_path, cfg.requested_mode)
+    # Paper crypto only. Do not inherit a 1-coin leftover (ETH/USDT 1 @
+    # 2460) into the sized book. Live rows are invisible to this read.
+    if AssetClass.CRYPTO in cfg.asset_classes:
+        reset_oversized_paper_crypto(store, clip=CRYPTO_CLIP_USDT, now=clock())
     control = api_mod.SqliteControlStore(cfg.db_path)
+    enable_crypto_spray = parse_crypto_spray(source.get(ENV_CRYPTO_SPRAY))
+    crypto_venue = parse_crypto_venue(source.get(ENV_CRYPTO_VENUE))
+    kraken_live = parse_kraken_live(source.get(ENV_KRAKEN_LIVE))
+    mandate_ledger = (
+        MandateLedger(cfg.db_path) if AssetClass.CRYPTO in cfg.asset_classes
+        else None
+    )
 
     engine_config = EngineConfig(requested_mode=cfg.requested_mode)
 
@@ -907,10 +1491,77 @@ def build_stack(config: Optional[RunnerConfig] = None,
         resolved[asset_class] = (Mode.LIVE if cfg.requested_mode is Mode.LIVE
                                  and armed else Mode.PAPER)
 
+    # Kraken does not inherit CRYPTO_LIVE from the OKX book. Naming the
+    # venue without KRAKEN_LIVE must fail closed (not silently paper, and
+    # not place on Kraken). This branch is skipped when the venue is okx.
+    if (crypto_venue == FeedChoice.KRAKEN.value
+            and resolved.get(AssetClass.CRYPTO) is Mode.LIVE
+            and not kraken_live):
+        raise RuntimeError(
+            "TRADER_CRYPTO_VENUE=kraken resolved crypto to LIVE via "
+            "TRADER_MODE/CRYPTO_LIVE, but KRAKEN_LIVE is off. CRYPTO_LIVE "
+            "arms OKX, not Kraken. Unset TRADER_CRYPTO_VENUE to keep the "
+            "OKX book, or set KRAKEN_LIVE=1 after KRAKEN_API_KEY/"
+            f"{ENV_KRAKEN_API_SECRET} are present. Constructing "
+            "KrakenAdapter is not arming."
+        )
+
+    if (crypto_venue == FeedChoice.KRAKEN.value
+            and AssetClass.CRYPTO in resolved
+            and resolved[AssetClass.CRYPTO] is Mode.PAPER):
+        LOG.info(
+            "boot: TRADER_CRYPTO_VENUE=kraken KRAKEN_LIVE=%s credentials=%s; "
+            "crypto is PaperAdapter (KrakenAdapter is wired unused)",
+            "on" if kraken_live else "off",
+            "present" if _kraken_credentials_present(source) else "absent",
+        )
+
+    # A live crypto class with no trade credentials and no injected exchange
+    # cannot place and cannot flatten through the adapter. Fail now, before
+    # the feed bind talks to the network.
+    if crypto_venue == FeedChoice.OKX.value:
+        if (resolved.get(AssetClass.CRYPTO) is Mode.LIVE
+                and okx_trade_exchange is None
+                and not _okx_credentials_present(source)):
+            raise RuntimeError(
+                "crypto resolved to LIVE but "
+                f"{ENV_OKX_API_KEY}/{ENV_OKX_API_SECRET}/{ENV_OKX_PASSPHRASE} "
+                "are not all set; refusing to boot an armed book that cannot "
+                "sign an order. Constructing OkxAdapter is not arming — set the "
+                "Fly secrets, then the arm flags."
+            )
+    elif (resolved.get(AssetClass.CRYPTO) is Mode.LIVE
+            and kraken_trade_exchange is None
+            and not _kraken_credentials_present(source)):
+        raise RuntimeError(
+            "crypto venue is kraken and resolved to LIVE but "
+            f"{ENV_KRAKEN_API_KEY}/{ENV_KRAKEN_API_SECRET} "
+            "are not both set; refusing to boot an armed book that cannot "
+            "sign an order. Constructing KrakenAdapter is not arming."
+        )
+
+    chain_index = None
+    if AssetClass.EQUITY in resolved:
+        chain_index = _load_option_chain(source, clock, scrip_master)
+    chain_universe: tuple[Instrument, ...] = ()
+    option_underlyings: tuple[str, ...] = ()
+    if chain_index is not None and AssetClass.EQUITY in resolved:
+        option_underlyings = chain_index.index_underlyings()
+        today = clock().astimezone(IST).date()
+        # Validate the chain against the resolved equity mode at boot so a
+        # PAPER- identity cannot wait until tick 1 to blow up a live class.
+        # Spots (INDEX rows) have to be on the watchlist too: the strategy
+        # ATM-picks off ctx.quote(underlying), and DhanFeed's regime is
+        # computed from cash listings.
+        chain_universe = chain_index.watchlist(
+            today, mode=resolved[AssetClass.EQUITY])
+
     instruments = {a: default_instruments(a) for a in cfg.asset_classes}
     routes, feed_reports = select_feeds(
         cfg, resolved, instruments,
-        dhan_client=dhan_client, okx_exchange=okx_exchange)
+        dhan_client=dhan_client, okx_exchange=okx_exchange,
+        kraken_exchange=kraken_exchange,
+        option_instruments=chain_universe)
     # bind() is where a synthetic feed refuses a live class, and CompositeFeed
     # binds each sub-feed with the modes of ITS OWN classes so the refusal
     # cannot be routed around.
@@ -922,38 +1573,78 @@ def build_stack(config: Optional[RunnerConfig] = None,
     wirings: list[ClassWiring] = []
     adapters: dict[AssetClass, Any] = {}
     quote_sources: dict[AssetClass, InMemoryQuoteSource] = {}
+    live_adapter_names: dict[AssetClass, str] = {}
 
     for asset_class in cfg.asset_classes:
         mode = resolved[asset_class]
-        circuits[asset_class] = RiskCircuit(store, mode, clock=clock)
+        circuits[asset_class] = RiskCircuit(
+            store, mode, limits=DEFAULT_LIMITS, clock=clock)
 
         quotes = InMemoryQuoteSource()
         quote_sources[asset_class] = quotes
         paper = PaperAdapter(asset_class, quotes,
                              cfg.starting_paper_cash[asset_class])
 
+        class_instruments = tuple(instruments[asset_class])
+        if asset_class is AssetClass.EQUITY and chain_universe:
+            seen = {i.symbol for i in class_instruments}
+            extra = [i for i in chain_universe if i.symbol not in seen]
+            class_instruments = class_instruments + tuple(extra)
+
         def extra_provider(ac: AssetClass, now: dt.datetime,
                            _quotes: InMemoryQuoteSource = quotes,
+                           _chain: Optional[OptionChainIndex] = chain_index,
+                           _mode: Mode = mode,
+                           _instruments: Sequence[Instrument] = class_instruments,
                            ) -> Mapping[str, Any]:
             # Marks and bars come from ONE source and are refreshed together.
             # A quote from a different clock than the bars is how a strategy's
             # stop is evaluated against a price the entry never saw.
             feed.refresh_quotes(_quotes, ac, now)
-            return feed.extra_provider(ac, now)
+            extra = dict(feed.extra_provider(ac, now))
+            if ac is AssetClass.EQUITY and _chain is not None:
+                extra[CHAIN_KEY] = _chain.as_mapping(
+                    now.astimezone(IST).date(), mode=_mode)
+            if ac is AssetClass.CRYPTO and mandate_ledger is not None:
+                extra[STATE_KEY] = _mandate_snapshot(
+                    mandate_ledger, store, now, _mode, _instruments,
+                    _quotes)
+            return extra
+
+        live_adapter = None
+        if asset_class is AssetClass.CRYPTO:
+            # Constructed, reported, unused unless CRYPTO_LIVE and
+            # TRADER_MODE=live. Equity stays unwired: that would need a Dhan
+            # token, and the live Fly engine holds the only permitted one.
+            live_adapter = _build_crypto_live_adapter(
+                source, exchange=okx_trade_exchange,
+                kraken_exchange=kraken_trade_exchange)
+
+        if live_adapter is not None:
+            live_adapter_names[asset_class] = type(live_adapter).__name__
 
         wirings.append(ClassWiring(
             asset_class=asset_class,
             paper_adapter=paper,
             risk=circuits[asset_class],
-            strategies=default_strategies(asset_class, instruments[asset_class]),
-            # No live adapter is constructed here. Wiring one is a separate,
-            # deliberate edit; see the README.
-            live_adapter=None,
-            instruments=instruments[asset_class],
+            strategies=_wire_strategies(
+                asset_class, instruments[asset_class],
+                option_underlyings=(option_underlyings
+                                    if asset_class is AssetClass.EQUITY else ()),
+                enable_crypto_spray=enable_crypto_spray,
+                ledger=mandate_ledger,
+            ),
+            live_adapter=live_adapter,
+            instruments=class_instruments,
             tick_interval_s=cfg.tick_interval_s,
             extra_provider=extra_provider,
         ))
-        adapters[asset_class] = paper
+        # The handle reports the adapter this class will actually place on,
+        # which is the resolved one. Putting the live adapter here while the
+        # class is disarmed makes /ready 503 with "LIVE adapter wired for a
+        # class that is not armed".
+        adapters[asset_class] = paper if mode is Mode.PAPER else (
+            live_adapter if live_adapter is not None else paper)
 
     gate = OrderGate(
         position_store=store,
@@ -961,7 +1652,10 @@ def build_stack(config: Optional[RunnerConfig] = None,
         risk_circuit=_PerClassCircuit(circuits),
         # requested_mode MUST match EngineConfig's, or every approval is refused
         # with a mode mismatch. One value, read once, passed to both.
-        config=GateConfig(requested_mode=cfg.requested_mode),
+        config=GateConfig(
+            requested_mode=cfg.requested_mode,
+            limits={AssetClass.CRYPTO: CRYPTO_CLASS_LIMITS},
+        ),
         env=env,
     )
 
@@ -976,6 +1670,8 @@ def build_stack(config: Optional[RunnerConfig] = None,
 
     api_bus = api_mod.EventBus()
     engine_modes = engine.runner_modes()
+    class_feeds = {r.asset_class: r.source for r in feed_reports}
+    crypto_feed = class_feeds.get(AssetClass.CRYPTO, cfg.feed.value)
     handle = api_mod.EngineHandle(
         # The handle's mode is what this process REQUESTED. Per-class truth is
         # in `armed`, which is taken from the engine's own resolution.
@@ -989,12 +1685,18 @@ def build_stack(config: Optional[RunnerConfig] = None,
         adapters=adapters,
         armed={a: engine_modes[a] is Mode.LIVE for a in cfg.asset_classes},
         clock=clock,
+        crypto_venue=cfg.crypto_venue,
+        kraken_live=kraken_live,
+        feed=crypto_feed,
+        live_adapter_names=live_adapter_names,
+        class_feeds=class_feeds,
     )
 
     return TraderStack(config=cfg, store=store, gate_state=gate_state,
                        control=control, gate=gate, engine=engine,
                        registry=registry, api_bus=api_bus, handle=handle,
-                       feed=feed, feed_report=feed_reports)
+                       feed=feed, feed_report=feed_reports,
+                       mandate_ledger=mandate_ledger)
 
 
 class _HandleCircuit(_PerClassCircuit):
@@ -1168,11 +1870,60 @@ async def run_engine_only(config: Optional[RunnerConfig] = None,
         await stack.stop()
 
 
+def status_report(
+    env: Optional[Mapping[str, str]] = None,
+    **stack_kw: Any,
+) -> dict[str, Any]:
+    """Paper-only process status. Builds the stack, places no orders.
+
+    Used by `python3 -m runner --status` and by /ready's handle fields.
+    KRAKEN_LIVE is reported, never set.
+    """
+    import json as _json  # local: keep runner import surface small
+
+    stack = build_stack(env=env, **stack_kw)
+    try:
+        crypto = stack.engine._runners.get(AssetClass.CRYPTO)
+        feed = stack.handle.feed
+        live_name = None
+        adapter_name = None
+        signal = None
+        if crypto is not None:
+            adapter_name = type(crypto.adapter).__name__
+            if crypto.wiring.live_adapter is not None:
+                live_name = type(crypto.wiring.live_adapter).__name__
+            ids = [st.id for st in crypto.wiring.strategies]
+            signal = "crypto_mandate" if "crypto_mandate" in ids else (
+                ids[0] if ids else None)
+        payload = {
+            "crypto_venue": stack.handle.crypto_venue,
+            "kraken_live": stack.handle.kraken_live,
+            "feed": feed,
+            "armed_live": bool(stack.handle.armed.get(AssetClass.CRYPTO)),
+            "adapter": adapter_name,
+            "live_adapter": live_name,
+            "signal": signal,
+            "clip_usdt": str(CRYPTO_CLIP_USDT),
+            "daily_usdt": str(CRYPTO_DAILY_USDT),
+            "max_open": int(CRYPTO_CLASS_LIMITS.max_open_positions),
+        }
+        # Round-trip through JSON so callers cannot smuggle Decimals.
+        return _json.loads(_json.dumps(payload))
+    finally:
+        stack.close()
+        stack.store.close()
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:   # pragma: no cover - CLI
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s")
     args = list(sys.argv[1:] if argv is None else argv)
+
+    if "--status" in args:
+        import json
+        print(json.dumps(status_report(), indent=2))
+        return 0
 
     if "--no-api" in args:
         try:

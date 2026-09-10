@@ -80,15 +80,28 @@ class Quote:
     exercising partial fills. `depth == 0` means the price exists but nothing
     is available at it, which is a real state and must not be confused with
     "no quote".
+
+    `live` is what stops a frozen option LTP from silently pricing a spread.
+    A mark we cannot age (Dhan's bare LTP has no timestamp) is stored as
+    `live=False` so it is distinguishable from a live print, and every path
+    that would *act* on a quote — place, mark-to-market, engine snapshot —
+    treats a frozen mark as absent, never as a number.
     """
     price: Decimal
     depth: Optional[Decimal] = None
+    as_of: Optional[dt.datetime] = None
+    live: bool = True
 
     def __post_init__(self) -> None:
         if self.price <= 0:
             raise ValueError(f"quote price must be > 0, got {self.price}")
         if self.depth is not None and self.depth < 0:
             raise ValueError(f"quote depth must be >= 0, got {self.depth}")
+        if self.as_of is not None:
+            if self.as_of.tzinfo is None or self.as_of.utcoffset() is None:
+                raise ValueError(
+                    f"quote as_of must be timezone-aware, got {self.as_of!r}"
+                )
 
 
 @runtime_checkable
@@ -113,10 +126,11 @@ class InMemoryQuoteSource:
             self.set(symbol, price)
 
     def set(self, symbol: str, price: Decimal | int | str,
-            depth: Optional[Decimal | int | str] = None) -> None:
+            depth: Optional[Decimal | int | str] = None, *,
+            as_of: Optional[dt.datetime] = None, live: bool = True) -> None:
         px = _money(price, f"quote price for {symbol}")
         dp = None if depth is None else _money(depth, f"quote depth for {symbol}")
-        self._quotes[symbol] = Quote(price=px, depth=dp)
+        self._quotes[symbol] = Quote(price=px, depth=dp, as_of=as_of, live=live)
 
     def remove(self, symbol: str) -> None:
         """Raises if the symbol was never there — a silent no-op would let a
@@ -344,8 +358,17 @@ class PaperAdapter:
     # -- BrokerAdapter ------------------------------------------------------
 
     def quote(self, instrument: Instrument) -> Optional[Decimal]:
-        q = self._quotes.quote(instrument)
+        q = self._live_quote(instrument)
         return None if q is None else q.price
+
+    def _live_quote(self, instrument: Instrument) -> Optional[Quote]:
+        """The quote this adapter may act on. Frozen marks are present on the
+        source (so they are distinguishable from a live print) and absent
+        here (so they cannot silently price a fill or a book)."""
+        q = self._quotes.quote(instrument)
+        if q is None or not q.live:
+            return None
+        return q
 
     def positions(self) -> Sequence[Position]:
         with self._lock:
@@ -362,7 +385,7 @@ class PaperAdapter:
         with self._lock:
             total = self._cash
             for pos in self._positions.values():
-                q = self._quotes.quote(pos.instrument)
+                q = self._live_quote(pos.instrument)
                 if q is None:
                     return None
                 total += pos.qty * q.price
@@ -438,9 +461,18 @@ class PaperAdapter:
                                     f"{instrument.tick_size} tick (nearest {on_tick}); "
                                     "quantize via profile_for(...).quantize_price")
 
-        q = self._quotes.quote(instrument)
+        q = self._live_quote(instrument)
         if q is None:
             # The one thing a paper adapter must never do is make up a price.
+            # A frozen mark is "no quote" for the order path: using it would
+            # silently price a live or paper spread off a stale LTP.
+            stored = self._quotes.quote(instrument)
+            if stored is not None and not stored.live:
+                return self._reject(
+                    order_id, intent,
+                    f"frozen (unageable) mark for {instrument.symbol}; "
+                    "refusing to price an order off a stale LTP",
+                )
             return self._reject(order_id, intent,
                                 f"no quote for {instrument.symbol}")
 
@@ -484,7 +516,7 @@ class PaperAdapter:
             self._working.add(order_id)
         try:
             while True:
-                q = self._quotes.quote(instrument)
+                q = self._live_quote(instrument)
                 if q is not None:
                     take = self._fillable(intent, q, remaining)
                     if take > 0:

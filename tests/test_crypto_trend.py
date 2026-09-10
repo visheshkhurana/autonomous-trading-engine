@@ -32,14 +32,20 @@ def strat(**kw) -> CryptoEmaTrendStrategy:
     return CryptoEmaTrendStrategy(**params)
 
 
-def ctx_from(values, now=None, positions=(), spread=1):
+def ctx_from(values, now=None, positions=(), spread=1, quotes=None):
     bars = make_bars(values, utc(2026, 8, 24, 0, 0), INTERVAL, spread=spread)
     now = now or bars[-1].ts
-    return context(now, bars={"BTC/USDT": bars}, positions=positions), bars
+    if quotes is None:
+        quotes = {"BTC/USDT": bars[-1].close}
+    return context(now, bars={"BTC/USDT": bars}, positions=positions,
+                   quotes=quotes), bars
 
 
-def ctx_bars(bars, now=None, positions=()):
-    return context(now or bars[-1].ts, bars={"BTC/USDT": bars}, positions=positions)
+def ctx_bars(bars, now=None, positions=(), quotes=None):
+    if quotes is None:
+        quotes = {"BTC/USDT": bars[-1].close}
+    return context(now or bars[-1].ts, bars={"BTC/USDT": bars},
+                   positions=positions, quotes=quotes)
 
 
 # ------------------------------------------------------------------ entry
@@ -50,7 +56,9 @@ def test_cross_up_opens_a_long_with_a_market_order():
     assert len(intents) == 1
     i = intents[0]
     assert i.side is Side.BUY
-    assert i.order_type is OrderType.MARKET and i.limit_price is None
+    assert i.order_type is OrderType.MARKET
+    assert i.limit_price == bars[-1].close
+    assert i.limit_price > 0
     assert i.qty == Decimal(1)
     assert "EMA cross up" in i.reason and "Stop starts at" in i.reason
     assert i.structure_id is None
@@ -78,6 +86,27 @@ def test_no_entry_when_another_strategy_already_holds_the_coin():
 def test_short_history_is_quiet_rather_than_wrong():
     ctx, _ = ctx_from([100, 99, 98])
     assert list(strat().propose(ctx)) == []
+
+
+def test_a_cross_without_a_quote_is_not_an_entry():
+    """Unknown is never a free price. Bars can fire and the quote can still
+    be absent; treating that as 'trade anyway' is how a 0 mark becomes an
+    order. The engine documents that strategies skip a missing name."""
+    ctx, _ = ctx_from(CROSS_UP, quotes={})
+    assert list(strat().propose(ctx)) == []
+
+
+def test_a_zero_quote_is_unknown_and_does_not_enter():
+    ctx, _ = ctx_from(CROSS_UP, quotes={"BTC/USDT": Decimal("0")})
+    assert list(strat().propose(ctx)) == []
+
+
+def test_an_open_position_with_no_quote_raises_rather_than_going_unmanaged():
+    ctx, bars = ctx_from(CROSS_DOWN, quotes={})
+    ctx = ctx_bars(bars, positions=[position(BTC, 1, 100, strategy_id="crypto_trend")],
+                   quotes={})
+    with pytest.raises(MissingDataError, match="quote"):
+        strat().propose(ctx)
 
 
 # ------------------------------------------------------------------- exit

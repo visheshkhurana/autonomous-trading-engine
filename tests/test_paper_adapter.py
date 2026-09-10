@@ -600,6 +600,34 @@ def test_quote_passthrough_is_none_for_unknown_instrument():
     assert a.quote(BTC) is None
 
 
+def test_a_frozen_mark_does_not_price_a_paper_order():
+    """A frozen option LTP must be distinguishable from a live one, and must
+    not silently fill a spread."""
+    quotes = InMemoryQuoteSource()
+    quotes.set("NIFTY26JAN24000CE", "120", live=False)
+    stored = quotes.quote(NIFTY_CE)
+    assert stored is not None and stored.live is False
+    a = equity_adapter(quotes)
+    assert a.quote(NIFTY_CE) is None
+    ref = a.place(intent(NIFTY_CE, Side.BUY, "75",
+                         order_type=OrderType.LIMIT, limit="120"))
+    assert ref.status is OrderStatus.REJECTED
+    assert "frozen" in (ref.error or "")
+
+
+def test_a_frozen_mark_does_not_price_an_open_position():
+    """A live fill followed by a frozen LTP must not keep marking the book."""
+    quotes = InMemoryQuoteSource()
+    quotes.set("NIFTY26JAN24000CE", "120")
+    a = equity_adapter(quotes)
+    ref = a.place(intent(NIFTY_CE, Side.BUY, "75",
+                         order_type=OrderType.LIMIT, limit="120"))
+    assert ref.status is OrderStatus.FILLED
+    quotes.set("NIFTY26JAN24000CE", "120", live=False)
+    assert a.quote(NIFTY_CE) is None
+    assert a.equity() is None
+
+
 # ---------------------------------------------------------------------------
 # Input hygiene
 # ---------------------------------------------------------------------------

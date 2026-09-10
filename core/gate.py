@@ -24,9 +24,16 @@ allowed to look like a permissive zero.
 
 Two things the Approval carries that callers must actually use, rather than
 reading the original Intent: `Approval.mode`, and `Approval.intent`, whose qty
-is the SNAPPED and (where the circuit says so) THROTTLED size. Placing
-`intent.qty` instead makes quantization and the circuit's size_multiplier
-decorative.
+is the SNAPPED, CAPPED (sized down to the notional and allocation caps) and
+(where the circuit says so) THROTTLED size. Placing `intent.qty` instead makes
+quantization, the caps and the circuit's size_multiplier decorative.
+
+Sizing down is not a loosening of fail-closed risk: unknown equity still
+refuses, unknown exposure still refuses, a scale that snaps to zero or under
+the min notional still refuses, reducing orders are never resized, and a
+structure short that would outrun its hedge is still refused rather than
+silently shrunk. Paper vs live remains an adapter choice — this gate never
+reads a venue.
 
 Ordering note: the eleven checks run in the documented order and stop at the
 FIRST failure, because later checks depend on facts established by earlier ones
@@ -102,9 +109,16 @@ class GateStateStoreProto(Protocol):
         ...
 
     def record_submission(self, idempotency_key: str, asset_class: AssetClass,
-                          day_key: str, now: dt.datetime) -> None:
+                          day_key: str, now: dt.datetime,
+                          notional: Decimal = Decimal("0")) -> None:
         """Claim the key and increment the day's count. Called by the gate
-        ONLY after every check has passed."""
+        ONLY after every check has passed. `notional` is the approved entry
+        size (0 for reducing orders) so the daily notional cap can be summed
+        from the same durable rows as the order count."""
+        ...
+
+    def daily_notional(self, asset_class: AssetClass, day_key: str) -> Decimal:
+        """Approved entry notional recorded for this class on this day."""
         ...
 
 
@@ -112,7 +126,14 @@ class GateStateStoreProto(Protocol):
 class ClassLimits:
     """Per-asset-class caps. Fractions are of LIVE equity, never of a constant:
     a cap denominated in rupees stops being a risk limit the moment the account
-    halves."""
+    halves.
+
+    Absolute notionals (`max_order_notional`, `max_daily_notional`) are
+    optional extra ceilings in the class's base currency. When set, the
+    effective clip is the TIGHTER of the fraction-of-equity cap and the
+    constant. Crypto uses them so a large paper float (or a later live
+    book) cannot print a 1-coin BTC clip.
+    """
 
     # Largest single order, as a fraction of equity.
     max_order_notional_fraction: Decimal = Decimal("0.10")
@@ -123,6 +144,11 @@ class ClassLimits:
     # Floor applied on top of Instrument.min_notional, in the class's base
     # currency. Dust orders pay fees and move nothing.
     min_notional_floor: Decimal = Decimal("0")
+    # Optional hard clip in the class's base currency. None = fraction only.
+    max_order_notional: Optional[Decimal] = None
+    # Optional hard cap on approved *entry* notional for the class's day.
+    # Exits do not consume it. None = no absolute daily notional cap.
+    max_daily_notional: Optional[Decimal] = None
 
     def __post_init__(self) -> None:
         for name in ("max_order_notional_fraction", "max_allocation_fraction"):
@@ -147,6 +173,21 @@ class ClassLimits:
             raise TypeError("min_notional_floor must be Decimal")
         if self.min_notional_floor < 0:
             raise ValueError("min_notional_floor must be >= 0")
+        for name in ("max_order_notional", "max_daily_notional"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, Decimal):
+                raise TypeError(f"{name} must be Decimal or None, got {type(value).__name__}")
+            if not value.is_finite() or value <= 0:
+                raise ValueError(f"{name} must be a finite Decimal > 0, got {value}")
+        if (self.max_order_notional is not None
+                and self.max_daily_notional is not None
+                and self.max_order_notional > self.max_daily_notional):
+            raise ValueError(
+                "max_order_notional exceeds max_daily_notional: a single clip "
+                "could never be placed without breaching the daily notional cap"
+            )
 
 
 @dataclass(frozen=True)
@@ -222,6 +263,7 @@ _CHECK_NOTIONAL_CAP: Final[str] = "notional_cap"
 _CHECK_ALLOCATION: Final[str] = "allocation_cap"
 _CHECK_OPEN_POSITIONS: Final[str] = "max_open_positions"
 _CHECK_STRUCTURE: Final[str] = "structure_legs"
+_CHECK_DAILY_NOTIONAL: Final[str] = "daily_notional_cap"
 _CHECK_DAILY_ORDERS: Final[str] = "daily_order_cap"
 _CHECK_CIRCUIT: Final[str] = "risk_circuit"
 _CHECK_COERCION: Final[str] = "mode_coercion"
@@ -321,6 +363,45 @@ def _positive_decimal(value: Any) -> Optional[Decimal]:
     if isinstance(value, Decimal) and value.is_finite() and value > 0:
         return value
     return None
+
+
+def _scale_to_cap(profile: AssetClassProfile, instrument, qty: Decimal,
+                  price: Decimal, cap: Decimal, floor: Decimal,
+                  ) -> tuple[Optional[Decimal], str]:
+    """Largest placeable qty whose notional is <= cap, or (None, why).
+
+    Round DOWN through the profile so the sized qty cannot exceed the cap after
+    quantization. A scale that leaves nothing placeable, or that would print
+    under the min-notional floor, is a refusal — never a silent 0 or a bump
+    back up through the cap.
+    """
+    if price <= 0:
+        return None, f"cannot size against price {price}"
+    raw = cap / price
+    scaled = profile.quantize_qty(instrument, raw)
+    if scaled <= 0:
+        return None, (
+            f"notional {qty * price} exceeds cap {cap}; qty {qty} scales to "
+            f"{scaled} for lot_size={instrument.lot_size} precision="
+            f"{instrument.qty_precision} and there is nothing to place"
+        )
+    if scaled >= qty:
+        # ROUND_DOWN cannot grow a qty; if it did, the cap would be decorative.
+        return None, (
+            f"sizing {qty} to cap {cap} produced {scaled}, which is not smaller"
+        )
+    notional = scaled * price
+    if notional > cap:
+        return None, (
+            f"sized qty {scaled} still notionally {notional} above cap {cap}"
+        )
+    if notional < floor:
+        return None, (
+            f"sized notional {notional} below minimum {floor} (cap {cap})"
+        )
+    return scaled, (
+        f"qty {qty} -> {scaled} so notional {notional} <= cap {cap}"
+    )
 
 
 class OrderGate:
@@ -444,6 +525,12 @@ class OrderGate:
                 "without one",
                 effective,
             )
+        # A MARKET still needs a reference for the venue drift guard. The
+        # quote we just used to size is that reference. Stamp it onto the
+        # approved intent so a sized clip cannot die as "unbounded" later.
+        if (effective.order_type is OrderType.MARKET
+                and _positive_decimal(effective.limit_price) is None):
+            effective = replace(effective, limit_price=price)
         notional = qty * price
 
         # 4. min notional / min lot ----------------------------------------
@@ -496,17 +583,31 @@ class OrderGate:
         reducing = _is_reducing(effective, book)
 
         # 6. notional cap ---------------------------------------------------
+        # Size DOWN to the cap rather than only refusing. Strategies propose a
+        # raw unit qty (one lot, one coin); without this, every entry that is
+        # slightly too large never trades, which is how a paper bot ticks
+        # forever and stays flat. Reducing orders are not resized: shrinking
+        # an exit leaves a tail on.
+        #
+        # The effective clip is the tighter of the equity-fraction cap and
+        # any absolute max_order_notional. Crypto sets the absolute so a
+        # 2M paper float cannot print a 1-coin BTC order.
         notional_cap = equity * limits.max_order_notional_fraction
+        if limits.max_order_notional is not None:
+            notional_cap = min(notional_cap, limits.max_order_notional)
+        floor = max(effective.instrument.min_notional, limits.min_notional_floor)
         if reducing:
             passed(_CHECK_NOTIONAL_CAP,
                    "reducing an open position; order-size cap not applied")
         elif notional > notional_cap:
-            return reject(
-                _CHECK_NOTIONAL_CAP,
-                f"notional {notional} exceeds {limits.max_order_notional_fraction} "
-                f"of equity {equity} ({notional_cap})",
-                effective,
-            )
+            scaled, detail = _scale_to_cap(
+                profile, effective.instrument, qty, price, notional_cap, floor)
+            if scaled is None:
+                return reject(_CHECK_NOTIONAL_CAP, detail, effective)
+            qty = scaled
+            notional = qty * price
+            effective = replace(effective, qty=qty)
+            passed(_CHECK_NOTIONAL_CAP, detail)
         else:
             passed(_CHECK_NOTIONAL_CAP, f"notional {notional} <= {notional_cap}")
 
@@ -523,13 +624,30 @@ class OrderGate:
             return reject(_CHECK_ALLOCATION, unmarkable or "exposure unknown",
                           effective)
         elif exposure + notional > allocation_cap:
-            return reject(
-                _CHECK_ALLOCATION,
-                f"{asset_class.value} exposure {exposure} + {notional} exceeds "
-                f"{limits.max_allocation_fraction} of equity {equity} "
-                f"({allocation_cap})",
-                effective,
-            )
+            remaining = allocation_cap - exposure
+            if remaining <= 0:
+                return reject(
+                    _CHECK_ALLOCATION,
+                    f"{asset_class.value} exposure {exposure} already meets or "
+                    f"exceeds {limits.max_allocation_fraction} of equity "
+                    f"{equity} ({allocation_cap}); no room to add {notional}",
+                    effective,
+                )
+            scaled, detail = _scale_to_cap(
+                profile, effective.instrument, qty, price, remaining, floor)
+            if scaled is None:
+                return reject(
+                    _CHECK_ALLOCATION,
+                    f"{asset_class.value} exposure {exposure} + {notional} "
+                    f"exceeds {allocation_cap}; {detail}",
+                    effective,
+                )
+            qty = scaled
+            notional = qty * price
+            effective = replace(effective, qty=qty)
+            passed(_CHECK_ALLOCATION,
+                   f"exposure {exposure} + sized {notional} <= {allocation_cap} "
+                   f"({detail})")
         else:
             passed(_CHECK_ALLOCATION,
                    f"exposure {exposure} + {notional} <= {allocation_cap}")
@@ -597,8 +715,50 @@ class OrderGate:
                 passed(_CHECK_STRUCTURE,
                        f"structure {structure!r}: this leg does not open a short")
 
-        # 10. daily order count ----------------------------------------------
+        # 10. daily entry notional (optional absolute) ----------------------
+        # Reported only when configured, so equity keeps its 11-check list.
         day_key = profile.day_key(ctx.now)
+        if limits.max_daily_notional is not None:
+            if reducing:
+                passed(_CHECK_DAILY_NOTIONAL,
+                       "reducing an open position; daily notional cap not applied")
+            else:
+                try:
+                    spent = self.__state.daily_notional(asset_class, day_key)
+                except Exception as exc:                  # fail CLOSED
+                    return reject(_CHECK_DAILY_NOTIONAL,
+                                  f"daily-notional store unavailable: {exc!r}",
+                                  effective)
+                if not isinstance(spent, Decimal) or not spent.is_finite() or spent < 0:
+                    return reject(
+                        _CHECK_DAILY_NOTIONAL,
+                        f"daily-notional store returned {spent!r}, expected a "
+                        "non-negative Decimal",
+                        effective,
+                    )
+                remaining = limits.max_daily_notional - spent
+                if remaining <= 0:
+                    return reject(
+                        _CHECK_DAILY_NOTIONAL,
+                        f"{asset_class.value} already deployed {spent} of "
+                        f"{limits.max_daily_notional} daily notional on {day_key}",
+                        effective,
+                    )
+                if notional > remaining:
+                    scaled, detail = _scale_to_cap(
+                        profile, effective.instrument, qty, price, remaining, floor)
+                    if scaled is None:
+                        return reject(_CHECK_DAILY_NOTIONAL, detail, effective)
+                    qty = scaled
+                    notional = qty * price
+                    effective = replace(effective, qty=qty)
+                    passed(_CHECK_DAILY_NOTIONAL,
+                           f"spent {spent}; {detail}")
+                else:
+                    passed(_CHECK_DAILY_NOTIONAL,
+                           f"spent {spent} + {notional} <= {limits.max_daily_notional}")
+
+        # 11. daily order count ----------------------------------------------
         try:
             count = self.__state.order_count(asset_class, day_key)
         except Exception as exc:                      # fail CLOSED
@@ -621,7 +781,7 @@ class OrderGate:
         passed(_CHECK_DAILY_ORDERS,
                f"{count}/{limits.max_orders_per_day} used on {day_key}")
 
-        # 11. risk circuit ---------------------------------------------------
+        # 12. risk circuit ---------------------------------------------------
         try:
             decision = self.__circuit.read(asset_class, equity)
         except Exception as exc:                      # fail CLOSED
@@ -684,13 +844,15 @@ class OrderGate:
                        f"circuit is {state}; qty {qty} -> {throttled} "
                        f"(x{multiplier}){suffix}")
 
-        # 12. mode coercion ---------------------------------------------------
+        # 13. mode coercion ---------------------------------------------------
         passed(_CHECK_COERCION, self.__coercion_detail(asset_class, mode))
 
         # Only now — after everything passed — is the quota spent and the key
         # claimed. Doing this earlier is what made the old daily cap useless.
         try:
-            self.__state.record_submission(key, asset_class, day_key, ctx.now)
+            recorded_notional = Decimal("0") if reducing else notional
+            self.__state.record_submission(
+                key, asset_class, day_key, ctx.now, notional=recorded_notional)
         except Exception as exc:
             return reject(
                 _CHECK_DEDUP,

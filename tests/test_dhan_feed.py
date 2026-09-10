@@ -717,3 +717,86 @@ def test_equity_profile_is_the_market_hours_authority():
     assert profile.is_open(OPEN_NOW)
     assert not profile.is_open(CLOSED_NOW)
     assert not profile.is_open(SATURDAY_NOW)
+
+
+# ---------------------------------------------------------------------------
+# bar cache
+# ---------------------------------------------------------------------------
+
+def test_closed_bars_are_cached_inside_the_same_interval():
+    """A 5s tick must not refetch a 15m candle that cannot have changed."""
+    client = FakeDhanClient(candles=candle_rows(OPEN_NOW - INTERVAL, 40))
+    f = feed(client)
+    first = f.bars("RELIANCE", OPEN_NOW)
+    second = f.bars("RELIANCE", OPEN_NOW + dt.timedelta(seconds=5))
+    assert first == second
+    assert len(client.ohlc_calls) == 1
+
+
+def test_a_new_closed_bar_busts_the_cache():
+    client = FakeDhanClient(candles=candle_rows(OPEN_NOW - INTERVAL, 40))
+    f = feed(client)
+    f.bars("RELIANCE", OPEN_NOW)
+    f.bars("RELIANCE", OPEN_NOW + INTERVAL + dt.timedelta(seconds=1))
+    assert len(client.ohlc_calls) == 2
+
+
+def test_a_stale_cache_is_not_served_while_the_session_is_open():
+    """Fail closed: if the cache cannot vouch freshness, it is not a price."""
+    client = FakeDhanClient(candles=candle_rows(OPEN_NOW - INTERVAL, 40))
+    f = feed(client, max_age_intervals=1)
+    f.bars("RELIANCE", OPEN_NOW)
+    # 20 minutes later, still the same last-closed bar start, but age exceeds
+    # one interval. The cache must refuse and refetch (which will also fail
+    # freshness against the same candles).
+    later = OPEN_NOW + dt.timedelta(minutes=20)
+    client._candles = candle_rows(OPEN_NOW - INTERVAL, 40)
+    with pytest.raises(Exception):
+        f.bars("RELIANCE", later)
+    assert len(client.ohlc_calls) >= 2
+
+
+# ---------------------------------------------------------------------------
+# option-leg freshness
+# ---------------------------------------------------------------------------
+
+def test_an_option_ltp_without_a_timestamp_is_frozen_not_live():
+    """A bare LTP cannot silently price a spread."""
+    ins = [instrument("RELIANCE", "2885"),
+           instrument("NIFTY25SEP24000CE", "43211", expiry=dt.date(2025, 9, 25))]
+    client = FakeDhanClient(quotes={
+        "2885": {"ltp": 1400.0},
+        "43211": {"ltp": 180.0},   # no timestamp
+    })
+    quotes = InMemoryQuoteSource()
+    feed(client, ins).refresh_quotes(quotes, AssetClass.EQUITY, OPEN_NOW)
+    cash = quotes.quote(ins[0])
+    leg = quotes.quote(ins[1])
+    assert cash is not None and cash.live is True
+    assert leg is not None and leg.live is False
+    assert leg.price == Decimal("180.0")
+
+
+def test_a_timestamped_option_ltp_is_live_when_fresh():
+    ins = [instrument("NIFTY25SEP24000CE", "43211", expiry=dt.date(2025, 9, 25))]
+    ts_ms = int(OPEN_NOW.timestamp() * 1000)
+    client = FakeDhanClient(quotes={
+        "43211": {"ltp": 180.0, "last_trade_time": ts_ms},
+    })
+    quotes = InMemoryQuoteSource()
+    feed(client, ins).refresh_quotes(quotes, AssetClass.EQUITY, OPEN_NOW)
+    leg = quotes.quote(ins[0])
+    assert leg is not None and leg.live is True
+    assert leg.as_of is not None
+
+
+def test_a_stale_timestamped_option_ltp_is_frozen():
+    ins = [instrument("NIFTY25SEP24000CE", "43211", expiry=dt.date(2025, 9, 25))]
+    old = OPEN_NOW - dt.timedelta(minutes=10)
+    client = FakeDhanClient(quotes={
+        "43211": {"ltp": 180.0, "last_trade_time": int(old.timestamp() * 1000)},
+    })
+    quotes = InMemoryQuoteSource()
+    feed(client, ins).refresh_quotes(quotes, AssetClass.EQUITY, OPEN_NOW)
+    leg = quotes.quote(ins[0])
+    assert leg is not None and leg.live is False

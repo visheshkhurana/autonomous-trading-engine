@@ -130,6 +130,24 @@ EXCHANGE_FNO = "NSE_FNO"
 # lookback window wide enough; over-fetching is free, under-fetching is not.
 SESSION_MINUTES = 375
 
+# A 5s engine tick against an uncached 15m candle fetch is ~48 req/min and
+# Dhan rate-limit-halts. Closed bars do not change until the next bar closes,
+# so they are cached against that close. Serving a cache that cannot vouch
+# the last closed bar is refused — a frozen tape is not a quiet market.
+_QUOTE_MAX_AGE = dt.timedelta(seconds=60)
+
+
+@dataclass(frozen=True)
+class _Mark:
+    """One last price, with enough metadata to tell a live print from a freeze.
+
+    Dhan's thin LTP endpoint carries no timestamp. A number with no age is
+    stored as `live=False` so a spread cannot be silently priced off it.
+    """
+    price: Decimal
+    as_of: Optional[dt.datetime]
+    live: bool
+
 # Anything outside 2000-2100 is not a market timestamp. Dhan's epoch handling
 # has historically been the source of quietly-wrong candle dates, and a bar
 # stamped 1985 would sail through every downstream check as "very stale" or, on
@@ -264,6 +282,17 @@ def _checked_ms(ms: int, what: str, original: object) -> int:
     return ms
 
 
+def _floor_utc(now: dt.datetime, step: dt.timedelta) -> dt.datetime:
+    seconds = int(step.total_seconds())
+    epoch = int(now.timestamp())
+    return dt.datetime.fromtimestamp(epoch - (epoch % seconds), tz=dt.timezone.utc)
+
+
+def _last_closed_start(now: dt.datetime, interval: dt.timedelta) -> dt.datetime:
+    """Open time of the newest bar that has already closed."""
+    return _floor_utc(now, interval) - interval
+
+
 def _drop_unclosed(rows: Sequence[Sequence], interval: dt.timedelta,
                    now: dt.datetime, symbol: str) -> list[Sequence]:
     """Every trailing candle whose period has not closed — not just the first.
@@ -329,6 +358,46 @@ def _price_or_none(value: object, what: str) -> Optional[Decimal]:
     if price <= 0:
         return None
     return price
+
+
+def _quote_timestamp(record: MappingABC, now: dt.datetime, sid: str
+                     ) -> Optional[dt.datetime]:
+    """Venue trade time if the record carries one, else None.
+
+    None is the honest answer for Dhan's thin LTP. It is not `now`: stamping
+    an unageable print with the fetch clock is how a frozen option mark looks
+    live.
+    """
+    del now  # used only to make the contract obvious to callers
+    for key in ("last_trade_time", "ltt", "timestamp", "update_time", "last_time"):
+        raw = record.get(key)
+        if raw is None or raw == "" or raw == 0:
+            continue
+        try:
+            if isinstance(raw, dt.datetime):
+                moment = raw
+            elif isinstance(raw, bool):
+                continue
+            elif isinstance(raw, (int, float)):
+                ms = _epoch_to_ms(float(raw), f"quote {sid} {key}")
+                moment = dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc)
+            elif isinstance(raw, str):
+                text = raw.strip()
+                if not text:
+                    continue
+                try:
+                    ms = _epoch_to_ms(float(text), f"quote {sid} {key}")
+                    moment = dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc)
+                except ValueError:
+                    moment = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+            else:
+                continue
+            if moment.tzinfo is None or moment.utcoffset() is None:
+                moment = moment.replace(tzinfo=IST)
+            return moment
+        except (FeedUnavailableError, ValueError, OverflowError, OSError, TypeError):
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +478,8 @@ class DhanFeed:
                     "would publish no regime and look like a quiet market"
                 )
             self._regime_aliases[alias] = target
+        # symbol -> (closed bars, last-closed bar start). See bars().
+        self._bar_cache: dict[str, tuple[tuple[Bar, ...], dt.datetime]] = {}
 
     # -- the one symbol -> security_id map --------------------------------
 
@@ -467,7 +538,20 @@ class DhanFeed:
         A live equity book on a feed with no client would price off nothing at
         all, so that combination raises here rather than at the first fetch,
         when a strategy is already mid-decision.
+
+        The refusal below is an identity check, and it has to be: `Mode` is a
+        str Enum, so a bare `"live"` from a config file or a JSON round trip
+        compares EQUAL to `Mode.LIVE` while failing `is Mode.LIVE`, and would
+        walk past this guard while every log line still read `equity->live`.
+        A map that is not made of `Mode` members is rejected outright.
         """
+        wrong = sorted(f"{a.value}={m!r}" for a, m in resolved_modes.items()
+                       if not isinstance(m, Mode))
+        if wrong:
+            raise RuntimeError(
+                f"DhanFeed.bind: {', '.join(wrong)} is not a Mode. A bare "
+                "string compares equal to Mode.LIVE and fails the identity "
+                "check below; pass the enum member.")
         equity_mode = resolved_modes.get(AssetClass.EQUITY)
         if equity_mode is Mode.LIVE:
             if self._client is None:
@@ -520,10 +604,19 @@ class DhanFeed:
         The forming bar is dropped. Freshness is asserted only while the NSE
         session is open — outside it, an hours-old newest bar is the correct
         answer, not an alarm.
+
+        Closed bars are cached until the next bar closes. A 5s tick must not
+        refetch a 15m candle that cannot have changed. If the cache cannot
+        vouch that it holds the last closed bar, it is not served.
         """
         self._require_bound("bars")
         now = self._checked_now(now, "bars")
         listing = self._listing(symbol)
+        last_closed = _last_closed_start(now, self._interval)
+        cached = self._bar_cache.get(symbol)
+        if self._cache_vouches(cached, last_closed, now, symbol):
+            assert cached is not None
+            return list(cached[0])
 
         rows = self._normalise_candles(self._fetch_candles(listing, now), symbol)
         self._assert_ordered(rows, symbol)
@@ -543,7 +636,35 @@ class DhanFeed:
             # Session is live: a gap here is a real data failure.
             assert_fresh(bars, symbol, self._interval, now,
                          max_age_intervals=self._max_age_intervals)
+        self._bar_cache[symbol] = (tuple(bars), bars[-1].ts)
         return bars
+
+    def _cache_vouches(
+        self,
+        cached: Optional[tuple[tuple[Bar, ...], dt.datetime]],
+        last_closed: dt.datetime,
+        now: dt.datetime,
+        symbol: str,
+    ) -> bool:
+        """True only when the cache holds the last closed bar AND can still
+        be freshness-checked (or the session is closed, where old bars are
+        the correct answer)."""
+        if cached is None:
+            return False
+        bars, vouched = cached
+        if not bars or vouched != last_closed:
+            return False
+        if self._profile.is_open(now):
+            try:
+                assert_fresh(bars, symbol, self._interval, now,
+                             max_age_intervals=self._max_age_intervals)
+            except Exception:
+                LOG.error(
+                    "%s: bar cache cannot vouch freshness for last closed "
+                    "%s; refusing to serve it",
+                    symbol, last_closed.isoformat())
+                return False
+        return True
 
     def _fetch_candles(self, listing: _Listing, now: dt.datetime) -> Any:
         client = self._require_client()
@@ -735,24 +856,33 @@ class DhanFeed:
         for listing in listings:
             by_segment.setdefault(listing.segment, []).append(listing)
 
-        prices: dict[str, Decimal] = {}
+        prices: dict[str, _Mark] = {}
         for segment, group in by_segment.items():
-            prices.update(self._batch_prices([l.security_id for l in group], segment))
+            prices.update(self._batch_prices([l.security_id for l in group],
+                                             segment, now, group))
 
         unpriced: list[str] = []
+        frozen: list[str] = []
         for listing in listings:
-            price = prices.get(listing.security_id)
-            if price is None:
+            mark = prices.get(listing.security_id)
+            if mark is None:
                 unpriced.append(listing.symbol)
                 self._drop_quote(quotes, listing)
                 continue
-            quotes.set(listing.symbol, price)
+            quotes.set(listing.symbol, mark.price, as_of=mark.as_of, live=mark.live)
+            if not mark.live:
+                frozen.append(listing.symbol)
 
         if unpriced:
             LOG.error(
                 "DhanFeed could not price %s; their marks have been REMOVED "
                 "rather than left at the previous tick's value",
                 ", ".join(sorted(unpriced)))
+        if frozen:
+            LOG.error(
+                "DhanFeed could not age the LTP for %s; stored as frozen "
+                "(live=False) so a stale print cannot silently price a spread",
+                ", ".join(sorted(frozen)))
 
         # The blackout raise comes AFTER the drop: a failure that left the last
         # tick's prices sitting in the book would be loud and wrong at the same
@@ -781,11 +911,14 @@ class DhanFeed:
         if quotes.quote(listing.instrument) is not None:
             remove(listing.symbol)
 
-    def _batch_prices(self, security_ids: Sequence[str], segment: str) -> dict[str, Decimal]:
+    def _batch_prices(self, security_ids: Sequence[str], segment: str,
+                      now: dt.datetime, group: Sequence[_Listing]
+                      ) -> dict[str, _Mark]:
         client = self._require_client()
-        out: dict[str, Decimal] = {}
+        out: dict[str, _Mark] = {}
         if not security_ids:
             return out
+        by_id = {l.security_id: l for l in group}
 
         try:
             full = client.get_fno_quotes(list(security_ids), segment) or {}
@@ -799,9 +932,9 @@ class DhanFeed:
         for sid, record in full.items():
             if not isinstance(record, MappingABC):
                 continue
-            price = _price_or_none(record.get("ltp"), f"quote {sid} ltp")
-            if price is not None:
-                out[str(sid)] = price
+            mark = self._mark_from_record(record, by_id.get(str(sid)), now, str(sid))
+            if mark is not None:
+                out[str(sid)] = mark
 
         missing = [sid for sid in security_ids if sid not in out]
         if missing:
@@ -818,10 +951,49 @@ class DhanFeed:
                     f"Dhan LTP fetch for {segment} returned a "
                     f"{type(ltps).__name__}, not a mapping")
             for sid, value in ltps.items():
-                price = _price_or_none(value, f"ltp {sid}")
-                if price is not None:
-                    out[str(sid)] = price
+                listing = by_id.get(str(sid))
+                # A bare LTP has no timestamp. For a derivative that is a
+                # frozen mark; for cash, bars carry freshness and we treat
+                # the observation time as as_of.
+                mark = self._mark_from_ltp(value, listing, now, str(sid))
+                if mark is not None:
+                    out[str(sid)] = mark
         return out
+
+    def _mark_from_record(self, record: MappingABC, listing: Optional[_Listing],
+                          now: dt.datetime, sid: str) -> Optional[_Mark]:
+        price = _price_or_none(record.get("ltp"), f"quote {sid} ltp")
+        if price is None:
+            price = _price_or_none(record.get("last_price"), f"quote {sid} last_price")
+        if price is None:
+            return None
+        as_of = _quote_timestamp(record, now, sid)
+        return self._age_mark(price, as_of, listing, now)
+
+    def _mark_from_ltp(self, value: object, listing: Optional[_Listing],
+                       now: dt.datetime, sid: str) -> Optional[_Mark]:
+        price = _price_or_none(value, f"ltp {sid}")
+        if price is None:
+            return None
+        return self._age_mark(price, None, listing, now)
+
+    @staticmethod
+    def _age_mark(price: Decimal, as_of: Optional[dt.datetime],
+                  listing: Optional[_Listing], now: dt.datetime) -> _Mark:
+        derivative = listing is not None and listing.is_derivative
+        if as_of is None:
+            # No venue timestamp. Cash can lean on bar freshness; an option
+            # leg cannot. Store the mark as frozen so a spread is not priced
+            # off a number nobody can age.
+            if derivative:
+                return _Mark(price=price, as_of=None, live=False)
+            return _Mark(price=price, as_of=now, live=True)
+        if as_of > now + dt.timedelta(seconds=5):
+            # A future-dated print is not a price we can age.
+            return _Mark(price=price, as_of=as_of, live=False)
+        if now - as_of > _QUOTE_MAX_AGE:
+            return _Mark(price=price, as_of=as_of, live=False)
+        return _Mark(price=price, as_of=as_of, live=True)
 
     # -- ctx.extra ---------------------------------------------------------
 
@@ -832,6 +1004,16 @@ class DhanFeed:
         `refresh_quotes`; asking Dhan for an option's candle history through
         the equity scrip map would fail, and failing on a leg that never needed
         bars would take the whole tick down.
+
+        A universe with no cash listing at all — an option book with no
+        underlying, or an empty registry — therefore has no bars to publish,
+        and it RAISES rather than publishing `{bars: {}}`. That empty map is
+        not None and it does carry BARS_KEY, so `CompositeFeed`'s guard passes
+        it straight through, and downstream it is indistinguishable from a
+        market with nothing to say: entries stop, bar-driven exits stop, and
+        `refresh_quotes` keeps the legs priced so the class goes on ticking as
+        if all were well. Absence of a bar book is a wiring fault, not a quiet
+        tape.
         """
         self._require_bound("extra_provider")
         now = self._checked_now(now, "extra_provider")
@@ -843,6 +1025,16 @@ class DhanFeed:
             if listing.is_derivative:
                 continue
             bars_by_symbol[symbol] = self.bars(symbol, now)
+
+        if not bars_by_symbol:
+            legs = sorted(s for s, l in self._registry.items() if l.is_derivative)
+            what = (f"derivative legs only: {', '.join(legs)}" if legs
+                    else "the universe is empty")
+            raise FeedUnavailableError(
+                f"DhanFeed has no cash listing to draw bars from ({what}); "
+                "refusing to publish an empty bar book that reads downstream "
+                "as a quiet market. Add the underlying to this feed's universe."
+            )
 
         return {BARS_KEY: bars_by_symbol, REGIME_KEY: self._regimes(bars_by_symbol)}
 

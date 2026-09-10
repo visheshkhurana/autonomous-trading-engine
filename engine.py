@@ -1167,13 +1167,17 @@ class _ClassRunner:
             })
             return
 
-        quotes = await self._quotes(positions)
-        self._emit(EventKind.TICK, f"tick {self.ticks}", {
-            "tick": self.ticks, "at": now, "positions": len(positions),
-            "quotes": len(quotes), "equity": equity,
-            "halted": False, "stopping": False,
-        })
-
+        # The provider runs BEFORE the marks are read, and the order is
+        # load-bearing rather than incidental. A provider is where the feed
+        # refreshes the quote source (see build_stack), so reading marks first
+        # builds a context carrying THIS tick's bars beside LAST tick's prices
+        # — the very thing the wiring claims it prevents. Worse, on the tick
+        # where a feed decides it can no longer vouch for a mark and removes
+        # it, a snapshot taken first still carries the retired price into the
+        # strategy's stop and the gate's notional caps.
+        #
+        # The cost of this order is that a provider which raises produces no
+        # TICK event. That is the honest report: the tick did not happen.
         try:
             extra = dict(self.wiring.extra_provider(self.asset_class, now)
                          if self.wiring.extra_provider is not None else {})
@@ -1182,6 +1186,13 @@ class _ClassRunner:
                         "market data provider raised; no strategy can be "
                         "evaluated this tick", exc)
             raise
+
+        quotes = await self._quotes(positions)
+        self._emit(EventKind.TICK, f"tick {self.ticks}", {
+            "tick": self.ticks, "at": now, "positions": len(positions),
+            "quotes": len(quotes), "equity": equity,
+            "halted": False, "stopping": False,
+        })
 
         ctx = MarketContext(now=now, quotes=quotes, positions=positions,
                             equity=equity, extra=extra)
@@ -1319,36 +1330,46 @@ class _ClassRunner:
             if position.qty == 0 or position.instrument.symbol in covered:
                 continue
             side = Side.SELL if position.qty > 0 else Side.BUY
+            # Book qty. OkxAdapter.place clips a crypto spot SELL to venue
+            # free base so a fee-in-base leftover cannot 51008 the flatten.
             qty = abs(position.qty)
             instrument = position.instrument
             mark = ctx.quote(instrument.symbol)
+            usable = (mark if isinstance(mark, Decimal)
+                      and mark.is_finite() and mark > 0 else None)
             order_type = OrderType.MARKET
             limit: Optional[Decimal] = None
+            if usable is None:
+                # No invented price. A MARKET without a reference is the
+                # unbounded-order refuse the OKX drift guard exists to stop;
+                # a LIMIT derived from a stale average can rest or fill badly
+                # and still look like a successful square-off in the log.
+                why = ("cannot build a marketable exit and this venue "
+                       "rejects MARKET orders"
+                       if not self.profile.market_orders_allowed else
+                       "MARKET exit would be unbounded")
+                self._error(
+                    "square_off",
+                    f"no quote for {instrument.symbol}; {why}",
+                    None,
+                    {"symbol": instrument.symbol, "qty": qty,
+                     "strategy_id": position.strategy_id})
+                continue
             if not self.profile.market_orders_allowed:
-                if mark is None:
-                    # No invented price. A limit derived from a stale average
-                    # can be far from the market: it either rests unfilled or
-                    # fills badly, and both look like a successful square-off
-                    # in the log.
-                    self._error(
-                        "square_off",
-                        f"no quote for {instrument.symbol}; cannot build a "
-                        "marketable exit and this venue rejects MARKET orders",
-                        None,
-                        {"symbol": instrument.symbol, "qty": qty,
-                         "strategy_id": position.strategy_id})
-                    continue
                 limit = _marketable_limit(
-                    instrument, side, mark,
+                    instrument, side, usable,
                     self.engine.config.square_off_cross_ticks)
                 if limit is None:
                     self._error(
                         "square_off",
                         f"no positive on-tick exit price for "
-                        f"{instrument.symbol} at mark {mark}", None,
-                        {"symbol": instrument.symbol, "mark": mark})
+                        f"{instrument.symbol} at mark {usable}", None,
+                        {"symbol": instrument.symbol, "mark": usable})
                     continue
                 order_type = OrderType.LIMIT
+            else:
+                # Stamp the last known quote so the drift guard can run.
+                limit = usable
 
             # The source is part of the key: an operator flatten landing in the
             # same 60s bucket as the session square-off would otherwise reuse
