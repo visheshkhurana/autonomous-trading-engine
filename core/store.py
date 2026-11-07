@@ -755,7 +755,7 @@ class SQLiteGateStateStore:
     def _ensure_gate_notional_column(self) -> None:
         """Older ledgers created gate_submissions without `notional`. A missing
         column would make daily_notional refuse every crypto entry after a
-        deploy that added the 250 USDT daily cap."""
+        deploy that added the absolute daily notional cap."""
         cols = {row[1] for row in self._conn.execute(
             "PRAGMA table_info(gate_submissions)")}
         if "notional" not in cols:

@@ -83,9 +83,11 @@ def is_funds_movement(name: str) -> bool:
 
 
 def clip_spot_sell_qty(book_qty: Decimal, venue_free: Decimal) -> Decimal:
-    """Qty a spot SELL may send: never more than the venue can actually sell.
+    """Qty a spot SELL may send: min(engine book qty, venue free).
 
-    Buys must not go through this. Existing clip caps size those.
+    Venue free is a ceiling, never a size. A wallet that also holds coins
+    the engine does not track (a manual balance on the same account) cannot
+    increase the order above `book_qty`. Buys must not go through this.
     """
     if book_qty <= 0 or venue_free <= 0:
         return Decimal("0")

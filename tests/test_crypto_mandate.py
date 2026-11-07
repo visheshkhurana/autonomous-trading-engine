@@ -411,7 +411,8 @@ def test_unrecognised_spray_flag_raises() -> None:
         runner.parse_crypto_spray("maybe")
 
 
-def test_class_limits_remain_fifty_two_fifty_max_one() -> None:
-    assert runner.CRYPTO_CLIP_USDT == Decimal("50")
-    assert runner.CRYPTO_DAILY_USDT == Decimal("250")
+def test_class_limits_default_to_one_hundred_five_hundred_max_one() -> None:
+    assert runner.CRYPTO_CLIP_USDT == Decimal("100")
+    assert runner.CRYPTO_DAILY_USDT == Decimal("500")
     assert runner.CRYPTO_CLASS_LIMITS.max_open_positions == 1
+    assert runner.KRAKEN_SLEEVE_A_MAX_OPEN == 1

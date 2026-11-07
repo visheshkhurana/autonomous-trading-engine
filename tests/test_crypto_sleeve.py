@@ -2,14 +2,14 @@
 Vishesh's OKX sleeve — the proofs the rest of the book is not enough on
 its own.
 
-Caps (50 / 250 / max-1) live in the gate. Strategies are pure. Paper is
+Caps (100 / 500 / max-1) live in the gate. Strategies are pure. Paper is
 an adapter, not a flag. These tests stitch those pieces together and
 fail if any one of them is decorative:
 
   * a paper fill happens without constructing a live venue
   * a missing or zero quote never becomes an order
   * a second open symbol is refused
-  * the 50 / 250 USDT ceilings still bind through a real strategy intent
+  * the 100 / 500 USDT ceilings still bind through a real strategy intent
   * nothing in the OKX adapter can call withdraw / transfer / earn
 
 No test here sets CRYPTO_LIVE, EQUITY_LIVE, or TRADER_MODE=live.
@@ -42,8 +42,8 @@ from tests import test_engine as eng_tests
 from tests._strategy_support import coin, context
 from tests.test_okx_adapter import FILLED_ORDER, FakeExchange, adapter, spot
 
-CLIP = Decimal("50")
-DAILY = Decimal("250")
+CLIP = Decimal("100")
+DAILY = Decimal("500")
 BTC_PX = Decimal("78000")
 ETH_PX = Decimal("2460")
 NOW = dt.datetime(2026, 3, 2, 12, 0, tzinfo=dt.timezone.utc)
@@ -191,11 +191,10 @@ def test_the_gate_stamps_the_last_known_quote_onto_a_naked_market_intent(
 
 def test_a_trend_entry_with_a_known_quote_is_not_rejected_for_missing_reference(
         tmp_path) -> None:
-    """Reproduce the 2 Sep live book: EMA-cross-up, clip ~50 USDT
-    (qty 0.000643), then OkxAdapter refused with
-    'MARKET intent carries no reference price'. A known last quote must
+    """Reproduce the 2 Sep live book: EMA-cross-up, then OkxAdapter refused
+    with 'MARKET intent carries no reference price'. A known last quote must
     let the drift guard run; the order must be sent, not fail-closed for
-    a missing reference."""
+    a missing reference. Size follows the current clip, not the old 50."""
     env = {
         "TRADER_DB": str(tmp_path / "trader.db"),
         "ENGINE_API_TOKEN": "t" * 32,
@@ -225,8 +224,8 @@ def test_a_trend_entry_with_a_known_quote_is_not_rejected_for_missing_reference(
         assert approval.intent.limit_price == quote
         assert approval.intent.qty * quote <= CLIP
         assert approval.intent.qty < Decimal(1)
-        # Live clip was 0.000643; 50 / 78000 = 0.000641 at 6dp.
-        assert approval.intent.qty == Decimal("0.000641")
+        # 100 / 78000 = 0.00128205, snapped to qty_precision=6.
+        assert approval.intent.qty == Decimal("0.001282")
 
         ex = FakeExchange(
             {"BTC/USDT": spot("BTC/USDT")},
@@ -323,7 +322,7 @@ def test_paper_adapter_fills_without_constructing_okx() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_a_unit_btc_intent_is_clipped_to_fifty_usdt(tmp_path) -> None:
+def test_a_unit_btc_intent_is_clipped_to_the_usdt_cap(tmp_path) -> None:
     env = {
         "TRADER_DB": str(tmp_path / "trader.db"),
         "ENGINE_API_TOKEN": "t" * 32,
@@ -393,7 +392,7 @@ def test_daily_notional_stops_a_sixth_clip(tmp_path) -> None:
         s.store.close()
 
 
-def test_wired_crypto_caps_are_still_fifty_two_fifty_and_one(tmp_path) -> None:
+def test_wired_crypto_caps_are_one_hundred_five_hundred_and_one(tmp_path) -> None:
     env = {
         "TRADER_DB": str(tmp_path / "trader.db"),
         "ENGINE_API_TOKEN": "t" * 32,

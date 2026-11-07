@@ -85,7 +85,11 @@ UTC = dt.timezone.utc
 __all__ = [
     "CRYPTO_CLIP_USDT",
     "CRYPTO_DAILY_USDT",
+    "CRYPTO_CLIP_USDT_MAX",
+    "CRYPTO_DAILY_USDT_MAX",
     "CRYPTO_CLASS_LIMITS",
+    "crypto_class_limits",
+    "resolve_crypto_usdt_caps",
     "KRAKEN_SLEEVE_A_USDT",
     "KRAKEN_SLEEVE_A_CLIP_USDT",
     "KRAKEN_SLEEVE_A_DAILY_USDT",
@@ -130,21 +134,35 @@ ENV_KRAKEN_API_SECRET = "KRAKEN_API_SECRET"
 # no longer the registered crypto engine. Setting this to 1 re-registers
 # them behind the mandate for comparison only. Not an arming flag.
 ENV_CRYPTO_SPRAY = "CRYPTO_EMA_SPRAY"
+# Absolute USDT ceilings for crypto entries. Not arming flags. A value
+# above the hard max is clamped; it cannot raise the clip.
+ENV_CRYPTO_CLIP_USDT = "CRYPTO_CLIP_USDT"
+ENV_CRYPTO_DAILY_USDT = "CRYPTO_DAILY_USDT"
 
 DEFAULT_DB_PATH = "./var/trader.db"
 
-# Operator clip for crypto (Vishesh/Tony): 50 USDT per entry, 250 USDT of
-# new entry notional per UTC day, at most one open symbol. Absolute USDT
-# ceilings bind on top of the equity-fraction caps so a 2M paper float —
-# or a later live book — cannot print qty 1 BTC (~78k USDT). Paper and
-# live share these limits; arming is not a reason to uncap.
-CRYPTO_CLIP_USDT = Decimal("50")
-CRYPTO_DAILY_USDT = Decimal("250")
-# Locked by Vishesh for a later Kraken *live* sleeve A arm, AFTER paper
-# smoke is green. NOT wired. CRYPTO_CLASS_LIMITS and the paper mandate
-# stay 50 / 250 / max 1. Consecutive-loss halt stays the shared mandate
-# rule (3 losers), same as the OKX paper path. Do not apply these until
-# the owner sets KRAKEN_LIVE out of band.
+# Operator clip for crypto: 100 USDT per entry, 500 USDT of new entry
+# notional per UTC day, at most one open symbol. Absolute USDT ceilings
+# bind on top of the equity-fraction caps so a 2M paper float — or a
+# later live book — cannot print qty 1 BTC. Paper and live share these
+# limits; arming is not a reason to uncap.
+#
+# CRYPTO_CLIP_USDT / CRYPTO_DAILY_USDT are the defaults used when the
+# matching env var is unset. They are also the hard ceilings: an env
+# value above them is clamped down and can never raise the clip. A
+# smaller positive value is honoured. max_open_positions stays 1 and is
+# not an env knob.
+CRYPTO_CLIP_USDT_MAX = Decimal("100")
+CRYPTO_DAILY_USDT_MAX = Decimal("500")
+CRYPTO_CLIP_USDT = CRYPTO_CLIP_USDT_MAX
+CRYPTO_DAILY_USDT = CRYPTO_DAILY_USDT_MAX
+# Locked by Vishesh for a later Kraken *live* sleeve A arm. NOT wired as
+# a second limit set. Crypto uses CRYPTO_CLASS_LIMITS (defaults 100 / 500
+# / max 1, env-clamped to those ceilings). The 1000 USDT sleeve figure
+# and KRAKEN_SLEEVE_A_MAX_OPEN stay documentation for that later arm.
+# Consecutive-loss halt stays the shared mandate rule (3 losers), same
+# as the OKX paper path. Do not apply a live arm until the owner sets
+# KRAKEN_LIVE out of band.
 KRAKEN_SLEEVE_A_USDT = Decimal("1000")
 KRAKEN_SLEEVE_A_CLIP_USDT = Decimal("100")
 KRAKEN_SLEEVE_A_DAILY_USDT = Decimal("500")
@@ -157,6 +175,84 @@ CRYPTO_CLASS_LIMITS = ClassLimits(
     max_order_notional=CRYPTO_CLIP_USDT,
     max_daily_notional=CRYPTO_DAILY_USDT,
 )
+
+
+def _parse_capped_usdt(
+    raw: Optional[str],
+    *,
+    name: str,
+    default: Decimal,
+    ceiling: Decimal,
+) -> Decimal:
+    """Positive USDT amount from env. Blank uses `default`. Above `ceiling` clamps.
+
+    Unparseable, non-finite, or non-positive values raise. The clamp is only
+    an upper bound: a typo must not become a silent zero, and a value above
+    the ceiling must not become a larger clip.
+    """
+    if raw is None or not raw.strip():
+        return default
+    text = raw.strip()
+    try:
+        value = Decimal(text)
+    except Exception as exc:
+        raise ValueError(f"{name}={raw!r} is not a decimal USDT amount") from exc
+    if not value.is_finite() or value <= 0:
+        raise ValueError(f"{name}={raw!r} must be a finite amount > 0")
+    if value > ceiling:
+        LOG.warning(
+            "%s=%s exceeds the hard ceiling %s; clamping",
+            name, value, ceiling,
+        )
+        return ceiling
+    return value
+
+
+def resolve_crypto_usdt_caps(
+    env: Optional[Mapping[str, str]] = None,
+) -> tuple[Decimal, Decimal]:
+    """`(clip, daily)` USDT caps for crypto entries.
+
+    Unset env vars use CRYPTO_CLIP_USDT / CRYPTO_DAILY_USDT. Either value
+    is clamped to its hard max. A clip larger than the daily cap raises:
+    that configuration cannot place a single entry.
+    """
+    source: Mapping[str, str] = os.environ if env is None else env
+    clip = _parse_capped_usdt(
+        source.get(ENV_CRYPTO_CLIP_USDT),
+        name=ENV_CRYPTO_CLIP_USDT,
+        default=CRYPTO_CLIP_USDT,
+        ceiling=CRYPTO_CLIP_USDT_MAX,
+    )
+    daily = _parse_capped_usdt(
+        source.get(ENV_CRYPTO_DAILY_USDT),
+        name=ENV_CRYPTO_DAILY_USDT,
+        default=CRYPTO_DAILY_USDT,
+        ceiling=CRYPTO_DAILY_USDT_MAX,
+    )
+    if clip > daily:
+        raise ValueError(
+            f"{ENV_CRYPTO_CLIP_USDT}={clip} exceeds "
+            f"{ENV_CRYPTO_DAILY_USDT}={daily}; a single clip could never "
+            "be placed without breaching the daily notional cap"
+        )
+    return clip, daily
+
+
+def crypto_class_limits(env: Optional[Mapping[str, str]] = None) -> ClassLimits:
+    """Crypto ClassLimits for this env. Defaults return the shared object.
+
+    max_open_positions stays 1. Only the two USDT ceilings are env-backed,
+    and neither can exceed its hard max.
+    """
+    clip, daily = resolve_crypto_usdt_caps(env)
+    if clip == CRYPTO_CLIP_USDT and daily == CRYPTO_DAILY_USDT:
+        return CRYPTO_CLASS_LIMITS
+    return replace(
+        CRYPTO_CLASS_LIMITS,
+        max_order_notional=clip,
+        max_daily_notional=daily,
+    )
 
 
 class FeedChoice(str, Enum):
@@ -1181,10 +1277,10 @@ def reset_oversized_paper_crypto(
 ) -> tuple[str, ...]:
     """Flatten paper crypto rows whose notional exceeds the clip.
 
-    The Phase-0 leftover is ETH/USDT qty 1 @ 2460 — ~49x the clip and
-    enough to consume the single open slot. A reused `/data/trader.db`
+    The Phase-0 leftover is ETH/USDT qty 1 @ 2460 — many times the clip
+    and enough to consume the single open slot. A reused `/data/trader.db`
     must not inherit that 1-coin book. Clip-sized paper rows are kept so
-    a restart does not wipe a real 50 USDT position.
+    a restart does not wipe a real clip-sized position.
 
     LIVE rows are never touched. Paper vs live isolation is the whole
     point of the ledger.
@@ -1467,10 +1563,16 @@ def build_stack(config: Optional[RunnerConfig] = None,
 
     store = SQLitePositionStore(cfg.db_path)
     gate_state = SQLiteGateStateStore(cfg.db_path, cfg.requested_mode)
+    crypto_limits = crypto_class_limits(source)
     # Paper crypto only. Do not inherit a 1-coin leftover (ETH/USDT 1 @
     # 2460) into the sized book. Live rows are invisible to this read.
+    # The clip is the resolved env cap, so a lower CRYPTO_CLIP_USDT still
+    # flattens a paper row above that cap.
     if AssetClass.CRYPTO in cfg.asset_classes:
-        reset_oversized_paper_crypto(store, clip=CRYPTO_CLIP_USDT, now=clock())
+        clip = crypto_limits.max_order_notional
+        if clip is None:
+            raise RuntimeError("crypto clip was not resolved")
+        reset_oversized_paper_crypto(store, clip=clip, now=clock())
     control = api_mod.SqliteControlStore(cfg.db_path)
     enable_crypto_spray = parse_crypto_spray(source.get(ENV_CRYPTO_SPRAY))
     crypto_venue = parse_crypto_venue(source.get(ENV_CRYPTO_VENUE))
@@ -1654,7 +1756,7 @@ def build_stack(config: Optional[RunnerConfig] = None,
         # with a mode mismatch. One value, read once, passed to both.
         config=GateConfig(
             requested_mode=cfg.requested_mode,
-            limits={AssetClass.CRYPTO: CRYPTO_CLASS_LIMITS},
+            limits={AssetClass.CRYPTO: crypto_limits},
         ),
         env=env,
     )
@@ -1881,6 +1983,8 @@ def status_report(
     """
     import json as _json  # local: keep runner import surface small
 
+    source: Mapping[str, str] = os.environ if env is None else env
+    crypto_limits = crypto_class_limits(source)
     stack = build_stack(env=env, **stack_kw)
     try:
         crypto = stack.engine._runners.get(AssetClass.CRYPTO)
@@ -1903,9 +2007,9 @@ def status_report(
             "adapter": adapter_name,
             "live_adapter": live_name,
             "signal": signal,
-            "clip_usdt": str(CRYPTO_CLIP_USDT),
-            "daily_usdt": str(CRYPTO_DAILY_USDT),
-            "max_open": int(CRYPTO_CLASS_LIMITS.max_open_positions),
+            "clip_usdt": str(crypto_limits.max_order_notional),
+            "daily_usdt": str(crypto_limits.max_daily_notional),
+            "max_open": int(crypto_limits.max_open_positions),
         }
         # Round-trip through JSON so callers cannot smuggle Decimals.
         return _json.loads(_json.dumps(payload))

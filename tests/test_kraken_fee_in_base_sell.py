@@ -7,7 +7,7 @@ fees in the base the same way. These tests are the same contract: a spot
 SELL is min(book, venue free) and unplaceable dust is written off.
 
 No network, no credentials, no CRYPTO_LIVE / EQUITY_LIVE / TRADER_MODE /
-KRAKEN_LIVE. Buys are not shrunk. Caps stay 50 USDT / clip, 250 / day.
+KRAKEN_LIVE. Buys are not shrunk. Caps default to 100 USDT / clip, 500 / day.
 """
 
 from __future__ import annotations
@@ -129,6 +129,44 @@ def test_spot_sell_is_clipped_to_free_base_and_does_not_insufficient_funds() -> 
     assert "clipped" in (ref.error or "")
 
 
+def test_sell_is_not_inflated_to_a_larger_free_btc_balance() -> None:
+    """A manual 0.088 BTC in the same wallet must not become the sell size.
+
+    Flatten and strategy exits pass the engine ledger qty as the intent.
+    Venue free is only a ceiling: free = engine qty + 0.088 still sends
+    the engine qty, not the wallet.
+    """
+    engine_qty = Decimal("0.001")
+    manual = Decimal("0.088")
+    free = manual + engine_qty
+    btc = runner.default_instruments(AssetClass.CRYPTO)[0]
+    mark = Decimal("100000")
+    ex = IncidentExchange(free_eth=free, mark=mark)
+    ex._markets = {"BTC/USDT": spot(
+        "BTC/USDT", amount_step="0.00000001", price_step="0.1",
+        min_amount="0.00001", min_cost="5",
+    )}
+    ex.markets = ex._markets
+    ex.tickers = {"BTC/USDT": {"last": format(mark, "f")}}
+    ex.balance = {
+        "total": {"USDT": "10000", "BTC": format(free, "f")},
+        "free": {"USDT": "10000", "BTC": format(free, "f")},
+    }
+    intent = Intent(
+        instrument=btc, side=Side.SELL, qty=engine_qty,
+        order_type=OrderType.MARKET, strategy_id="crypto_mandate",
+        reason="engine exit", idempotency_key="exit-btc-manual",
+        limit_price=mark,
+    )
+    ref = _adapter(ex).place(intent)
+    assert ref.status is OrderStatus.FILLED
+    sent = _sent_amount(ex)
+    assert sent == engine_qty
+    assert sent < manual
+    assert sent < free
+    assert "clipped" not in (ref.error or "")
+
+
 def test_spot_buy_is_not_shrunk_to_free_base() -> None:
     ex = IncidentExchange(free_eth=Decimal("0"))
     ref = _adapter(ex).place(_buy_intent())
@@ -179,7 +217,8 @@ def test_place_still_raises_order_submit_failed_when_the_venue_rejects() -> None
         _adapter(ex).place(_sell_intent(key="still-fails"))
 
 
-def test_caps_are_still_fifty_two_fifty_and_one_open() -> None:
-    assert runner.CRYPTO_CLIP_USDT == Decimal("50")
-    assert runner.CRYPTO_DAILY_USDT == Decimal("250")
+def test_caps_default_to_one_hundred_five_hundred_and_one_open() -> None:
+    assert runner.CRYPTO_CLIP_USDT == Decimal("100")
+    assert runner.CRYPTO_DAILY_USDT == Decimal("500")
     assert runner.CRYPTO_CLASS_LIMITS.max_open_positions == 1
+    assert runner.KRAKEN_SLEEVE_A_MAX_OPEN == 1

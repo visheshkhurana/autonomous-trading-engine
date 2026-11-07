@@ -9,7 +9,8 @@ no CRYPTO_LIVE / EQUITY_LIVE / TRADER_MODE. After the fix, a spot SELL is
 min(book, venue free) and the leftover dust is written off so flatten cannot
 stick on an unsellable stub.
 
-Buys are not shrunk this way. Caps stay 50 USDT / clip, 250 / day, max 1 open.
+Buys are not shrunk this way. Caps default to 100 USDT / clip, 500 / day,
+max 1 open.
 """
 
 from __future__ import annotations
@@ -180,7 +181,7 @@ def test_spot_sell_is_clipped_to_free_eth_and_does_not_51008() -> None:
 
 def test_spot_buy_is_not_shrunk_to_free_base() -> None:
     """Buys keep their sized qty. Free ETH is the coin we are about to acquire,
-    not a cap on the order. Existing clip caps (50 USDT) are the only shrink."""
+    not a cap on the order. Existing clip caps are the only shrink."""
     ex = IncidentExchange(free_eth=Decimal("0"))
     ref = _adapter(ex).place(_buy_intent())
     assert ref.status is OrderStatus.FILLED
@@ -375,9 +376,9 @@ def test_strategy_exit_proposes_book_qty_and_the_adapter_clips_the_send(
         h.close()
 
 
-def test_caps_are_still_fifty_two_fifty_and_one_open() -> None:
-    assert runner.CRYPTO_CLIP_USDT == Decimal("50")
-    assert runner.CRYPTO_DAILY_USDT == Decimal("250")
+def test_caps_default_to_one_hundred_five_hundred_and_one_open() -> None:
+    assert runner.CRYPTO_CLIP_USDT == Decimal("100")
+    assert runner.CRYPTO_DAILY_USDT == Decimal("500")
     assert runner.CRYPTO_CLASS_LIMITS.max_open_positions == 1
-    assert runner.CRYPTO_CLASS_LIMITS.max_order_notional == Decimal("50")
-    assert runner.CRYPTO_CLASS_LIMITS.max_daily_notional == Decimal("250")
+    assert runner.CRYPTO_CLASS_LIMITS.max_order_notional == Decimal("100")
+    assert runner.CRYPTO_CLASS_LIMITS.max_daily_notional == Decimal("500")

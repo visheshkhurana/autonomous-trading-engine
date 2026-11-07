@@ -503,9 +503,9 @@ def test_boot_report_shows_crypto_disarmed_by_default(stack) -> None:
     assert "OkxAdapter" not in text
 
 
-def test_crypto_notional_cap_is_fifty_usdt_not_ten_percent_of_equity(stack) -> None:
+def test_crypto_notional_cap_is_the_usdt_clip_not_ten_percent_of_equity(stack) -> None:
     """A 2M paper float must not license a 1-coin (or 2-coin) BTC clip.
-    The operator clip is 50 USDT, tighter than 10% of equity (200_000)."""
+    The operator clip is 100 USDT, tighter than 10% of equity (200_000)."""
     s = stack()
     limits = s.gate._OrderGate__config.limits_for(AssetClass.CRYPTO)
     assert limits is runner.CRYPTO_CLASS_LIMITS
@@ -514,7 +514,7 @@ def test_crypto_notional_cap_is_fifty_usdt_not_ten_percent_of_equity(stack) -> N
     assert limits.max_open_positions == 1
 
     instrument = runner.default_instruments(AssetClass.CRYPTO)[0]
-    # 3 BTC at 100_000 = 300_000; 10% of 2_000_000 is 200_000; clip is 50.
+    # 3 BTC at 100_000 = 300_000; 10% of 2_000_000 is 200_000; clip is 100.
     intent = Intent(
         instrument=instrument, side=Side.BUY, qty=Decimal("3"),
         order_type=OrderType.MARKET, strategy_id="crypto_trend",
@@ -524,7 +524,7 @@ def test_crypto_notional_cap_is_fifty_usdt_not_ten_percent_of_equity(stack) -> N
         equity=Decimal("2000000"))
     approval = s.gate.check(intent, ctx)
     assert approval.approved, approval.reason
-    assert approval.intent.qty == Decimal("0.0005")   # 50 / 100_000
+    assert approval.intent.qty == Decimal("0.001")   # 100 / 100_000
     assert approval.intent.qty * Decimal("100000") <= runner.CRYPTO_CLIP_USDT
     cap = [c for c in approval.checks if c.name == "notional_cap"][0]
     assert cap.passed

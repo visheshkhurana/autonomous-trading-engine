@@ -156,15 +156,20 @@ TRADER_CRYPTO_VENUE=kraken TRADER_FEED=kraken   # KRAKEN_LIVE off
 
 Public ticker (no keys): `curl -s 'https://api.kraken.com/0/public/Ticker?pair=XBTUSD'`
 
-**Today's paper caps stay 50 USDT / 250 daily / max 1 open** on the
-existing 1000 USDT `crypto_mandate` sleeve. Consecutive-loss halt is the
-shared mandate rule (3 losers / 2% daily), same as the OKX paper path.
+**Crypto entry caps default to 100 USDT / clip and 500 / day, max 1 open.**
+`CRYPTO_CLIP_USDT` and `CRYPTO_DAILY_USDT` override those defaults and are
+clamped so neither can exceed 100 / 500. `max_open_positions` stays 1.
+The 1000 USDT `crypto_mandate` sleeve NAV is unchanged. Consecutive-loss
+halt is the shared mandate rule (3 losers / 2% daily), same as the OKX
+paper path.
 
 Later **Kraken live sleeve A** (Vishesh-locked, document only — do **not**
 arm in this PR): **1000 USDT sleeve / 100 USDT per clip / 500 per day /
-max 1 open**, same consecutive-loss halt. Apply those caps only when the
-owner later sets `KRAKEN_LIVE=1` *and* `TRADER_MODE=live` *and*
-`CRYPTO_LIVE=1` *and* Fly secrets `KRAKEN_API_KEY`/`KRAKEN_API_SECRET`.
+max 1 open**, same consecutive-loss halt. The clip and daily numbers match
+the crypto defaults; the 1000 sleeve is still not wired as a second limit
+set. Apply a live arm only when the owner later sets `KRAKEN_LIVE=1`
+*and* `TRADER_MODE=live` *and* `CRYPTO_LIVE=1` *and* Fly secrets
+`KRAKEN_API_KEY`/`KRAKEN_API_SECRET`.
 `CRYPTO_LIVE` still arms **OKX** when the venue is unset; naming kraken
 without `KRAKEN_LIVE` refuses to boot. Do not set those flags from this
 README.
