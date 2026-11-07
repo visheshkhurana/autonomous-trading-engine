@@ -2,9 +2,10 @@
 Crypto clip / daily / open-slot caps.
 
 Strategies still propose one unit. The gate is what must make a live-ready
-clip 50 USDT, not 1 BTC (~78k) or the leftover paper ETH/USDT 1 @ 2460.
+clip 100 USDT, not 1 BTC (~78k) or the leftover paper ETH/USDT 1 @ 2460.
 These tests fail if CRYPTO_CLASS_LIMITS go back to equity-fraction-only
-sizing, or if a reused ledger can inherit a 1-coin paper leftover.
+sizing, if an env value can raise the clip above 100 / 500, or if a reused
+ledger can inherit a 1-coin paper leftover.
 """
 
 from __future__ import annotations
@@ -25,8 +26,8 @@ TOKEN = "t" * 32
 NOW = dt.datetime(2026, 3, 2, 12, 0, tzinfo=dt.timezone.utc)
 BTC_PX = Decimal("78000")
 ETH_PX = Decimal("2460")
-CLIP = Decimal("50")
-DAILY = Decimal("250")
+CLIP = Decimal("100")
+DAILY = Decimal("500")
 
 
 def base_env(tmp_path, **extra) -> dict[str, str]:
@@ -91,7 +92,7 @@ def stack(tmp_path):
 
 def test_crypto_clip_and_daily_caps_are_absolute_usdt(stack) -> None:
     """A 2M paper float must not license a 1-coin BTC clip. The operator
-    caps are 50 USDT / clip and 250 USDT / day, not 10% of equity."""
+    caps are 100 USDT / clip and 500 USDT / day, not 10% of equity."""
     s = stack()
     limits = s.gate._OrderGate__config.limits_for(AssetClass.CRYPTO)
     assert limits is runner.CRYPTO_CLASS_LIMITS
@@ -102,7 +103,7 @@ def test_crypto_clip_and_daily_caps_are_absolute_usdt(stack) -> None:
     assert limits.max_open_positions == 1
 
 
-def test_one_btc_is_sized_to_fifty_usdt_not_one_coin(stack) -> None:
+def test_one_btc_is_sized_to_the_clip_not_one_coin(stack) -> None:
     """The defect: paper used qty 1, which is ~78k USDT on BTC if armed."""
     s = stack()
     approval = s.gate.check(crypto_intent(qty="1"), crypto_ctx())
@@ -112,11 +113,11 @@ def test_one_btc_is_sized_to_fifty_usdt_not_one_coin(stack) -> None:
     assert sized * BTC_PX <= CLIP
     assert sized * BTC_PX >= Decimal("5")   # above instrument min_notional
     assert sized < Decimal("1")
-    # 50 / 78000 = 0.000641, snapped to qty_precision=6
-    assert sized == Decimal("0.000641")
+    # 100 / 78000 = 0.00128205, snapped to qty_precision=6
+    assert sized == Decimal("0.001282")
 
 
-def test_one_eth_is_sized_to_fifty_usdt(stack) -> None:
+def test_one_eth_is_sized_to_the_clip(stack) -> None:
     s = stack()
     approval = s.gate.check(
         crypto_intent(instrument=eth(), qty="1", key="eth-clip"),
@@ -141,8 +142,8 @@ def test_a_second_open_crypto_symbol_is_refused(stack) -> None:
     assert approval.rejections[0].name == "max_open_positions"
 
 
-def test_daily_notional_refuses_a_sixth_fifty_usdt_clip(stack) -> None:
-    """5 * 50 = 250. A sixth entry the same UTC day has no room."""
+def test_daily_notional_refuses_a_sixth_clip(stack) -> None:
+    """5 * 100 = 500. A sixth entry the same UTC day has no room."""
     s = stack()
     state = s.gate_state
     for i in range(5):
@@ -157,13 +158,13 @@ def test_daily_notional_refuses_a_sixth_fifty_usdt_clip(stack) -> None:
 def test_daily_notional_sizes_down_to_remaining_room(stack) -> None:
     s = stack()
     s.gate_state.record_submission(
-        "spent-200", AssetClass.CRYPTO, "2026-03-02", NOW,
-        notional=Decimal("200"))
+        "spent-450", AssetClass.CRYPTO, "2026-03-02", NOW,
+        notional=Decimal("450"))
     approval = s.gate.check(crypto_intent(qty="1", key="remain-50"),
                             crypto_ctx())
     assert approval.approved, approval.reason
     assert approval.intent.qty * BTC_PX <= Decimal("50")
-    # 50 remaining / 78000 = 0.000641
+    # 50 remaining / 78000 = 0.000641, snapped to qty_precision=6
     assert approval.intent.qty == Decimal("0.000641")
 
 
@@ -270,3 +271,123 @@ def test_equity_default_limits_have_no_absolute_usdt_cap() -> None:
     assert defaults.max_order_notional is None
     assert defaults.max_daily_notional is None
     assert GateConfig().limits_for(AssetClass.EQUITY) is GateConfig().default_limits
+
+
+# --------------------------------------------------------------------------
+# env caps: defaults, lower overrides, hard ceiling
+# --------------------------------------------------------------------------
+
+
+def test_unset_env_uses_the_default_caps_and_the_shared_object() -> None:
+    clip, daily = runner.resolve_crypto_usdt_caps({})
+    assert clip == CLIP == runner.CRYPTO_CLIP_USDT == runner.CRYPTO_CLIP_USDT_MAX
+    assert daily == DAILY == runner.CRYPTO_DAILY_USDT == runner.CRYPTO_DAILY_USDT_MAX
+    limits = runner.crypto_class_limits({})
+    assert limits is runner.CRYPTO_CLASS_LIMITS
+    assert limits.max_open_positions == 1
+    assert runner.KRAKEN_SLEEVE_A_MAX_OPEN == 1
+
+
+def test_blank_env_values_are_the_defaults() -> None:
+    clip, daily = runner.resolve_crypto_usdt_caps({
+        "CRYPTO_CLIP_USDT": "  ",
+        "CRYPTO_DAILY_USDT": "",
+    })
+    assert (clip, daily) == (CLIP, DAILY)
+    assert runner.crypto_class_limits({
+        "CRYPTO_CLIP_USDT": "100",
+        "CRYPTO_DAILY_USDT": "500.0",
+    }) is runner.CRYPTO_CLASS_LIMITS
+
+
+def test_a_lower_env_cap_is_honoured(stack) -> None:
+    limits = runner.crypto_class_limits({
+        "CRYPTO_CLIP_USDT": " 40 ",
+        "CRYPTO_DAILY_USDT": "200",
+    })
+    assert limits is not runner.CRYPTO_CLASS_LIMITS
+    assert limits.max_order_notional == Decimal("40")
+    assert limits.max_daily_notional == Decimal("200")
+    assert limits.max_open_positions == 1
+
+    s = stack(CRYPTO_CLIP_USDT="40", CRYPTO_DAILY_USDT="200")
+    wired = s.gate._OrderGate__config.limits_for(AssetClass.CRYPTO)
+    assert wired.max_order_notional == Decimal("40")
+    assert wired.max_daily_notional == Decimal("200")
+    assert wired.max_open_positions == 1
+    approval = s.gate.check(crypto_intent(qty="1", key="env-40"), crypto_ctx())
+    assert approval.approved, approval.reason
+    # 40 / 78000 = 0.00051282, snapped to qty_precision=6
+    assert approval.intent.qty == Decimal("0.000512")
+    assert approval.intent.qty * BTC_PX <= Decimal("40")
+
+
+def test_env_above_the_ceiling_is_clamped_to_100_and_500(stack) -> None:
+    clip, daily = runner.resolve_crypto_usdt_caps({
+        "CRYPTO_CLIP_USDT": "1000",
+        "CRYPTO_DAILY_USDT": "9000",
+    })
+    assert clip == CLIP
+    assert daily == DAILY
+    assert runner.crypto_class_limits({
+        "CRYPTO_CLIP_USDT": "10000",
+        "CRYPTO_DAILY_USDT": "5000",
+    }) is runner.CRYPTO_CLASS_LIMITS
+
+    s = stack(CRYPTO_CLIP_USDT="250", CRYPTO_DAILY_USDT="5000")
+    wired = s.gate._OrderGate__config.limits_for(AssetClass.CRYPTO)
+    assert wired.max_order_notional == CLIP
+    assert wired.max_daily_notional == DAILY
+    assert wired.max_open_positions == 1
+    approval = s.gate.check(crypto_intent(qty="1", key="clamped"), crypto_ctx())
+    assert approval.approved, approval.reason
+    assert approval.intent.qty == Decimal("0.001282")
+    assert approval.intent.qty * BTC_PX <= CLIP
+
+
+@pytest.mark.parametrize("raw", ["nope", "0", "-5", "inf", "NaN", "100 USDT"])
+def test_unusable_clip_env_raises(raw: str) -> None:
+    with pytest.raises(ValueError):
+        runner.resolve_crypto_usdt_caps({"CRYPTO_CLIP_USDT": raw})
+
+
+def test_a_clip_above_the_resolved_daily_cap_raises() -> None:
+    with pytest.raises(ValueError, match="CRYPTO_CLIP_USDT"):
+        runner.resolve_crypto_usdt_caps({
+            "CRYPTO_CLIP_USDT": "80",
+            "CRYPTO_DAILY_USDT": "40",
+        })
+
+
+def test_a_lower_env_clip_flattens_a_paper_row_above_it(tmp_path) -> None:
+    """60 USDT is inside the 100 default and outside a 40 env clip."""
+    db = str(tmp_path / "trader.db")
+    qty = (Decimal("60") / BTC_PX).quantize(Decimal("0.000001"))
+    assert qty * BTC_PX <= CLIP
+    assert qty * BTC_PX > Decimal("40")
+    with SQLitePositionStore(db) as seed:
+        seed.apply(
+            Fill(order_id="paper-between-caps", instrument=btc(),
+                 side=Side.BUY, qty=qty, price=BTC_PX,
+                 fees=Decimal("0"), at=NOW, mode=Mode.PAPER),
+            strategy_id="crypto_trend",
+        )
+    kept = runner.build_stack(env=base_env(tmp_path), clock=lambda: NOW)
+    try:
+        held = kept.store.positions(Mode.PAPER, AssetClass.CRYPTO)
+        assert len(held) == 1
+        assert held[0].qty == qty
+    finally:
+        kept.close()
+        kept.store.close()
+
+    flattened = runner.build_stack(
+        env=base_env(tmp_path, CRYPTO_CLIP_USDT="40"), clock=lambda: NOW)
+    try:
+        assert flattened.store.positions(Mode.PAPER, AssetClass.CRYPTO) == []
+        wired = flattened.gate._OrderGate__config.limits_for(AssetClass.CRYPTO)
+        assert wired.max_order_notional == Decimal("40")
+        assert wired.max_open_positions == 1
+    finally:
+        flattened.close()
+        flattened.store.close()

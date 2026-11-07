@@ -284,16 +284,17 @@ def test_kraken_paper_reuses_crypto_mandate_not_a_new_scraper(tmp_path) -> None:
         assert "crypto_mandate" in ids
         assert not any("scraper" in i for i in ids)
         limits = runner.CRYPTO_CLASS_LIMITS
-        assert limits.max_order_notional == runner.CRYPTO_CLIP_USDT == Decimal("50")
-        assert limits.max_daily_notional == runner.CRYPTO_DAILY_USDT == Decimal("250")
+        assert limits.max_order_notional == runner.CRYPTO_CLIP_USDT == Decimal("100")
+        assert limits.max_daily_notional == runner.CRYPTO_DAILY_USDT == Decimal("500")
         assert limits.max_open_positions == 1
-        # Locked live sleeve A numbers exist for the later arm step only.
-        # Wiring them here would raise the shared OKX/paper clip.
+        # Sleeve A numbers stay documentation for a later arm. The 1000
+        # sleeve is not the clip. Max open stays 1.
         assert runner.KRAKEN_SLEEVE_A_USDT == Decimal("1000")
         assert runner.KRAKEN_SLEEVE_A_CLIP_USDT == Decimal("100")
         assert runner.KRAKEN_SLEEVE_A_DAILY_USDT == Decimal("500")
         assert runner.KRAKEN_SLEEVE_A_MAX_OPEN == 1
-        assert runner.CRYPTO_CLIP_USDT != runner.KRAKEN_SLEEVE_A_CLIP_USDT
+        assert limits.max_order_notional != runner.KRAKEN_SLEEVE_A_USDT
+        assert limits.max_open_positions == runner.KRAKEN_SLEEVE_A_MAX_OPEN
         assert runner.parse_kraken_live(None) is False
         from strategies.mandate.constants import CONSECUTIVE_LOSS_STOP
         from strategies.mandate.risk import new_directional_blocked
