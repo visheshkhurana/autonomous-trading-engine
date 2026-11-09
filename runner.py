@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import time
 import logging
 import os
 import sys
@@ -1198,6 +1199,11 @@ class _LazyKrakenTradeExchange:
         if secret:
             cfg["secret"] = secret
         inner = ccxt.kraken(cfg)
+        # Kraken nonces are per-API-key and must always increase. Millisecond
+        # timestamps lose to any peer that used a higher-resolution nonce (or a
+        # second process on the same key), which makes fetch_balance fail with
+        # InvalidNonce and nulls equity forever. Nanoseconds stay ahead of both.
+        inner.nonce = lambda: int(time.time() * 1_000_000_000)
         object.__setattr__(self, "_inner", inner)
         return inner
 
