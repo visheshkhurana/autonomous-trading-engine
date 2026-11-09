@@ -1221,11 +1221,19 @@ def _adapter_equity(handle: EngineHandle,
     if adapter is None:
         return None, f"no adapter resolved for {asset_class.value}"
     try:
-        value = adapter.equity()
+        breakdown = getattr(adapter, "equity_breakdown", None)
+        if callable(breakdown):
+            bd = breakdown()
+            value = getattr(bd, "total", None)
+            if value is None:
+                reason = getattr(bd, "reason", None) or "adapter could not establish equity"
+                return None, reason
+        else:
+            value = adapter.equity()
+            if value is None:
+                return None, "adapter could not establish equity"
     except Exception as exc:
         return None, f"adapter.equity() raised: {exc!r}"
-    if value is None:
-        return None, "adapter could not establish equity"
     if not isinstance(value, Decimal):
         # A float here would silently become a JSON number and drift the
         # denominator every drawdown fraction is computed against.
