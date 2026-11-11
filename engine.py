@@ -2659,7 +2659,8 @@ class Engine:
         if due:
             self._status_fetched_mono = now_m
             try:
-                fetched, fetch_error = fetch_status_windows(self._status_fetcher)
+                fetched, fetch_error = fetch_status_windows(
+                    self._status_fetcher, env=self.safety_env)
             except Exception as exc:
                 fetched, fetch_error = [], repr(exc)
             if fetch_error and not fetched:

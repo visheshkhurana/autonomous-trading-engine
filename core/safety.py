@@ -9,7 +9,12 @@ string rather than as a silent skip:
   not open risk, and it also must not trap a position the operator is trying
   to close.
 * ``blackout`` — a configured UTC window, or a Kraken status-page maintenance
-  padded 15 minutes before and 30 minutes after. Configured windows always
+  that affects trading, padded 15 minutes before and 30 minutes after.
+  Delistings, funding, deposits and withdrawals, specific assets or
+  networks, and any status-page window longer than
+  ``KRAKEN_STATUS_MAX_WINDOW_H`` (default 12 hours) are not blackouts.
+  An ``in_progress`` incident Kraken never marks complete still ends at
+  ``scheduled_until`` plus the 30 minute pad. Configured windows always
   apply. A failed status-page fetch adds nothing (fail open) and does not
   drop windows that were configured.
 * ``key_freeze`` — ``KEY_FREEZE`` is truthy, or the freeze file exists. No
@@ -27,6 +32,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -45,6 +51,41 @@ STOP_CONFIRM_S = 10.0
 # does not leave an entry in flight as the matching engine goes down.
 STATUS_PAD_BEFORE = dt.timedelta(minutes=15)
 STATUS_PAD_AFTER = dt.timedelta(minutes=30)
+# Real API maintenance is short. The Sep–Dec 2026 asset-delisting notice
+# is a multi-month status entry; it must not become an entry blackout.
+STATUS_MAX_WINDOW = dt.timedelta(hours=12)
+STATUS_MAX_WINDOW_ENV = "KRAKEN_STATUS_MAX_WINDOW_H"
+
+# Component `name` values on status.kraken.com/api/v2/components.json are
+# short labels: "REST", "WebSocket", "FIX", "Unified WebSocket", "REST API",
+# "Websocket API", "FIX API", "Order Placement", "Prop Trading". Asset and
+# network rails look like "API3 (API3) - Ethereum" or "Euro (EUR) - SEPA".
+# Match the trading labels. A parenthetical ticker is not an API.
+_TRADING_MARK = re.compile(
+    r"("
+    r"\brest\b"
+    r"|websocket"
+    r"|\bfix\b"
+    r"|\bapi\b"
+    r"|order\s+entr(?:y|ies)"
+    r"|order\s+placement"
+    r"|\btrading\b"
+    r"|website[\s-]+and[\s-]+api"
+    r"|platform[\s-]+wide"
+    r")",
+    re.IGNORECASE,
+)
+# Funding rails and per-asset notices. "API3" must not match \bapi\b; the
+# ticker pattern is what drops "API3 (API3) - Ethereum" if a looser rule
+# is added later.
+_ASSET_OR_FUNDING_COMPONENT = re.compile(
+    r"\([A-Z0-9]{2,}\)|deposit|withdraw|funding",
+    re.IGNORECASE,
+)
+_NON_TRADING_NOTICE = re.compile(
+    r"delist|funding|deposit|withdraw|banking|\bnetwork\b|\([A-Z0-9]{2,}\)",
+    re.IGNORECASE,
+)
 
 STATUS_URLS: tuple[str, ...] = (
     "https://status.kraken.com/api/v2/scheduled-maintenances/upcoming.json",
@@ -409,16 +450,81 @@ def load_configured_windows(
     return windows, ("; ".join(errors) if errors else None)
 
 
+def status_max_window(source: Mapping[str, str]) -> dt.timedelta:
+    """``KRAKEN_STATUS_MAX_WINDOW_H`` (default 12). Longer status windows drop.
+
+    A value that is not a positive number raises, same as the other safety
+    env parsers. The engine treats that as a failed status fetch (previous
+    status windows stay, configured windows stay). The API falls back to
+    12 hours and reports the error instead of failing the request.
+    """
+    hours = env_float(
+        source, STATUS_MAX_WINDOW_ENV, STATUS_MAX_WINDOW.total_seconds() / 3600.0)
+    return dt.timedelta(hours=hours)
+
+
+def _component_names(row: Mapping[str, Any]) -> list[str]:
+    """Short component labels from a scheduled-maintenance object.
+
+    statuspage.io puts the group's display prefix on incident-update
+    ``affected_components`` ("Kraken API - Embed"). That prefix contains
+    "API", so Embed-only work would look like an API outage. The
+    ``components`` array carries the real label ("Embed", "REST", "FIX").
+    """
+    components = row.get("components")
+    if not isinstance(components, list):
+        return []
+    names: list[str] = []
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        name = component.get("name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return names
+
+
+def _maintenance_affects_trading(row: Mapping[str, Any]) -> bool:
+    """True when this status entry is about placing or reaching orders.
+
+    Delistings never qualify, even if a component label happens to match:
+    the Sep 2026 delisting notice ran for months with an empty component
+    list and was blocking every new entry. Funding, deposits, withdrawals,
+    and a single asset or network do not qualify either. A trading
+    component still counts when the title is vague ("Derivatives Platform
+    Maintenance" whose components are REST API / Websocket API / FIX API).
+    """
+    name = str(row.get("name") or "")
+    if re.search(r"delist", name, re.IGNORECASE):
+        return False
+    for component in _component_names(row):
+        if _ASSET_OR_FUNDING_COMPONENT.search(component):
+            continue
+        if _TRADING_MARK.search(component):
+            return True
+    if _NON_TRADING_NOTICE.search(name):
+        return False
+    return _TRADING_MARK.search(name) is not None
+
+
 def windows_from_status_payload(
     payload: Any,
     *,
     pad_before: dt.timedelta = STATUS_PAD_BEFORE,
     pad_after: dt.timedelta = STATUS_PAD_AFTER,
+    max_window: dt.timedelta = STATUS_MAX_WINDOW,
 ) -> list[BlackoutWindow]:
     """Kraken / statuspage.io scheduled-maintenance documents.
 
-    Each maintenance is widened by the padding. An item without both
-    timestamps is skipped rather than given an invented end.
+    Each trading maintenance is widened by the padding. The length cap is
+    applied to the published ``scheduled_for`` / ``scheduled_until`` span,
+    before padding. An item without both timestamps is skipped rather than
+    given an invented end.
+
+    ``in_progress`` items whose ``scheduled_until`` has passed stay ended
+    at ``scheduled_until`` plus ``pad_after``. Kraken leaves API maintenance
+    marked in progress after the window; stretching those to "now" would
+    block entries until somebody edits the status page.
     """
     if not isinstance(payload, dict):
         return []
@@ -431,17 +537,49 @@ def windows_from_status_payload(
             continue
         try:
             start = _parse_instant(row.get("scheduled_for"), "scheduled_for")
+            # in_progress does not extend past scheduled_until. The pad below
+            # is the only grace after the published end.
             end = _parse_instant(row.get("scheduled_until"), "scheduled_until")
         except ValueError:
             continue
+        if end <= start or (end - start) > max_window:
+            continue
+        if not _maintenance_affects_trading(row):
+            continue
         name = str(row.get("name") or row.get("id") or "")
-        out.append(BlackoutWindow(
-            start=start - pad_before,
-            end=end + pad_after,
-            source="kraken_status",
-            name=name,
-        ))
+        try:
+            out.append(BlackoutWindow(
+                start=start - pad_before,
+                end=end + pad_after,
+                source="kraken_status",
+                name=name,
+            ))
+        except ValueError:
+            continue
     return out
+
+
+def cached_status_window_applies(
+    window: BlackoutWindow,
+    *,
+    max_window: dt.timedelta = STATUS_MAX_WINDOW,
+) -> bool:
+    """Whether a status window already stored by the engine still counts.
+
+    The cache has no component list. Drop what the parser would no longer
+    write: a span longer than the cap plus padding, a delisting, or a
+    funding / deposit / asset notice whose title is not a trading maintenance.
+    A short window the engine stored because of its components (the title
+    need not repeat "API") is kept.
+    """
+    limit = max_window + STATUS_PAD_BEFORE + STATUS_PAD_AFTER
+    if window.end - window.start > limit:
+        return False
+    if re.search(r"delist", window.name, re.IGNORECASE):
+        return False
+    if _NON_TRADING_NOTICE.search(window.name) and not _TRADING_MARK.search(window.name):
+        return False
+    return True
 
 
 def fetch_status_windows(
@@ -449,12 +587,19 @@ def fetch_status_windows(
     *,
     urls: Sequence[str] = STATUS_URLS,
     timeout_s: float = 3.0,
+    max_window: Optional[dt.timedelta] = None,
+    env: Optional[Mapping[str, str]] = None,
 ) -> tuple[list[BlackoutWindow], Optional[str]]:
     """Best-effort status page read. Any failure returns no windows.
 
     ``opener`` is the test seam: it receives a URL and returns parsed JSON.
     The default opener is HTTP GET. A failure here must not become a blackout.
+    ``max_window`` wins when given; otherwise ``env`` supplies
+    ``KRAKEN_STATUS_MAX_WINDOW_H``. Neither falls through to ``os.environ``,
+    so a test that does not pass them stays on the 12 hour default.
     """
+    if max_window is None:
+        max_window = status_max_window(env) if env is not None else STATUS_MAX_WINDOW
     fetch = opener or _http_json
     windows: list[BlackoutWindow] = []
     errors: list[str] = []
@@ -464,7 +609,7 @@ def fetch_status_windows(
         except Exception as exc:
             errors.append(f"{url}: {exc}")
             continue
-        windows.extend(windows_from_status_payload(payload))
+        windows.extend(windows_from_status_payload(payload, max_window=max_window))
     # Duplicate incidents listed on both feeds collapse to one window.
     unique: list[BlackoutWindow] = []
     seen: set[tuple[str, str, str]] = set()
@@ -510,6 +655,25 @@ def next_window(now: dt.datetime,
 
 def blackout_active(now: dt.datetime, windows: Sequence[BlackoutWindow]) -> bool:
     return bool(active_windows(now, windows))
+
+
+def blackout_causes(now: dt.datetime,
+                    windows: Sequence[BlackoutWindow]) -> list[dict[str, str]]:
+    """Why entries are blocked right now, one object per active window.
+
+    ``source`` is ``configured`` for ``BLACKOUT_WINDOWS`` and ``status_page``
+    for a Kraken status incident. ``name`` is the incident or window name.
+    Empty when nothing contains ``now`` — a future ``next_window`` is not a
+    cause.
+    """
+    moment = _aware(now, "now")
+    causes: list[dict[str, str]] = []
+    active = sorted(active_windows(moment, windows),
+                    key=lambda w: (w.start, w.name, w.source))
+    for window in active:
+        kind = "status_page" if window.source == "kraken_status" else "configured"
+        causes.append({"source": kind, "name": window.name})
+    return causes
 
 
 def heartbeat_age_s(now: dt.datetime, beat: Optional[dt.datetime]) -> Optional[float]:

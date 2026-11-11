@@ -1,0 +1,81 @@
+{
+  "active": {
+    "scheduled_maintenances": [
+      {
+        "id": "tj6bdxtj0dcl",
+        "name": "WebSocket, FIX + REST API Maintenance",
+        "status": "in_progress",
+        "scheduled_for": "2026-11-11T07:00:00.000Z",
+        "scheduled_until": "2026-11-11T14:00:00.000Z",
+        "components": [
+          {"name": "FIX"},
+          {"name": "REST"},
+          {"name": "WebSocket"}
+        ]
+      }
+    ]
+  },
+  "upcoming": {
+    "scheduled_maintenances": [
+      {
+        "id": "y0cswpkpwm33",
+        "name": "Notice of scheduled asset delistings - August 2026",
+        "status": "scheduled",
+        "scheduled_for": "2026-09-24T14:25:00.000Z",
+        "scheduled_until": "2026-12-10T15:05:00.000Z",
+        "components": []
+      },
+      {
+        "id": "b3rpc2txzmpj",
+        "name": "Dual-Currency Investments Maintenance",
+        "status": "scheduled",
+        "scheduled_for": "2026-11-11T15:00:00.000Z",
+        "scheduled_until": "2026-11-11T15:15:00.000Z",
+        "components": [
+          {"name": "Dual Investments"}
+        ]
+      },
+      {
+        "id": "cz4803vngdfx",
+        "name": "Derivatives Platform Maintenance",
+        "status": "scheduled",
+        "scheduled_for": "2026-11-12T08:00:00.000Z",
+        "scheduled_until": "2026-11-12T08:15:00.000Z",
+        "components": [
+          {"name": "User Interface"},
+          {"name": "REST API"},
+          {"name": "Websocket API"},
+          {"name": "FIX API"}
+        ]
+      },
+      {
+        "id": "pfhs2kx3d122",
+        "name": "Kraken Website and API Maintenance",
+        "status": "scheduled",
+        "scheduled_for": "2026-11-12T08:01:00.000Z",
+        "scheduled_until": "2026-11-12T08:16:00.000Z",
+        "components": [
+          {"name": "Website"},
+          {"name": "FIX"},
+          {"name": "REST"},
+          {"name": "WebSocket"},
+          {"name": "Unified WebSocket"},
+          {"name": "Embed"}
+        ]
+      },
+      {
+        "id": "tbjxl9k3rffc",
+        "name": "Scheduled Banking Partner Maintenance",
+        "status": "scheduled",
+        "scheduled_for": "2026-11-21T10:00:00.000Z",
+        "scheduled_until": "2026-11-21T18:00:00.000Z",
+        "components": [
+          {"name": "Euro (EUR) - Instant"},
+          {"name": "Euro (EUR) - SEPA"},
+          {"name": "Pound Sterling (GBP) - Domestic"},
+          {"name": "Pound Sterling (GBP) - Instant"}
+        ]
+      }
+    ]
+  }
+}

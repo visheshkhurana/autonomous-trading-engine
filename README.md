@@ -225,8 +225,18 @@ Windows that did parse always apply.
 
 Kraken scheduled maintenance is read from the status page
 (`KRAKEN_STATUS_BLACKOUT`, default on outside tests) and padded 15 minutes
-before and 30 minutes after. A failed fetch adds no window and does not
-drop configured ones.
+before and 30 minutes after. Only a maintenance that affects trading is
+counted. The incident name or a component name (`components` on the
+scheduled-maintenance document — the short labels from
+`status.kraken.com/api/v2/components.json`, such as `REST`, `WebSocket`,
+`FIX`, `REST API`, `Order Placement`) must match API, REST, WebSocket,
+FIX, order entry, trading, "Website and API", or platform-wide. Delistings,
+funding, deposits and withdrawals, and a specific asset or network are
+ignored. A published window longer than `KRAKEN_STATUS_MAX_WINDOW_H` hours
+(default 12) is ignored; real API maintenance is short. An `in_progress`
+incident that Kraken never marks complete still ends at `scheduled_until`
+plus the 30 minute pad, so a stale status page cannot block forever. A
+failed fetch adds no window and does not drop configured ones.
 
 `KEY_FREEZE=1` or a file at `KEY_FREEZE_PATH` (default `/data/KEY_FREEZE`)
 blocks every private Kraken call that places or modifies an order, including
@@ -234,8 +244,12 @@ cancels. Stops already resting at the venue stay there. The API reports
 `key_freeze: true`.
 
 `/api/state` carries `entries_allowed`, `entries_block_reason`,
-`heartbeat_age_s`, `blackout_active`, `next_window`, `key_freeze`, and
-`native_stop` on each open position.
+`heartbeat_age_s`, `blackout_active`, `blackout_causes`, `next_window`,
+`key_freeze`, and `native_stop` on each open position. `blackout_causes`
+lists each window that contains now: `source` is `configured` or
+`status_page`, and `name` is the configured label or the status-page
+incident name. `next_window` is that active window, or the soonest future
+one when entries are open.
 
 ## The two arming switches
 

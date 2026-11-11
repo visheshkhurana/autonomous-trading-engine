@@ -68,9 +68,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.profiles import AssetClassProfile, profile_for
 from core.safety import (
-    ENTRY_HEARTBEAT_MAX_AGE_S, DEAD_HEARTBEAT_S, BlackoutWindow,
-    entry_block_reason, entry_block_reasons, env_float, heartbeat_age_s,
-    key_freeze_active, load_configured_windows, next_window, windows_from_payload,
+    ENTRY_HEARTBEAT_MAX_AGE_S, DEAD_HEARTBEAT_S, STATUS_MAX_WINDOW, BlackoutWindow,
+    blackout_causes, cached_status_window_applies, entry_block_reason,
+    entry_block_reasons, env_float, heartbeat_age_s, key_freeze_active,
+    load_configured_windows, next_window, status_max_window, windows_from_payload,
 )
 from core.protocols import BrokerAdapter, RiskCircuitProto
 from core.types import (
@@ -1472,6 +1473,7 @@ def _register_routes(app: FastAPI, handle: EngineHandle,
             "entry_blocks": safety["entry_blocks"],
             "heartbeat_age_s": safety["heartbeat_age_s"],
             "blackout_active": safety["blackout_active"],
+            "blackout_causes": safety["blackout_causes"],
             "next_window": safety["next_window"],
             "blackout_config_error": safety["blackout_config_error"],
             "key_freeze": safety["key_freeze"],
@@ -1781,7 +1783,9 @@ def _register_routes(app: FastAPI, handle: EngineHandle,
 # route helpers
 # --------------------------------------------------------------------------
 
-def _cached_status_windows(row: Optional[Mapping[str, str]]) -> list[BlackoutWindow]:
+def _cached_status_windows(row: Optional[Mapping[str, str]],
+                           *,
+                           max_window: dt.timedelta) -> list[BlackoutWindow]:
     if row is None:
         return []
     raw = row.get("blackout_status_json")
@@ -1789,9 +1793,11 @@ def _cached_status_windows(row: Optional[Mapping[str, str]]) -> list[BlackoutWin
         return []
     try:
         payload = json.loads(raw)
-        return windows_from_payload(payload, source="kraken_status")
+        windows = windows_from_payload(payload, source="kraken_status")
     except (ValueError, json.JSONDecodeError):
         return []
+    return [w for w in windows
+            if cached_status_window_applies(w, max_window=max_window)]
 
 
 def _safety_public(handle: EngineHandle, settings: ApiSettings,
@@ -1814,7 +1820,15 @@ def _safety_public(handle: EngineHandle, settings: ApiSettings,
             engine_row = None
     age = _heartbeat_age(handle, settings, engine_row)
     configured, config_error = load_configured_windows(source)
-    windows = list(configured) + _cached_status_windows(engine_row)
+    try:
+        max_window = status_max_window(source)
+        max_error = None
+    except ValueError as exc:
+        # A bad cap must not 500 the dashboard or turn into a blackout.
+        max_window = STATUS_MAX_WINDOW
+        max_error = str(exc)
+    windows = list(configured) + _cached_status_windows(
+        engine_row, max_window=max_window)
     frozen = key_freeze_active(source)
     halted = bool(engine_row and engine_row.get("entry_halt_reason"))
     reason = entry_block_reason(
@@ -1838,10 +1852,16 @@ def _safety_public(handle: EngineHandle, settings: ApiSettings,
         ),
         "heartbeat_age_s": None if age is None else round(age, 3),
         "blackout_active": any(w.contains(now) for w in windows),
+        "blackout_causes": blackout_causes(now, windows),
         "next_window": None if upcoming is None else upcoming.to_json(),
-        "blackout_config_error": config_error or row_error,
+        "blackout_config_error": _join_errors(config_error, row_error, max_error),
         "key_freeze": frozen,
     }
+
+
+def _join_errors(*parts: Optional[str]) -> Optional[str]:
+    text = "; ".join(part for part in parts if part)
+    return text or None
 
 
 def _heartbeat_age(handle: EngineHandle, settings: ApiSettings,
