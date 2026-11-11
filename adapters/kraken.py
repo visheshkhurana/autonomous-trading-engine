@@ -46,10 +46,11 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from uuid import uuid4
 
+from core.risk import equity_for_drawdown
 from core.safety import (
     STOP_FEE_CLIP_LIMIT, ManualReservedError, StopCancelResult, StopPlaceResult,
-    base_asset, key_freeze_active, non_reserved_free, parse_manual_reserved,
-    stop_qty_for_ledger,
+    base_asset, env_bool, key_freeze_active, non_reserved_free,
+    parse_manual_reserved, stop_budget_remaining, stop_qty_for_ledger,
 )
 from core.types import (
     AssetClass, Fill, Instrument, Intent, Mode, OrderRef, OrderStatus,
@@ -330,6 +331,7 @@ class KrakenAdapter:
         sleep: Callable[[float], None] = time.sleep,
         key_freeze: Optional[Callable[[], bool]] = None,
         manual_reserved: Optional[str] = None,
+        risk_exclude_reserved: Optional[bool] = None,
     ) -> None:
         # This class reaches a real venue. A PAPER stamp on a real fill is how a
         # live book gets recorded as paper and then traded against twice, so
@@ -368,6 +370,15 @@ class KrakenAdapter:
         # every order, so the reserve can be set without rebuilding the
         # adapter. A string is an explicit override (tests).
         self._manual_reserved_raw = manual_reserved
+        # None reads RISK_EXCLUDE_RESERVED_BASE on each equity read. Default
+        # in that helper is false, so an unset flag does not change equity.
+        self._risk_exclude_reserved = risk_exclude_reserved
+        # Last successful free-balance map, plus fills applied since that read.
+        # The entry-stop path uses this instead of another venue round trip.
+        self._free_cache: dict[str, Decimal] = {}
+        self._free_adjust: dict[str, Decimal] = {}
+        self._free_negative: set[str] = set()
+        self._free_cache_mono: Optional[float] = None
         self._markets: Optional[dict[str, Any]] = None
         # Kraken needs the symbol to cancel, and the protocol's cancel() only gets
         # an id, so the mapping is kept here for orders this adapter placed.
@@ -513,31 +524,153 @@ class KrakenAdapter:
     def _base_of(symbol: str) -> str:
         return symbol.split("/", 1)[0].upper()
 
-    def _free_base(self, symbol: str) -> Optional[Decimal]:
+    def _refresh_free_cache(self) -> bool:
+        """Fetch free balances once. True when the map was readable.
+
+        A readable map that omits an asset means zero of that asset, which
+        is stored by absence. An exception or a payload with no ``free`` map
+        leaves the previous cache alone.
+        """
+        raw = self._ex.fetch_balance()
+        if not isinstance(raw, dict):
+            return False
+        free_map = raw.get("free")
+        if not isinstance(free_map, dict):
+            return False
+        parsed: dict[str, Decimal] = {}
+        negative: set[str] = set()
+        for key, value in free_map.items():
+            amount = _dec_opt(value)
+            if amount is None:
+                continue
+            code = str(key).upper()
+            if amount < 0:
+                negative.add(code)
+                continue
+            parsed[code] = amount
+        self._free_cache = parsed
+        self._free_negative = negative
+        self._free_adjust = {}
+        self._free_cache_mono = self._monotonic()
+        return True
+
+    def _cached_amount(self, code: str) -> Optional[Decimal]:
+        if self._free_cache_mono is None or code not in self._free_cache:
+            return None
+        return self._free_cache[code] + self._free_adjust.get(code, Decimal("0"))
+
+    def _free_base(
+        self, symbol: str, *, refresh: bool = True, allow_stale: bool = False,
+    ) -> Optional[Decimal]:
         """Spendable units of the base asset, or None if that cannot be read.
 
         `total` is the wrong number: locked / frozen coins sit in total and
         cannot be sold. Sizing a sell from total is how a fee-in-base leftover
         becomes Kraken insufficient-funds. A missing `free` map is unreadable, not zero: zero
         would look like a flat wallet and invite a write-off.
+
+        A live read is tried twice. ``allow_stale`` may then return the last
+        successful read, adjusted for fills since that read. A sell does not
+        pass that flag: an unreadable balance refuses the order.
         """
-        raw = self._ex.fetch_balance()
-        if not isinstance(raw, dict):
-            return None
-        free_map = raw.get("free")
-        if not isinstance(free_map, dict):
-            return None
         code = self._base_of(symbol)
-        amount: Optional[Decimal] = None
-        for key, value in free_map.items():
-            if str(key).upper() == code:
-                amount = _dec_opt(value)
-                break
-        if amount is None:
+        if not refresh:
+            return self._cached_amount(code)
+        last_exc: Optional[BaseException] = None
+        for _attempt in range(2):
+            try:
+                readable = self._refresh_free_cache()
+            except Exception as exc:
+                last_exc = exc
+                continue
+            if not readable:
+                continue
+            if code in self._free_negative:
+                return None
+            cached = self._cached_amount(code)
+            if cached is not None:
+                return cached
+            # Readable map, asset not listed: the wallet holds none of it.
             return Decimal("0")
-        if amount < 0:
-            return None
-        return amount
+        if allow_stale:
+            stale = self._cached_amount(code)
+            if stale is not None:
+                return stale
+        if last_exc is not None:
+            raise last_exc
+        return None
+
+    def _apply_fill_to_cache(
+        self, order: Mapping[str, Any], base: str, side: Side, filled: Decimal,
+    ) -> None:
+        """Move the cached free balance by a fill so the stop need not re-read it.
+
+        A buy credits base; a base-denominated fee debits it. Without this the
+        cache is the pre-fill wallet and a stop sized from it would ignore the
+        coins just bought.
+        """
+        if self._free_cache_mono is None or filled <= 0:
+            return
+        code = base.upper()
+        if code not in self._free_cache:
+            self._free_cache[code] = Decimal("0")
+        delta = filled if side is Side.BUY else -filled
+        for entry in self._fee_entries(order):
+            cost = _dec_opt(entry.get("cost"))
+            if cost is None:
+                continue
+            if str(entry.get("currency") or "").upper() == code:
+                delta -= abs(cost)
+        self._free_adjust[code] = self._free_adjust.get(code, Decimal("0")) + delta
+
+    def _exclude_reserved_equity(
+        self, total: Decimal, excluded: list[tuple[str, Decimal]],
+    ) -> tuple[Optional[Decimal], list[tuple[str, Decimal]], Optional[str]]:
+        """Drop MANUAL_RESERVED_BASE from equity when the opt-in flag is set.
+
+        The default is off, so an unset flag returns ``total`` unchanged.
+        The high-water mark and the drawdown thresholds live in the risk
+        circuit and are not touched here; only the equity number is.
+        """
+        flag = self._risk_exclude_reserved
+        if flag is None:
+            try:
+                flag = env_bool(os.environ, "RISK_EXCLUDE_RESERVED_BASE", False)
+            except ValueError as exc:
+                return None, excluded, f"RISK_EXCLUDE_RESERVED_BASE is unreadable ({exc})"
+        if not flag:
+            return total, excluded, None
+        try:
+            if self._manual_reserved_raw is None:
+                raw = os.environ.get("MANUAL_RESERVED_BASE", "")
+            else:
+                raw = self._manual_reserved_raw
+            table = parse_manual_reserved(raw)
+        except ManualReservedError as exc:
+            return None, excluded, f"cannot exclude reserved base: {exc}"
+        reserved_value = Decimal("0")
+        for asset, qty in table.items():
+            if qty <= 0:
+                continue
+            try:
+                rate, _source = self._rate_to_base(asset)
+            except Exception as exc:
+                return None, excluded, (
+                    f"reserved {asset} could not be priced ({exc}); "
+                    "equity is unknown rather than overstated"
+                )
+            if rate is None:
+                return None, excluded, (
+                    f"reserved {asset} is unpriceable; equity is unknown "
+                    "rather than overstated"
+                )
+            reserved_value += qty * rate
+            excluded.append((f"{asset}:reserved", qty))
+        return (
+            equity_for_drawdown(total, reserved_value, exclude_reserved=True),
+            excluded,
+            None,
+        )
 
     def _reserved_base(self, symbol: str) -> Decimal:
         """Manual balance that must not fund an engine order in this base."""
@@ -722,6 +855,21 @@ class KrakenAdapter:
                 self.base_currency, None,
                 reason=f"fetch_balance failed: {exc!r}",
             )
+        if isinstance(raw, dict) and isinstance(raw.get("free"), dict):
+            # Same payload the stop path will reuse. A second fetch_balance
+            # here is the 8–10s read that used to sit between a fill and the stop.
+            try:
+                parsed: dict[str, Decimal] = {}
+                for key, value in raw["free"].items():
+                    amount = _dec_opt(value)
+                    if amount is None or amount < 0:
+                        continue
+                    parsed[str(key).upper()] = amount
+                self._free_cache = parsed
+                self._free_adjust = {}
+                self._free_cache_mono = self._monotonic()
+            except Exception:
+                pass
 
         totals = raw.get("total") if isinstance(raw, dict) else None
         if not isinstance(totals, dict):
@@ -770,8 +918,14 @@ class KrakenAdapter:
             )
 
         total = sum((c.value for c in components), Decimal("0"))
+        net, excluded, exclude_reason = self._exclude_reserved_equity(total, excluded)
+        if exclude_reason:
+            return EquityBreakdown(
+                self.base_currency, None, tuple(components), (), tuple(excluded),
+                reason=exclude_reason,
+            )
         return EquityBreakdown(
-            self.base_currency, total, tuple(components), (), tuple(excluded),
+            self.base_currency, net, tuple(components), (), tuple(excluded),
         )
 
     def equity(self) -> Optional[Decimal]:
@@ -1168,6 +1322,8 @@ class KrakenAdapter:
                 at=self._timestamp(order) or self._now(), mode=self.mode,
             ))
 
+        if filled > 0 and base:
+            self._apply_fill_to_cache(order, base, intent.side, filled)
         return OrderRef(
             order_id=order_id, status=status, intent=intent, mode=self.mode,
             filled_qty=filled, avg_price=avg, fills=tuple(fills),
@@ -1241,22 +1397,92 @@ class KrakenAdapter:
 
         The stop's size is never this number. A larger free balance (the
         manual BTC that shares the account) must not become the order qty.
+        An unreadable balance is None, not the ledger qty.
         """
         symbol = self.resolve_symbol(instrument)
         if symbol is None:
             return None
-        return self._free_base(symbol)
+        try:
+            return self._free_base(symbol, refresh=True, allow_stale=True)
+        except Exception:
+            return self._free_base(symbol, refresh=False)
+
+    def cached_free_base(self, instrument: Instrument) -> Optional[Decimal]:
+        """Last free balance plus fills since that read. No venue call."""
+        symbol = self.resolve_symbol(instrument)
+        if symbol is None:
+            return None
+        return self._free_base(symbol, refresh=False)
+
+    def last_known_free_base(self, instrument: Instrument) -> Optional[Decimal]:
+        return self.cached_free_base(instrument)
+
+    def free_by_asset(self) -> Optional[dict[str, Decimal]]:
+        """Free balance by asset for the ledger reconcile.
+
+        Uses a cache younger than five seconds (the equity read on this tick).
+        Otherwise one live read, retried once. None means the wallet could
+        not be read and there is no last-known map.
+        """
+        fresh = (
+            self._free_cache_mono is not None
+            and (self._monotonic() - self._free_cache_mono) <= 5
+        )
+        if not fresh:
+            try:
+                ok = self._refresh_free_cache()
+            except Exception:
+                ok = False
+            if not ok:
+                try:
+                    ok = self._refresh_free_cache()
+                except Exception:
+                    ok = False
+            if not ok and self._free_cache_mono is None:
+                return None
+        return {
+            asset: amount + self._free_adjust.get(asset, Decimal("0"))
+            for asset, amount in self._free_cache.items()
+        }
+
+    def _stop_spendable(self, symbol: str, *, use_cache: bool) -> Optional[Decimal]:
+        """Non-reserved free for a stop.
+
+        ``use_cache`` is the entry path: the equity read, adjusted by the
+        fill, is reused so a venue round trip does not sit in front of the
+        stop. Otherwise one live read, retried once, then the last known
+        balance. None means there is nothing safe to size from. The reserve
+        is always applied; a missing read is not the full ledger qty.
+        """
+        free: Optional[Decimal] = None
+        if use_cache:
+            free = self._free_base(symbol, refresh=False)
+        if free is None:
+            try:
+                free = self._free_base(symbol, refresh=True, allow_stale=True)
+            except Exception:
+                free = self._free_base(symbol, refresh=False)
+        if free is None:
+            return None
+        return non_reserved_free(free, self._reserved_base(symbol))
 
     def place_native_stop(
         self, instrument: Instrument, qty: Decimal, stop_price: Decimal,
         timeout_s: float = 10.0,
+        fill_at: Optional[dt.datetime] = None,
+        use_cached_balance: bool = False,
     ) -> StopPlaceResult:
         """Rest a sell stop-loss for ``qty`` at ``stop_price``.
 
         ``qty`` is the engine ledger size. This method does not read the
-        wallet to choose it. It then polls open orders until the txid is
-        visible or ``timeout_s`` elapses. Unconfirmed is not success: an
-        order id may still be returned so the caller can try to cancel it.
+        wallet to choose it. Confirmation is measured from ``fill_at`` when
+        that is set, otherwise from submission. Unconfirmed is not success:
+        an order id may still be returned so the caller can try to cancel it.
+
+        Free balance is the cached read (equity, or the last fetch) adjusted
+        for the fill. A live read happens only when that cache is empty, and
+        it is retried once. An unreadable balance does not send the ledger
+        qty unchecked.
         """
         if qty <= 0 or stop_price <= 0:
             return StopPlaceResult(False, None, qty, stop_price,
@@ -1283,40 +1509,61 @@ class KrakenAdapter:
                 False, None, amount, price,
                 f"stop quantized to amount {amount} price {price}",
             )
+        # The confirm clock starts at the fill. Time already spent, including
+        # a balance read below, counts against timeout_s.
+        remaining = stop_budget_remaining(self._now(), fill_at, timeout_s)
+        deadline = self._monotonic() + max(0.0, remaining)
+        if fill_at is not None and remaining <= 0:
+            return StopPlaceResult(
+                False, None, amount, price,
+                f"stop budget exhausted: fill is already {timeout_s}s old",
+            )
         # Free balance includes the manual reserve. A stop may use only what
         # is left after that reserve. A fee-sized gap is clipped; a wider
-        # gap is not sent (the engine flattens). Unknown free keeps the
-        # requested ledger qty — the wallet is still not the size.
+        # gap is not sent (the engine flattens). Unknown free is a refusal,
+        # not a licence to send the full ledger qty.
         try:
-            spendable = self._spendable_base(symbol)
+            spendable = self._stop_spendable(symbol, use_cache=use_cached_balance)
         except ManualReservedError as exc:
             return StopPlaceResult(
                 False, None, qty, stop_price,
                 f"MANUAL_RESERVED_BASE unreadable: {exc}",
             )
-        except Exception:
-            spendable = None
-        if spendable is not None:
-            sized, decision = stop_qty_for_ledger(qty, spendable)
-            if decision == "halt":
+        if spendable is None:
+            return StopPlaceResult(
+                False, None, qty, stop_price,
+                "free balance unreadable; refusing to send a stop without "
+                "the reserve check",
+            )
+        sized, decision = stop_qty_for_ledger(qty, spendable)
+        if sized > spendable:
+            sized = spendable
+        if decision == "halt" or sized <= 0:
+            return StopPlaceResult(
+                False, None, qty, stop_price,
+                f"non-reserved free {spendable} is more than "
+                f"{STOP_FEE_CLIP_LIMIT * 100}% under ledger qty {qty}",
+            )
+        if decision == "clip" or sized < amount:
+            try:
+                amount = self._quantize_amount(symbol, sized)
+            except Exception as exc:
                 return StopPlaceResult(
-                    False, None, qty, stop_price,
-                    f"non-reserved free {spendable} is more than "
-                    f"{STOP_FEE_CLIP_LIMIT * 100}% under ledger qty {qty}",
+                    False, None, sized, price,
+                    f"could not quantize clipped stop: {exc!r}",
                 )
-            if decision == "clip":
-                try:
-                    amount = self._quantize_amount(symbol, sized)
-                except Exception as exc:
-                    return StopPlaceResult(
-                        False, None, sized, price,
-                        f"could not quantize clipped stop: {exc!r}",
-                    )
-                if amount <= 0:
-                    return StopPlaceResult(
-                        False, None, amount, price,
-                        "clipped stop quantized to 0",
-                    )
+            if amount <= 0 or amount > spendable:
+                return StopPlaceResult(
+                    False, None, amount, price,
+                    "clipped stop quantized to 0" if amount <= 0
+                    else f"clipped stop {amount} exceeds non-reserved free {spendable}",
+                )
+        if self._monotonic() >= deadline:
+            return StopPlaceResult(
+                False, None, amount, price,
+                "stop budget exhausted before the order was sent",
+            )
+        placed_at = self._now()
         try:
             created = self._ex.create_order(
                 symbol, "stop-loss", "sell",
@@ -1327,28 +1574,49 @@ class KrakenAdapter:
                 False, None, amount, price,
                 f"stop-loss create_order raised {exc!r}; the stop may or may "
                 "not exist. Not confirmed.",
+                placed_at=placed_at,
             )
         txid = str(created.get("id") or "") if isinstance(created, dict) else ""
         if not txid:
             return StopPlaceResult(
                 False, None, amount, price,
                 f"stop-loss create_order returned no id ({created!r})",
+                placed_at=placed_at,
             )
         self._order_symbols[txid] = symbol
-        if self._confirm_stop(symbol, txid, timeout_s):
-            return StopPlaceResult(True, txid, amount, price, "open")
+        if self._confirm_stop(symbol, txid, deadline):
+            confirmed_at = self._now()
+            if (fill_at is not None and stop_budget_remaining(
+                    confirmed_at, fill_at, timeout_s) < 0):
+                return StopPlaceResult(
+                    False, txid, amount, price,
+                    f"stop {txid} confirmed after the fill budget",
+                    placed_at=placed_at, confirmed_at=confirmed_at,
+                )
+            return StopPlaceResult(
+                True, txid, amount, price, "open",
+                placed_at=placed_at, confirmed_at=confirmed_at,
+            )
         return StopPlaceResult(
             False, txid, amount, price,
+            f"stop {txid} was not visible on open orders within {timeout_s}s of the fill"
+            if fill_at is not None else
             f"stop {txid} was not visible on open orders within {timeout_s}s",
+            placed_at=placed_at,
         )
 
-    def _confirm_stop(self, symbol: str, txid: str, timeout_s: float) -> bool:
-        deadline = self._monotonic() + timeout_s
+    def _confirm_stop(self, symbol: str, txid: str, deadline_mono: float) -> bool:
+        """Poll until ``deadline_mono`` on the adapter clock.
+
+        The deadline is absolute. Callers that have a fill timestamp set it
+        to fill_at + budget, so a slow read before this loop consumes the
+        window instead of starting a fresh one.
+        """
         while True:
             visible = self._stop_visible(symbol, txid)
             if visible is True:
                 return True
-            if self._monotonic() >= deadline:
+            if self._monotonic() >= deadline_mono:
                 return False
             self._sleep(self._poll_interval_s)
 

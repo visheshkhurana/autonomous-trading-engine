@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import logging
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
@@ -67,8 +68,9 @@ class StopBook:
     def __init__(self, mode: Mode = Mode.PAPER, *, free: D = D("0.098"),
                  wallet: D = D("0.088")) -> None:
         self.mode = mode
-        self.free = free
+        self.free: Optional[D] = free
         self.wallet = wallet  # must never become an order qty
+        self.fill_at: Optional[dt.datetime] = None
         self.price = D("50000")
         self.fail_stop = False
         self.stops: dict[str, tuple[D, D]] = {}
@@ -94,7 +96,7 @@ class StopBook:
     def cancel(self, order_id: str) -> bool:
         return False
 
-    def free_base(self, instrument: Instrument) -> D:
+    def free_base(self, instrument: Instrument) -> Optional[D]:
         return self.free
 
     def place(self, intent: Intent, timeout_s: float = 30.0) -> OrderRef:
@@ -102,7 +104,7 @@ class StopBook:
         fill = Fill(
             order_id=f"ORD-{len(self.log)}", instrument=intent.instrument,
             side=intent.side, qty=intent.qty, price=self.price, fees=D("0"),
-            at=WHEN, mode=self.mode,
+            at=self.fill_at or WHEN, mode=self.mode,
         )
         return OrderRef(
             order_id=fill.order_id, status=OrderStatus.FILLED, intent=intent,
@@ -110,7 +112,8 @@ class StopBook:
             fills=(fill,),
         )
 
-    def place_native_stop(self, instrument, qty, stop_price, timeout_s=10.0):
+    def place_native_stop(self, instrument, qty, stop_price, timeout_s=10.0,
+                          fill_at=None, use_cached_balance=False):
         from core.safety import StopPlaceResult
         self.timeouts.append(timeout_s)
         self.log.append(("stop", qty, stop_price, instrument.symbol))
@@ -659,6 +662,7 @@ def test_kraken_stop_that_never_appears_on_open_orders_is_not_ok():
     ex = FakeExchange(
         {"BTC/USDT": spot("BTC/USDT")},
         tickers={"BTC/USDT": {"last": 100}},
+        balance={"free": {"BTC": "1"}, "total": {"BTC": "1"}},
     )
     ex.open_orders = []
     ex.fetch_open_orders = lambda symbol=None: []
@@ -1256,3 +1260,263 @@ class _Ledger:
 
     def realized_pnl(self, mode, asset_class, since_iso):
         return D("0")
+
+
+# ---------------------------------------------------------------- fill-to-rest
+
+
+def test_fill_to_rest_timestamps_and_log_line(tmp_path, caplog):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()])
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        with caplog.at_level(logging.INFO, logger="trader.engine"):
+            _tick(engine)
+        position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        assert position.stop_fill_at == WHEN
+        assert position.stop_placed_at == WHEN
+        assert position.stop_confirmed_at == WHEN
+        assert position.origin == "engine_fill"
+        rested = [e for e in engine.events.recent() if "native_stop rested" in e.message]
+        assert rested, "a confirmed stop must emit the rested line"
+        assert "txid=" in rested[0].message
+        assert "fill_to_rest_ms=" in rested[0].message
+        assert "native_stop rested BTC/USDT" in caplog.text
+        native = {
+            "fill_at": position.stop_fill_at.astimezone(UTC).isoformat(),
+            "placed_at": position.stop_placed_at.astimezone(UTC).isoformat(),
+            "confirmed_at": position.stop_confirmed_at.astimezone(UTC).isoformat(),
+        }
+        assert native["fill_at"].startswith("2026-08-27T12:00:00")
+        assert "fill_to_rest_ms=0" in rested[0].message
+    finally:
+        store.close()
+
+
+def test_stop_deadline_is_measured_from_the_fill_not_submission(tmp_path):
+    book = StopBook()
+    book.fill_at = WHEN - dt.timedelta(seconds=12)
+    strategy = NamingStrategy([_buy()])
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        assert book.timeouts == [], "a fill already outside the 10s budget must not start a fresh window"
+        assert book.stops == {}
+        sells = [row for row in book.log if row[0] == "place" and row[1] == "sell"]
+        assert sells and sells[0][2] == D("0.01")
+        assert store.positions(Mode.PAPER, AssetClass.CRYPTO) == []
+    finally:
+        store.close()
+
+
+def test_kraken_stop_confirm_budget_shrinks_by_the_fill_age():
+    ex = FakeExchange(
+        {"BTC/USDT": spot("BTC/USDT", amount_step="0.00000001", price_step="0.1",
+                          min_amount="0.00000001")},
+        tickers={"BTC/USDT": {"last": 100000}},
+        balance={"free": {"BTC": "1"}, "total": {"BTC": "1"}},
+    )
+    ex.open_orders = []
+    ex.fetch_open_orders = lambda symbol=None: []
+    ex.fetch_order = lambda order_id, symbol=None: {
+        "id": order_id, "status": "canceled", "amount": "0.001", "filled": "0",
+    }
+
+    def create_order(symbol, type_, side, amount, price=None, params=None):
+        ex.create_calls.append((symbol, type_, side, amount, price, params))
+        return {"id": "STOP-LATE"}
+
+    ex.create_order = create_order
+    clock = FakeClock()
+    adapter = KrakenAdapter(
+        ex, mode=Mode.LIVE, poll_interval_s=1.0,
+        monotonic=clock.monotonic, sleep=clock.sleep, now=lambda: WHEN,
+        key_freeze=lambda: False,
+    )
+    fill_at = WHEN - dt.timedelta(seconds=9)
+    result = adapter.place_native_stop(
+        BTC, D("0.001"), D("90000"), timeout_s=10, fill_at=fill_at)
+    assert result.ok is False
+    assert ex.create_calls, "budget remaining must still allow the order"
+    assert clock.t < 10
+    assert clock.t >= 1
+
+
+def test_unreadable_balance_never_sends_an_unchecked_stop():
+    ex = FakeExchange(
+        {"BTC/USDT": spot("BTC/USDT", amount_step="0.00000001", price_step="0.1",
+                          min_amount="0.00000001")},
+        tickers={"BTC/USDT": {"last": 100000}},
+        balance={"free": {"BTC": "1"}, "total": {"BTC": "1"}},
+    )
+    ex.balance_error = RuntimeError("balance down")
+    clock = FakeClock()
+    adapter = KrakenAdapter(
+        ex, mode=Mode.LIVE, poll_interval_s=1.0,
+        monotonic=clock.monotonic, sleep=clock.sleep, now=lambda: WHEN,
+        key_freeze=lambda: False,
+    )
+    result = adapter.place_native_stop(BTC, D("0.001"), D("90000"))
+    assert result.ok is False
+    assert ex.create_calls == []
+    assert "reserve" in result.reason or "unreadable" in result.reason
+
+
+def test_engine_flattens_when_free_balance_cannot_be_read(tmp_path):
+    book = StopBook()
+    book.free = None
+    strategy = NamingStrategy([_buy()])
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        assert not any(row[0] == "stop" for row in book.log)
+        sells = [row for row in book.log if row[0] == "place" and row[1] == "sell"]
+        assert sells and sells[0][2] == D("0.01")
+    finally:
+        store.close()
+
+
+def test_resting_stop_above_spendable_is_clipped_or_flattened(tmp_path):
+    book = StopBook(free=D("0.02"))
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        book.free = D("0.004")
+        strategy.intents = []
+        strategy.stop = D("48000")
+        _tick(engine)
+        stops = [row for row in book.log if row[0] == "stop"]
+        assert stops[-1][1] == D("0.004")
+        assert not any(row[0] == "place" and row[1] == "sell" for row in book.log)
+        position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        assert position.qty == D("0.004")
+        assert position.stop_qty == D("0.004")
+        check = json.loads(position.reserve_check)
+        assert check["action"] == "clipped"
+        book.fail_next = True
+        book.free = D("0.001")
+        _tick(engine)
+        sells = [row for row in book.log if row[0] == "place" and row[1] == "sell"]
+        assert sells and sells[-1][2] == D("0.001")
+    finally:
+        store.close()
+
+
+class _ReconBook(StopBook):
+    def free_by_asset(self):
+        return {"BTC": self.free if self.free is not None else D("0")}
+
+
+def test_ledger_qty_mismatch_blocks_entries(tmp_path):
+    book = _ReconBook(free=D("0.01"))
+    strategy = NamingStrategy([_buy()])
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        assert store.positions(Mode.PAPER, AssetClass.CRYPTO)
+        book.free = D("0.05")
+        strategy.intents = [_buy(key="k2")]
+        _tick(engine)
+        reasons = [e.data.get("reason") for e in _rejections(engine)]
+        assert "ledger_mismatch" in reasons
+        runner = engine._runners[AssetClass.CRYPTO]
+        assert runner._ledger_mismatch
+        assert any(row.get("reason") == "qty"
+                   for row in runner._ledger_mismatch["mismatches"])
+    finally:
+        store.close()
+
+
+def test_foreign_position_origin_blocks_entries(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()])
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        store._conn.execute(
+            "UPDATE positions SET origin=? WHERE symbol=?",
+            ("import", "BTC/USDT"),
+        )
+        strategy.intents = [_buy(key="k-eth", instrument=ETH, qty="0.02")]
+        _tick(engine)
+        reasons = [e.data.get("reason") for e in _rejections(engine)]
+        assert "ledger_mismatch" in reasons
+        eth_buys = [row for row in book.log
+                    if row[0] == "place" and row[1] == "buy" and row[3] == "ETH/USDT"]
+        assert eth_buys == []
+    finally:
+        store.close()
+
+
+def test_state_exposes_stop_times_reserve_check_and_ledger_mismatch(tmp_path):
+    position = Position(
+        instrument=BTC, qty=D("0.01"), avg_price=D("50000"),
+        mode=Mode.PAPER, strategy_id="s1",
+        stop_txid="STOP-1", stop_price=D("48000"), stop_qty=D("0.01"),
+        stop_status="open",
+        stop_fill_at=WHEN, stop_placed_at=WHEN, stop_confirmed_at=WHEN,
+        reserve_check=json.dumps({
+            "action": "clipped", "spendable": "0.004", "stop_qty": "0.01",
+        }),
+    )
+    control = MemoryControlStore()
+    control.rows["__engine__"] = {
+        "heartbeat_at": API_NOW.astimezone(UTC).isoformat(),
+        "paused": "0",
+        "entry_halt_reason": "ledger_mismatch",
+        "ledger_mismatch_json": json.dumps({
+            "mismatches": [{"asset": "BTC", "reason": "qty", "diff": "0.04"}],
+        }),
+    }
+    handle = build_handle(
+        ledger=_Ledger([position]), control=control, clock=lambda: API_NOW,
+    )
+    app = create_app(handle, ApiSettings(token=TOKEN), env={})
+    body = TestClient(app).get("/api/state", headers=AUTH).json()
+    assert body["entries_block_reason"] == "ledger_mismatch"
+    assert body["ledger_mismatch"]["mismatches"][0]["asset"] == "BTC"
+    native = body["classes"]["crypto"]["positions"][0]["native_stop"]
+    assert native["fill_at"].startswith("2026-08-27T12:00:00")
+    assert native["placed_at"].startswith("2026-08-27T12:00:00")
+    assert native["confirmed_at"].startswith("2026-08-27T12:00:00")
+    assert native["reserve_check"]["action"] == "clipped"
+
+
+def test_reserved_base_is_excluded_from_drawdown_only_when_opted_in(tmp_path):
+    from core.risk import DEFAULT_LIMITS, equity_for_drawdown
+    markets = {"BTC/USDT": spot("BTC/USDT"), "ETH/USDT": spot("ETH/USDT")}
+    tickers = {"BTC/USDT": {"last": 60000.0}, "ETH/USDT": {"last": 3000.0}}
+    ex = FakeExchange(
+        markets, tickers=tickers,
+        balance={"total": {"USDT": 1000.0, "BTC": 0.5},
+                 "free": {"USDT": 1000.0, "BTC": 0.5}},
+    )
+    plain = KrakenAdapter(
+        ex, mode=Mode.LIVE, now=lambda: WHEN, key_freeze=lambda: False,
+        manual_reserved="BTC:0.1", risk_exclude_reserved=False,
+    )
+    opted = KrakenAdapter(
+        ex, mode=Mode.LIVE, now=lambda: WHEN, key_freeze=lambda: False,
+        manual_reserved="BTC:0.1", risk_exclude_reserved=True,
+    )
+    # 0.5 BTC * 60000 + 1000 USDT. The 0.1 BTC reserve is 6000.
+    assert plain.equity() == D("31000")
+    assert opted.equity() == D("25000")
+    limits = DEFAULT_LIMITS[AssetClass.CRYPTO]
+    store = SQLitePositionStore(str(tmp_path / "risk.db"))
+    try:
+        circuit = RiskCircuit(store, Mode.PAPER, clock=lambda: WHEN)
+        seeded = circuit.advance(AssetClass.CRYPTO, D("31000"))
+        assert seeded.action.value == "ok"
+        net = equity_for_drawdown(D("31000"), D("6000"), exclude_reserved=True)
+        decision = circuit.advance(AssetClass.CRYPTO, net)
+        assert net == D("25000")
+        assert decision.drawdown_pct == (D("31000") - D("25000")) / D("31000")
+        # Ladder thresholds and the stored high-water are unchanged.
+        assert circuit._limits[AssetClass.CRYPTO] == limits
+        assert circuit.read(AssetClass.CRYPTO, D("31000")).drawdown_pct == D("0")
+        untouched = equity_for_drawdown(D("31000"), D("6000"), exclude_reserved=False)
+        assert untouched == D("31000")
+    finally:
+        store.close()

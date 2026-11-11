@@ -46,6 +46,29 @@ ZERO = Decimal("0")
 ONE = Decimal("1")
 
 
+def equity_for_drawdown(
+    equity: Decimal,
+    reserved_value: Decimal = ZERO,
+    *,
+    exclude_reserved: bool = False,
+) -> Decimal:
+    """Equity the drawdown ladder should see.
+
+    ``exclude_reserved`` drops the marked value of ``MANUAL_RESERVED_BASE``.
+    The high-water mark and the ladder thresholds are not modified here;
+    callers pass the returned number into ``advance`` / ``read`` as the
+    account value. The default leaves equity unchanged.
+    """
+    if not exclude_reserved:
+        return equity
+    if not reserved_value.is_finite() or reserved_value < ZERO:
+        raise ValueError(f"reserved_value must be finite and >= 0, got {reserved_value}")
+    net = equity - reserved_value
+    if net < ZERO:
+        return ZERO
+    return net
+
+
 class CircuitAction(str, Enum):
     """What the rest of the engine is allowed to do.
 

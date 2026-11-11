@@ -947,11 +947,23 @@ def _position_json(pos: Position) -> dict[str, Any]:
 def _native_stop_json(pos: Position) -> dict[str, Any]:
     """Exchange stop recorded against the ledger row, never a wallet qty."""
     status = pos.stop_status or ("open" if pos.stop_txid else "absent")
+    reserve: Any = None
+    if pos.reserve_check:
+        try:
+            reserve = json.loads(pos.reserve_check)
+        except json.JSONDecodeError:
+            reserve = {"raw": pos.reserve_check}
     return {
         "status": status,
         "txid": pos.stop_txid,
         "price": _dec(pos.stop_price),
         "qty": _dec(pos.stop_qty),
+        "fill_at": _ts(pos.stop_fill_at),
+        "placed_at": _ts(pos.stop_placed_at),
+        "confirmed_at": _ts(pos.stop_confirmed_at),
+        "stop_placed_at": _ts(pos.stop_placed_at),
+        "stop_confirmed_at": _ts(pos.stop_confirmed_at),
+        "reserve_check": reserve,
     }
 
 
@@ -1471,6 +1483,7 @@ def _register_routes(app: FastAPI, handle: EngineHandle,
             "entries_allowed": safety["entries_allowed"],
             "entries_block_reason": safety["entries_block_reason"],
             "entry_blocks": safety["entry_blocks"],
+            "ledger_mismatch": safety["ledger_mismatch"],
             "heartbeat_age_s": safety["heartbeat_age_s"],
             "blackout_active": safety["blackout_active"],
             "blackout_causes": safety["blackout_causes"],
@@ -1830,16 +1843,24 @@ def _safety_public(handle: EngineHandle, settings: ApiSettings,
     windows = list(configured) + _cached_status_windows(
         engine_row, max_window=max_window)
     frozen = key_freeze_active(source)
-    halted = bool(engine_row and engine_row.get("entry_halt_reason"))
+    halt_reason = None if engine_row is None else (engine_row.get("entry_halt_reason") or None)
     reason = entry_block_reason(
         key_freeze=frozen,
         blackout=any(w.contains(now) for w in windows),
         heartbeat_age=age,
         entry_max_age_s=settings.engine_stale_after_s,
-        stop_halt=halted,
+        stop_halt=bool(halt_reason),
+        halt_reason=halt_reason,
     )
     upcoming = next_window(now, windows)
     row_error = None if engine_row is None else engine_row.get("blackout_config_error")
+    mismatch = None
+    raw_mismatch = None if engine_row is None else engine_row.get("ledger_mismatch_json")
+    if raw_mismatch:
+        try:
+            mismatch = json.loads(raw_mismatch)
+        except json.JSONDecodeError:
+            mismatch = {"raw": raw_mismatch}
     return {
         "entries_allowed": reason is None,
         "entries_block_reason": reason,
@@ -1848,8 +1869,10 @@ def _safety_public(handle: EngineHandle, settings: ApiSettings,
             blackout=any(w.contains(now) for w in windows),
             heartbeat_age=age,
             entry_max_age_s=settings.engine_stale_after_s,
-            stop_halt=halted,
+            stop_halt=bool(halt_reason),
+            halt_reason=halt_reason,
         ),
+        "ledger_mismatch": mismatch,
         "heartbeat_age_s": None if age is None else round(age, 3),
         "blackout_active": any(w.contains(now) for w in windows),
         "blackout_causes": blackout_causes(now, windows),

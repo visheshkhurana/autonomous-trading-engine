@@ -99,6 +99,13 @@ REASON_STALE = "stale_heartbeat"
 REASON_BLACKOUT = "blackout"
 REASON_KEY_FREEZE = "key_freeze"
 REASON_STOP = "native_stop_unconfirmed"
+REASON_LEDGER = "ledger_mismatch"
+
+# Ledger rows the engine did not create from its own fill path.
+ORIGIN_ENGINE_FILL = "engine_fill"
+
+# Absolute base-qty dust. A fee-sized gap inside this band is not a mismatch.
+LEDGER_MISMATCH_TOLERANCE = Decimal("0.00001")
 
 # A fee taken in the base asset leaves free balance a hair under the ledger
 # qty. Clip the stop down to that hair. Anything wider is not a fee.
@@ -248,6 +255,9 @@ class StopPlaceResult:
     qty: Decimal
     stop_price: Decimal
     reason: str
+    # Wall times for the fill-to-rest budget. None when that phase did not happen.
+    placed_at: Optional[dt.datetime] = None
+    confirmed_at: Optional[dt.datetime] = None
 
 
 @dataclass(frozen=True)
@@ -684,6 +694,24 @@ def heartbeat_age_s(now: dt.datetime, beat: Optional[dt.datetime]) -> Optional[f
     return (now - beat.astimezone(UTC)).total_seconds()
 
 
+def stop_budget_remaining(
+    now: dt.datetime, fill_at: Optional[dt.datetime], budget_s: float,
+) -> float:
+    """Seconds left in the fill-to-rest window.
+
+    The budget starts when the entry fill is known (``fill_at``), not when
+    the stop order is handed to the venue. A missing fill time means the
+    caller is not on the entry path and the full budget remains.
+    """
+    if fill_at is None:
+        return budget_s
+    moment = fill_at if fill_at.tzinfo is not None else fill_at.replace(tzinfo=UTC)
+    elapsed = (now - moment.astimezone(UTC)).total_seconds()
+    if elapsed < 0:
+        elapsed = 0.0
+    return budget_s - elapsed
+
+
 def entry_block_reason(
     *,
     key_freeze: bool,
@@ -691,15 +719,21 @@ def entry_block_reason(
     heartbeat_age: Optional[float],
     entry_max_age_s: float,
     stop_halt: bool,
+    halt_reason: Optional[str] = None,
 ) -> Optional[str]:
     """The single reason new entries are closed, highest severity first.
 
-    Key freeze outranks a missing stop, which outranks a calendar blackout,
-    which outranks a stale loop. An unknown heartbeat (no beat yet) is not
-    stale: the first tick has not had a chance to stamp one.
+    Key freeze outranks a stored halt (an unconfirmed stop, or a ledger
+    mismatch), which outranks a calendar blackout, which outranks a stale
+    loop. An unknown heartbeat (no beat yet) is not stale: the first tick
+    has not had a chance to stamp one. ``halt_reason`` is the token persisted
+    on the control row; when it is absent a stop halt still reports
+    ``native_stop_unconfirmed``.
     """
     if key_freeze:
         return REASON_KEY_FREEZE
+    if halt_reason:
+        return halt_reason
     if stop_halt:
         return REASON_STOP
     if blackout:
@@ -716,11 +750,14 @@ def entry_block_reasons(
     heartbeat_age: Optional[float],
     entry_max_age_s: float,
     stop_halt: bool,
+    halt_reason: Optional[str] = None,
 ) -> list[str]:
     reasons: list[str] = []
     if key_freeze:
         reasons.append(REASON_KEY_FREEZE)
-    if stop_halt:
+    if halt_reason:
+        reasons.append(halt_reason)
+    elif stop_halt:
         reasons.append(REASON_STOP)
     if blackout:
         reasons.append(REASON_BLACKOUT)
