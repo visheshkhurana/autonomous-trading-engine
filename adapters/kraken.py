@@ -49,7 +49,7 @@ from uuid import uuid4
 from core.risk import equity_for_drawdown
 from core.safety import (
     STOP_FEE_CLIP_LIMIT, ManualReservedError, StopCancelResult, StopPlaceResult,
-    base_asset, env_bool, key_freeze_active, non_reserved_free,
+    base_asset, engine_spendable, env_bool, key_freeze_active, non_reserved_free,
     parse_manual_reserved, stop_budget_remaining, stop_qty_for_ledger,
 )
 from core.types import (
@@ -310,6 +310,10 @@ class KrakenAdapter:
 
     asset_class: AssetClass = AssetClass.CRYPTO
     manages_native_stops: bool = True
+    # Kraken spot locks the base asset in a resting stop-loss, so `free`
+    # does not include those coins. Venues that leave the coins in free
+    # set this false and the engine does not add the stop qty back.
+    stops_lock_base: bool = True
 
     def __init__(
         self,
@@ -379,6 +383,9 @@ class KrakenAdapter:
         self._free_adjust: dict[str, Decimal] = {}
         self._free_negative: set[str] = set()
         self._free_cache_mono: Optional[float] = None
+        # (symbol, txid, qty) the engine says are its stops. Only a txid
+        # that is actually on the open book is added back into spendable.
+        self._noted_stops: list[tuple[str, str, Decimal]] = []
         self._markets: Optional[dict[str, Any]] = None
         # Kraken needs the symbol to cancel, and the protocol's cancel() only gets
         # an id, so the mapping is kept here for orders this adapter placed.
@@ -615,13 +622,37 @@ class KrakenAdapter:
         if code not in self._free_cache:
             self._free_cache[code] = Decimal("0")
         delta = filled if side is Side.BUY else -filled
-        for entry in self._fee_entries(order):
+        delta -= self._fill_base_fee(order, code)
+        self._free_adjust[code] = self._free_adjust.get(code, Decimal("0")) + delta
+
+    def _base_fee_qty(self, payload: Mapping[str, Any], code: str) -> Decimal:
+        total = Decimal("0")
+        for entry in self._fee_entries(payload):
             cost = _dec_opt(entry.get("cost"))
             if cost is None:
                 continue
             if str(entry.get("currency") or "").upper() == code:
-                delta -= abs(cost)
-        self._free_adjust[code] = self._free_adjust.get(code, Decimal("0")) + delta
+                total += abs(cost)
+        return total
+
+    def _fill_base_fee(self, order: Mapping[str, Any], code: str) -> Decimal:
+        """Base-asset fee on a fill, without counting the same fee twice.
+
+        An aggregate fee on the order already includes the trades. When the
+        order has none, sum the trade-level fees. A buy that only reports
+        the fee on ``trades`` must still shrink the cached free balance.
+        """
+        order_fee = self._base_fee_qty(order, code)
+        if order_fee > 0:
+            return order_fee
+        trades = order.get("trades")
+        if not isinstance(trades, list):
+            return Decimal("0")
+        total = Decimal("0")
+        for trade in trades:
+            if isinstance(trade, dict):
+                total += self._base_fee_qty(trade, code)
+        return total
 
     def _exclude_reserved_equity(
         self, total: Decimal, excluded: list[tuple[str, Decimal]],
@@ -682,11 +713,14 @@ class KrakenAdapter:
         return table.get(base_asset(self._base_of(symbol)), Decimal("0"))
 
     def _spendable_base(self, symbol: str) -> Optional[Decimal]:
-        """Free base after the manual reserve. None if free cannot be read."""
+        """Free base after the manual reserve. None if free cannot be read.
+
+        Adds back this engine's own open stops when the venue locks them.
+        """
         free = self._free_base(symbol)
         if free is None:
             return None
-        return non_reserved_free(free, self._reserved_base(symbol))
+        return engine_spendable(free, self._reserved_base(symbol), self._locked_engine_qty(symbol))
 
     def _is_unplaceable_spot_qty(
         self, symbol: str, qty: Decimal, price: Decimal, instrument: Instrument,
@@ -1111,7 +1145,8 @@ class KrakenAdapter:
                     f"venue free {self._base_of(symbol)} is unreadable; "
                     "refusing to send a spot sell of book qty (Kraken insufficient-funds)",
                 )
-            spendable = non_reserved_free(free, reserved)
+            locked = self._locked_engine_qty(symbol)
+            spendable = engine_spendable(free, reserved, locked)
             if spendable is None:
                 return self._unplaced(
                     intent,
@@ -1445,6 +1480,41 @@ class KrakenAdapter:
             for asset, amount in self._free_cache.items()
         }
 
+    def note_engine_stops(self, rows: Sequence[tuple[str, str, Decimal]]) -> None:
+        """Remember which open-order ids belong to the engine.
+
+        A later spendable read adds a qty back only when that txid is on
+        the open book. Anything not in this list is someone else's order.
+        """
+        noted: list[tuple[str, str, Decimal]] = []
+        for row in rows:
+            if len(row) != 3:
+                continue
+            symbol, txid, qty = row
+            if not txid or qty is None or qty <= 0:
+                continue
+            noted.append((str(symbol), str(txid), qty))
+        self._noted_stops = noted
+
+    def _locked_engine_qty(self, symbol: str) -> Decimal:
+        """Qty of this engine's stops the venue is holding out of free.
+
+        Zero when this venue does not lock stop funds. A txid is counted
+        only when ``_stop_visible`` says it is on the open book.
+        """
+        if not self.stops_lock_base:
+            return Decimal("0")
+        code = self._base_of(symbol)
+        total = Decimal("0")
+        for noted_symbol, txid, qty in self._noted_stops:
+            noted_code = noted_symbol.split("/", 1)[0].upper()
+            if noted_code != code:
+                continue
+            market = noted_symbol if "/" in noted_symbol else symbol
+            if self._stop_visible(market, txid) is True:
+                total += qty
+        return total
+
     def _stop_spendable(self, symbol: str, *, use_cache: bool) -> Optional[Decimal]:
         """Non-reserved free for a stop.
 
@@ -1453,6 +1523,8 @@ class KrakenAdapter:
         stop. Otherwise one live read, retried once, then the last known
         balance. None means there is nothing safe to size from. The reserve
         is always applied; a missing read is not the full ledger qty.
+        Engine stops verified on the open book are added back when this
+        venue locks them.
         """
         free: Optional[Decimal] = None
         if use_cache:
@@ -1464,7 +1536,7 @@ class KrakenAdapter:
                 free = self._free_base(symbol, refresh=False)
         if free is None:
             return None
-        return non_reserved_free(free, self._reserved_base(symbol))
+        return engine_spendable(free, self._reserved_base(symbol), self._locked_engine_qty(symbol))
 
     def place_native_stop(
         self, instrument: Instrument, qty: Decimal, stop_price: Decimal,

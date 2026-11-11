@@ -93,8 +93,9 @@ from core.safety import (
     ORIGIN_ENGINE_FILL, REASON_LEDGER, REASON_STOP, BlackoutWindow,
     ManualReservedError, StopPlaceResult, base_asset, blackout_active,
     entry_block_reason, fetch_status_windows, key_freeze_active,
-    load_configured_windows, non_reserved_free, overlap_stops_allowed,
-    reserved_for, stop_budget_remaining, stop_qty_for_ledger,
+    engine_spendable, env_bool, load_configured_windows, non_reserved_free,
+    overlap_stops_allowed, reserved_for, stop_budget_remaining,
+    stop_qty_for_ledger,
 )
 from core.protocols import (
     BrokerAdapter, OrderGateProto, PositionStoreProto, RiskCircuitProto,
@@ -1290,6 +1291,7 @@ class _ClassRunner:
 
         if self.asset_class is AssetClass.CRYPTO:
             await _offload(self.engine.refresh_blackout)
+            await self._publish_engine_stops(positions)
             await self._reconcile_ledger(positions)
             await self._maintain_native_stops(ctx)
             # Maintain may have flattened a position whose stop could not be
@@ -1871,24 +1873,26 @@ class _ClassRunner:
             "native_stop reserve clip %s stop_qty=%s spendable=%s",
             position.instrument.symbol, position.stop_qty, target)
         if target <= 0:
-            detail["action"] = "flatten"
+            detail["action"] = "halt"
             await self._store_reserve_check(position, detail)
-            await self._fail_unprotected(
-                position, ctx,
-                "resting stop exceeds non-reserved free and nothing is spendable",
-                qty_cap=ZERO)
+            self._halt_without_sell(
+                position,
+                "resting stop exceeds non-reserved free and nothing is spendable")
             return True
         cancel = await self._cancel_stop(position.stop_txid, position)
         if cancel is not None and cancel.outcome == "filled" and cancel.fill is not None:
             await self._apply_external_fill(position, cancel.fill)
             return False
         if cancel is None or cancel.outcome != "cancelled":
-            detail["action"] = "flatten"
+            # The old stop may still be resting (absent from the book is not
+            # proof, and a cancel we could not confirm is not a licence to
+            # sell). Halt and alert. Do not market-sell.
+            detail["action"] = "halt"
+            detail["cancel"] = None if cancel is None else cancel.outcome
             await self._store_reserve_check(position, detail)
-            await self._fail_unprotected(
-                position, ctx,
-                "could not cancel a stop larger than non-reserved free",
-                qty_cap=target)
+            self._halt_without_sell(
+                position,
+                "could not confirm the resting stop was cancelled")
             return True
         try:
             await self._write_stop(position, None, None, None, "cancelled")
@@ -1900,10 +1904,20 @@ class _ClassRunner:
         result = await self._submit_stop(
             fresh, position.stop_price, write=True, qty=target, fast=False)
         if result is None or not result.ok:
-            detail["action"] = "flatten"
+            detail["action"] = "halt"
             current = self._ledger_position(
                 fresh.instrument.symbol, fresh.strategy_id) or fresh
             await self._store_reserve_check(current, detail)
+            if not await self._replacement_cleared(current, result):
+                self._halt_without_sell(
+                    current,
+                    "replacement stop was not confirmed cancelled")
+                return True
+            if await self._engine_stop_might_be_live(current.instrument.symbol):
+                self._halt_without_sell(
+                    current,
+                    "an engine stop might still be live")
+                return True
             await self._fail_unprotected(
                 current, ctx, "clipped stop was not confirmed", qty_cap=target)
             return True
@@ -1965,7 +1979,11 @@ class _ClassRunner:
                     except Exception:
                         rows.append({"asset": asset, "reason": "unreadable_free"})
                         continue
-                    spendable = non_reserved_free(free, reserved)
+                    locked = await self._verified_stop_qty(asset, positions)
+                    if locked is None:
+                        rows.append({"asset": asset, "reason": "unreadable_stops"})
+                        continue
+                    spendable = engine_spendable(free, reserved, locked)
                     if spendable is None:
                         rows.append({"asset": asset, "reason": "unreadable_free"})
                         continue
@@ -1979,6 +1997,7 @@ class _ClassRunner:
                             "spendable": str(spendable),
                             "diff": str(diff),
                             "tolerance": str(tolerance),
+                            "locked_stops": str(locked),
                             "reason": "qty",
                         })
         if rows:
@@ -2228,7 +2247,104 @@ class _ClassRunner:
             free = await self._cached_free(position)
         if free is None:
             return None, None, None
-        return free, non_reserved_free(free, reserved), None
+        locked = await self._verified_stop_qty(
+            base_asset(position.instrument.symbol))
+        if locked is None:
+            return free, None, None
+        return free, engine_spendable(free, reserved, locked), None
+
+    async def _verified_stop_qty(self, asset: str,
+                                 positions: Optional[Sequence[Position]] = None,
+                                 ) -> Optional[Decimal]:
+        """Open qty of this engine's stops on ``asset``.
+
+        None when the open-order book could not be read. Zero when the
+        venue does not lock stop funds, and zero for any order that is
+        not one of our stored txids sitting on the book.
+        """
+        if not bool(getattr(self.adapter, "stops_lock_base", False)):
+            return Decimal("0")
+        if positions is None:
+            try:
+                positions = tuple(self.engine.store.positions(
+                    self.mode, self.asset_class))
+            except Exception as exc:
+                self._error("native_stop",
+                            "could not read positions to verify resting stops",
+                            exc)
+                return None
+        total = Decimal("0")
+        for row in positions:
+            if row.qty == 0 or base_asset(row.instrument.symbol) != asset:
+                continue
+            if not row.stop_txid or row.stop_qty is None:
+                continue
+            visible = await self._stop_is_open(row)
+            if visible is None:
+                return None
+            if visible:
+                total += row.stop_qty
+        return total
+
+    async def _publish_engine_stops(self, positions: Sequence[Position]) -> None:
+        fn = getattr(self.adapter, "note_engine_stops", None)
+        if fn is None:
+            return
+        rows = [
+            (position.instrument.symbol, position.stop_txid, position.stop_qty)
+            for position in positions
+            if position.stop_txid and position.stop_qty is not None
+        ]
+        try:
+            await _offload(fn, rows)
+        except Exception as exc:
+            self._error("native_stop", "could not note engine stop ids", exc)
+
+    async def _engine_stop_might_be_live(
+        self, symbol: str, extra_txids: Sequence[str] = (),
+    ) -> bool:
+        """True unless every engine stop on ``symbol`` is confirmed gone.
+
+        An unreadable book is treated as live. No known txid means nothing
+        of ours can be resting.
+        """
+        txids: list[str] = [txid for txid in extra_txids if txid]
+        instrument: Optional[Instrument] = None
+        try:
+            rows = tuple(self.engine.store.positions(self.mode, self.asset_class))
+        except Exception:
+            return True
+        for row in rows:
+            if row.instrument.symbol != symbol:
+                continue
+            instrument = instrument or row.instrument
+            if row.stop_txid:
+                txids.append(row.stop_txid)
+        if not txids:
+            return False
+        fn = getattr(self.adapter, "native_stop_open", None)
+        if fn is None or instrument is None:
+            return True
+        seen: set[str] = set()
+        for txid in txids:
+            if txid in seen:
+                continue
+            seen.add(txid)
+            try:
+                visible = await _offload(fn, txid, instrument)
+            except Exception:
+                return True
+            if visible is not False:
+                return True
+        return False
+
+    def _halt_without_sell(self, position: Position, reason: str) -> None:
+        self._error(
+            "native_stop",
+            f"{position.instrument.symbol}: {reason}; halting entries "
+            "without a market sell",
+            None, {"symbol": position.instrument.symbol, "reason": reason})
+        self._set_entry_halt(REASON_STOP)
 
     async def _submit_stop(self, position: Position, price: Decimal,
                            *, write: bool = True,
@@ -2367,6 +2483,24 @@ class _ClassRunner:
                     "qty": qty, "price": fill.price,
                     "strategy_id": position.strategy_id, "source": "native_stop"})
 
+    async def _replacement_cleared(self, position: Position,
+                                   result: Optional[StopPlaceResult]) -> bool:
+        """Cancel a replacement that was not confirmed, and require proof it is gone.
+
+        False means some engine stop on the symbol might still be working,
+        so the caller must not sell.
+        """
+        if result is None or not result.txid:
+            return not await self._engine_stop_might_be_live(position.instrument.symbol)
+        cancel = await self._cancel_stop(result.txid, position)
+        if cancel is not None and cancel.outcome == "filled" and cancel.fill is not None:
+            await self._apply_external_fill(position, cancel.fill)
+            return False
+        if cancel is None or cancel.outcome != "cancelled":
+            return False
+        return not await self._engine_stop_might_be_live(
+            position.instrument.symbol, (result.txid,))
+
     async def _fail_unprotected(self, position: Position, ctx: MarketContext,
                                 reason: str,
                                 *, qty_cap: Optional[Decimal] = None) -> None:
@@ -2388,7 +2522,14 @@ class _ClassRunner:
 
         ``qty_cap`` is the non-reserved free when a reserve-cap failure is
         what brought us here. Zero means there is nothing we may sell.
+        A market sell is refused while any engine stop on the symbol might
+        still be resting.
         """
+        if await self._engine_stop_might_be_live(position.instrument.symbol):
+            self._halt_without_sell(
+                position,
+                f"{reason}; an engine stop might still be live")
+            return
         qty = abs(position.qty)
         if qty_cap is not None:
             qty = min(qty, qty_cap)
@@ -2473,9 +2614,12 @@ class _ClassRunner:
             await self._fail_unprotected(
                 position, ctx, "entry fill has no strategy stop")
             return
-        budget = stop_budget_remaining(
-            self.engine.now(), fill_at, self.engine.config.stop_confirm_s)
-        if fill_at is not None and budget <= 0:
+        # The adapter subtracts the fill age from this budget once. Passing
+        # the already-reduced remainder would count the age twice.
+        full_budget = self.engine.config.stop_confirm_s
+        remaining = stop_budget_remaining(
+            self.engine.now(), fill_at, full_budget)
+        if fill_at is not None and remaining <= 0:
             await self._fail_unprotected(
                 position, ctx,
                 "native stop was not confirmed within 10s of the fill")
@@ -2483,7 +2627,7 @@ class _ClassRunner:
         # Cache first. The ledger row is already written; a venue balance
         # read is not on this path unless nothing has been read yet.
         result = await self._submit_stop(
-            position, price, write=False, fast=True, timeout_s=budget,
+            position, price, write=False, fast=True, timeout_s=full_budget,
             fill_at=fill_at)
         confirmed = None if result is None else (
             result.confirmed_at or self.engine.now())
@@ -2802,8 +2946,15 @@ class _ClassRunner:
         """
         try:
             if equity is not None and equity > ZERO:
+                basis = "full"
+                try:
+                    if env_bool(self.engine.safety_env,
+                                "RISK_EXCLUDE_RESERVED_BASE", False):
+                        basis = "engine_only"
+                except ValueError:
+                    basis = "full"
                 decision = await _offload(self.wiring.risk.advance,
-                                          self.asset_class, equity)
+                                          self.asset_class, equity, basis)
             else:
                 decision = await _offload(self.wiring.risk.read,
                                           self.asset_class, equity)

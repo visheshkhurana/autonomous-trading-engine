@@ -189,6 +189,26 @@ def non_reserved_free(free: Optional[Decimal], reserved: Decimal) -> Optional[De
     return available
 
 
+def engine_spendable(
+    free: Optional[Decimal],
+    reserved: Decimal,
+    locked_stop_qty: Decimal = Decimal("0"),
+) -> Optional[Decimal]:
+    """Coins the engine may use: free, plus its own open stops, minus reserve.
+
+    Kraken spot takes the base quantity out of ``free`` while a stop-loss
+    rests. ``locked_stop_qty`` is only the engine's own stops whose txids
+    are on the open-order book. Pass 0 when the venue does not lock stop
+    funds, or when those stops are not open. Orders the engine did not
+    place are never included.
+    """
+    if locked_stop_qty < 0:
+        locked_stop_qty = Decimal("0")
+    if free is None:
+        return None
+    return non_reserved_free(free + locked_stop_qty, reserved)
+
+
 def overlap_stops_allowed(
     *,
     free: Optional[Decimal],

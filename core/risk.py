@@ -33,6 +33,8 @@ multiplies by 100 except the human-readable `reason` string.
 from __future__ import annotations
 
 import datetime as dt
+import json
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
@@ -44,6 +46,9 @@ from .types import AssetClass, Mode
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
+LOG = logging.getLogger("trader.risk")
+_BASIS_FULL = "full"
+_BASIS_ENGINE = "engine_only"
 
 
 def equity_for_drawdown(
@@ -252,6 +257,10 @@ class RiskState:
     day_key: str
     day_open_equity: Decimal
     updated_at: dt.datetime
+    # ``full`` is account equity including the manual reserve. ``engine_only``
+    # is the basis after RISK_EXCLUDE_RESERVED_BASE has been applied once.
+    equity_basis: str = "full"
+    hwm_rebase_json: str = ""
 
     def __post_init__(self) -> None:
         for label, value in (("high_water", self.high_water),
@@ -277,6 +286,8 @@ class RiskState:
             "day_key": self.day_key,
             "day_open_equity": str(self.day_open_equity),
             "updated_at": self.updated_at.isoformat(),
+            "equity_basis": self.equity_basis or "full",
+            "hwm_rebase_json": self.hwm_rebase_json or "",
         }
 
     @classmethod
@@ -290,6 +301,8 @@ class RiskState:
             day_key=str(row["day_key"]),
             day_open_equity=Decimal(str(row["day_open_equity"])),
             updated_at=dt.datetime.fromisoformat(str(row["updated_at"])),
+            equity_basis=str(row.get("equity_basis") or "full"),
+            hwm_rebase_json=str(row.get("hwm_rebase_json") or ""),
         )
 
 
@@ -378,11 +391,19 @@ class RiskCircuit:
 
     # ------------------------------------------------------------- advance
 
-    def advance(self, asset_class: AssetClass, equity: Decimal) -> CircuitDecision:
+    def advance(self, asset_class: AssetClass, equity: Decimal,
+                equity_basis: str = _BASIS_FULL) -> CircuitDecision:
         """Roll the high-water mark and the daily baseline forward, then judge.
 
         The ONLY writer. Belongs to the order path (post-fill / post-settlement),
         not to any polling or display path.
+
+        ``equity_basis="engine_only"`` means this equity already excludes
+        ``MANUAL_RESERVED_BASE``. The first time that basis is seen against a
+        high-water mark built from full equity, the mark and the day's open
+        are rebased once to this equity and an audit row is stored. Later
+        ticks use the normal "high-water only rises" rule. The default
+        ``full`` never rebases.
         """
         now = self._now()
         limits = self.limits_for(asset_class)
@@ -412,6 +433,8 @@ class RiskCircuit:
             return _blind(equity_known=True, state_known=False, detail=state_detail)
 
         day_key = profile.day_key(now)
+        basis = equity_basis if equity_basis in {_BASIS_FULL, _BASIS_ENGINE} else _BASIS_FULL
+        rebase_json = ""
         if state is None:
             high_water = equity
             day_open = equity
@@ -428,11 +451,36 @@ class RiskCircuit:
                 detail=(f"stored day_key {state.day_key} is ahead of {day_key}; "
                         "the daily-loss boundary cannot be established"),
             )
+        elif basis == _BASIS_ENGINE and state.equity_basis != _BASIS_ENGINE:
+            # One time only. The stored mark was built from equity that
+            # included the manual reserve. Replacing the input with
+            # engine-only equity must not look like a drawdown. The day's
+            # open is moved with the mark so the daily-loss rung does not
+            # flatten on the same fictional loss. Thresholds are untouched.
+            high_water = equity
+            day_open = equity
+            rebase_json = json.dumps({
+                "at": now.isoformat(),
+                "old_high_water": str(state.high_water),
+                "new_high_water": str(high_water),
+                "old_day_open_equity": str(state.day_open_equity),
+                "new_day_open_equity": str(day_open),
+                "reason": "RISK_EXCLUDE_RESERVED_BASE enabled; one-time rebase "
+                          "to engine-only equity",
+            })
+            LOG.info(
+                "risk HWM rebased once to engine-only equity "
+                "old_high_water=%s new_high_water=%s",
+                state.high_water, high_water,
+            )
         else:
             # max(), never assignment: the high-water mark only ever goes up.
             high_water = state.high_water if state.high_water > equity else equity
             # state.day_key <= day_key here, so this only ever rolls forward.
             day_open = equity if state.day_key != day_key else state.day_open_equity
+            rebase_json = state.hwm_rebase_json
+            if basis != _BASIS_ENGINE:
+                basis = state.equity_basis or _BASIS_FULL
 
         new_state = RiskState(
             mode=self._mode,
@@ -441,6 +489,9 @@ class RiskCircuit:
             day_key=day_key,
             day_open_equity=day_open,
             updated_at=now,
+            equity_basis=basis if state is None or basis == _BASIS_ENGINE else (
+                state.equity_basis or basis),
+            hwm_rebase_json=rebase_json,
         )
         # Deliberately unguarded: a failed write must reach the order path, not
         # be smoothed into a decision that looks persisted but is not.

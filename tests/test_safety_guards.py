@@ -64,6 +64,9 @@ class StopBook:
 
     manages_native_stops = True
     asset_class = AssetClass.CRYPTO
+    # This book does not lock stop funds inside `free`. Tests that model
+    # Kraken set the flag on the instance.
+    stops_lock_base = False
 
     def __init__(self, mode: Mode = Mode.PAPER, *, free: D = D("0.098"),
                  wallet: D = D("0.088")) -> None:
@@ -79,6 +82,8 @@ class StopBook:
         self.timeouts: list[float] = []
         self.filled_on_cancel = False
         self.fail_next = False
+        self.unconfirmed_next = False
+        self.sticky_unconfirmed = False
         self.sticky_ids: set[str] = set()
         self.filled_reports: dict[str, Fill] = {}
         # Sum of qtys if a new stop is placed while another is still open.
@@ -122,6 +127,14 @@ class StopBook:
         if self.fail_next:
             self.fail_next = False
             return StopPlaceResult(False, None, qty, stop_price, "rejected")
+        if self.unconfirmed_next:
+            self.unconfirmed_next = False
+            self._n += 1
+            txid = f"STOP-{self._n}"
+            self.stops[txid] = (qty, stop_price)
+            if self.sticky_unconfirmed:
+                self.sticky_ids.add(txid)
+            return StopPlaceResult(False, txid, qty, stop_price, "not confirmed")
         if self.fail_stop:
             return StopPlaceResult(False, None, qty, stop_price, "not on open orders")
         self._n += 1
@@ -1518,5 +1531,247 @@ def test_reserved_base_is_excluded_from_drawdown_only_when_opted_in(tmp_path):
         assert circuit.read(AssetClass.CRYPTO, D("31000")).drawdown_pct == D("0")
         untouched = equity_for_drawdown(D("31000"), D("6000"), exclude_reserved=False)
         assert untouched == D("31000")
+    finally:
+        store.close()
+
+
+def test_enabling_reserved_exclusion_rebases_the_high_water_once(tmp_path, caplog):
+    """A 62% reserve must not look like a drawdown the moment the flag turns on."""
+    from core.risk import CircuitAction
+    store = SQLitePositionStore(str(tmp_path / "rebase.db"))
+    try:
+        circuit = RiskCircuit(store, Mode.PAPER, clock=lambda: WHEN)
+        full = D("100000")
+        engine_only = D("38000")  # 62% of the account is the manual reserve
+        seeded = circuit.advance(AssetClass.CRYPTO, full)
+        assert seeded.drawdown_pct == D("0")
+        with caplog.at_level(logging.INFO, logger="trader.risk"):
+            rebased = circuit.advance(
+                AssetClass.CRYPTO, engine_only, "engine_only")
+        assert rebased.action is CircuitAction.OK
+        assert rebased.drawdown_pct == D("0")
+        assert rebased.daily_loss_pct == D("0")
+        row = store.read_risk_state(Mode.PAPER, AssetClass.CRYPTO)
+        assert row is not None
+        assert row["high_water"] == "38000"
+        assert row["equity_basis"] == "engine_only"
+        audit = json.loads(row["hwm_rebase_json"])
+        assert audit["old_high_water"] == "100000"
+        assert audit["new_high_water"] == "38000"
+        assert "rebased once" in caplog.text
+        # A later dip uses the rebased mark. It does not rebase again.
+        later = circuit.advance(AssetClass.CRYPTO, D("37000"), "engine_only")
+        kept = store.read_risk_state(Mode.PAPER, AssetClass.CRYPTO)
+        assert kept is not None and kept["high_water"] == "38000"
+        assert later.drawdown_pct == (D("38000") - D("37000")) / D("38000")
+        # Flag off never moves an existing mark down.
+        plain = RiskCircuit(store, Mode.LIVE, clock=lambda: WHEN)
+        plain.advance(AssetClass.CRYPTO, full)
+        plain.advance(AssetClass.CRYPTO, engine_only)
+        live = store.read_risk_state(Mode.LIVE, AssetClass.CRYPTO)
+        assert live is not None and live["high_water"] == "100000"
+        assert live["equity_basis"] == "full"
+    finally:
+        store.close()
+
+
+def test_cancel_that_is_not_confirmed_does_not_sell(tmp_path):
+    book = StopBook(free=D("0.02"))
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        txid = next(iter(book.stops))
+        book.sticky_ids.add(txid)
+        book.free = D("0.004")
+        strategy.intents = []
+        strategy.stop = D("48000")
+        _tick(engine)
+        assert not any(row[0] == "place" and row[1] == "sell" for row in book.log)
+        assert txid in book.stops
+        assert engine._runners[AssetClass.CRYPTO]._entry_halt_reason == "native_stop_unconfirmed"
+    finally:
+        store.close()
+
+
+def test_unconfirmed_replacement_is_cancelled_before_any_flatten(tmp_path):
+    book = StopBook(free=D("0.02"))
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        book.free = D("0.004")
+        book.unconfirmed_next = True
+        strategy.intents = []
+        strategy.stop = D("48000")
+        _tick(engine)
+        cancels = [row[1] for row in book.log if row[0] == "cancel"]
+        assert len(cancels) >= 2
+        sells = [row for row in book.log if row[0] == "place" and row[1] == "sell"]
+        assert sells, "a confirmed cancel of the replacement may then flatten"
+        assert book.stops == {}
+        # The replacement cancel is the last cancel and it precedes the sell.
+        last_cancel = max(i for i, row in enumerate(book.log) if row[0] == "cancel")
+        first_sell = min(i for i, row in enumerate(book.log)
+                         if row[0] == "place" and row[1] == "sell")
+        assert last_cancel < first_sell
+    finally:
+        store.close()
+
+
+def test_unconfirmed_replacement_that_cannot_be_cancelled_does_not_sell(tmp_path):
+    book = StopBook(free=D("0.02"))
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        book.free = D("0.004")
+        book.unconfirmed_next = True
+        book.sticky_unconfirmed = True
+        strategy.intents = []
+        strategy.stop = D("48000")
+        _tick(engine)
+        assert not any(row[0] == "place" and row[1] == "sell" for row in book.log)
+        assert book.stops, "the unconfirmed replacement is still on the book"
+        assert engine._runners[AssetClass.CRYPTO]._entry_halt_reason == "native_stop_unconfirmed"
+    finally:
+        store.close()
+
+
+def test_reconcile_and_recheck_match_whether_or_not_stops_lock_funds(tmp_path):
+    """Held: free excludes the resting stop. Not held: free already includes it."""
+    # Not held. free == ledger. Adding the stop qty would false-mismatch.
+    plain = _ReconBook(free=D("0.01"))
+    assert plain.stops_lock_base is False
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, plain, strategy)
+    try:
+        _tick(engine)
+        assert engine._runners[AssetClass.CRYPTO]._entry_halt_reason != "ledger_mismatch"
+        assert len(plain.stops) == 1
+        strategy.intents = []
+        _tick(engine)
+        assert engine._runners[AssetClass.CRYPTO]._ledger_mismatch is None
+        assert not any(row[0] == "cancel" for row in plain.log)
+    finally:
+        store.close()
+
+
+def test_held_stop_funds_are_added_back_for_reconcile_and_recheck(tmp_path):
+    book = _ReconBook(free=D("0.01"))
+    book.stops_lock_base = True
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        # Venue moved the position into the stop. free no longer includes it.
+        book.free = D("0")
+        strategy.intents = []
+        strategy.stop = D("48000")
+        _tick(engine)
+        runner = engine._runners[AssetClass.CRYPTO]
+        assert runner._ledger_mismatch is None
+        assert runner._entry_halt_reason != "ledger_mismatch"
+        assert len(book.stops) == 1
+        assert not any(row[0] == "place" and row[1] == "sell" for row in book.log)
+        # A foreign-sized free shortfall that the stop does not explain still clips.
+        # free 0 and stop 0.01 is explained. Drop the stop qty by shrinking free
+        # below zero is impossible; raise the reserve instead via env on a new tick.
+    finally:
+        store.close()
+
+
+def test_trade_level_base_fee_shrinks_the_cached_balance_once():
+    ex = FakeExchange(
+        {"BTC/USDT": spot("BTC/USDT")},
+        tickers={"BTC/USDT": {"last": 100000}},
+        balance={"free": {"BTC": "0.088"}, "total": {"BTC": "0.088"}},
+    )
+    adapter = KrakenAdapter(
+        ex, mode=Mode.LIVE, now=lambda: WHEN, key_freeze=lambda: False,
+        monotonic=FakeClock().monotonic, sleep=FakeClock().sleep,
+    )
+    adapter._free_cache = {"BTC": D("0.088")}
+    adapter._free_cache_mono = 0.0
+    adapter._free_adjust = {}
+    trade_only = {
+        "filled": "1",
+        "trades": [{
+            "amount": "1",
+            "fee": {"cost": "0.004", "currency": "BTC"},
+        }],
+    }
+    adapter._apply_fill_to_cache(trade_only, "BTC", Side.BUY, D("1"))
+    assert adapter._cached_amount("BTC") == D("0.088") + D("1") - D("0.004")
+    adapter._free_adjust = {}
+    adapter._free_cache = {"BTC": D("0.088")}
+    both = {
+        "filled": "1",
+        "fee": {"cost": "0.004", "currency": "BTC"},
+        "trades": [{
+            "amount": "1",
+            "fee": {"cost": "0.004", "currency": "BTC"},
+        }],
+    }
+    adapter._apply_fill_to_cache(both, "BTC", Side.BUY, D("1"))
+    assert adapter._cached_amount("BTC") == D("0.088") + D("1") - D("0.004")
+
+
+def test_sell_cap_adds_only_our_open_stop(tmp_path):
+    reserved = D("0.088")
+    ex = FakeExchange(
+        {"BTC/USDT": spot("BTC/USDT", amount_step="0.00000001", price_step="0.1",
+                          min_amount="0.00000001")},
+        tickers={"BTC/USDT": {"last": 100000}},
+        balance={"free": {"BTC": format(reserved, "f"), "USDT": "10000"},
+                 "total": {"BTC": format(reserved + D("0.02"), "f"), "USDT": "10000"}},
+        order_states=[dict(FILLED_ORDER, filled=0.01, amount=0.01, average=100000,
+                           cost=1000)],
+    )
+    ex.open_orders = [
+        {"id": "STOP-OURS", "symbol": "BTC/USDT", "status": "open", "amount": "0.01"},
+        {"id": "STOP-THEIRS", "symbol": "BTC/USDT", "status": "open", "amount": "0.05"},
+    ]
+    ex.fetch_open_orders = lambda symbol=None: list(ex.open_orders)
+
+    def create_order(symbol, type_, side, amount, price=None, params=None):
+        ex.create_calls.append((symbol, type_, side, amount, price, params))
+        return {"id": "SELL-1", "status": "closed", "filled": amount, "average": "100000",
+                "amount": amount}
+
+    ex.create_order = create_order
+    ex.fetch_order = lambda order_id, symbol=None: {
+        "id": order_id, "status": "closed", "filled": "0.01", "amount": "0.01",
+        "average": "100000", "symbol": "BTC/USDT",
+    }
+    adapter = KrakenAdapter(
+        ex, mode=Mode.LIVE, now=lambda: WHEN, key_freeze=lambda: False,
+        manual_reserved=f"BTC:{reserved}",
+        monotonic=FakeClock().monotonic, sleep=FakeClock().sleep,
+    )
+    adapter.note_engine_stops([("BTC/USDT", "STOP-OURS", D("0.01"))])
+    sell = Intent(
+        instrument=BTC, side=Side.SELL, qty=D("0.02"),
+        order_type=OrderType.MARKET, strategy_id="s1", reason="sell",
+        limit_price=D("100000"), idempotency_key="sell-cap",
+    )
+    ref = adapter.place(sell)
+    assert ref.status is OrderStatus.FILLED
+    sent = D(str(ex.create_calls[0][3]))
+    # free is only the reserve. Our open stop of 0.01 is added back. Theirs is not.
+    assert sent == D("0.01")
+    assert sent != D("0.06")
+
+
+def test_fill_age_is_subtracted_from_the_stop_budget_once(tmp_path):
+    book = StopBook()
+    book.fill_at = WHEN - dt.timedelta(seconds=6)
+    strategy = NamingStrategy([_buy()])
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        assert book.timeouts == [10]
+        assert book.stops
+        assert not any(row[0] == "place" and row[1] == "sell" for row in book.log)
     finally:
         store.close()
