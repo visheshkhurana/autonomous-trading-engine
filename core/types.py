@@ -201,6 +201,14 @@ class Position:
     stop_price: Optional[Decimal] = None
     stop_qty: Optional[Decimal] = None
     stop_status: Optional[str] = None
+    # ``engine_fill`` is the only origin that may open risk. Anything else
+    # blocks new entries until an operator clears the row.
+    origin: str = "engine_fill"
+    stop_fill_at: Optional[dt.datetime] = None
+    stop_placed_at: Optional[dt.datetime] = None
+    stop_confirmed_at: Optional[dt.datetime] = None
+    # JSON object describing the latest reserve-cap check, or None.
+    reserve_check: Optional[str] = None
 
 
 @dataclass

@@ -210,6 +210,28 @@ def _parse_capped_usdt(
     return value
 
 
+def _ledger_tolerance(source: Mapping[str, str]) -> Decimal:
+    """Absolute base-qty band for ledger vs (free - reserved).
+
+    Blank uses the dust default. A negative or non-numeric value raises
+    rather than silently widening the band.
+    """
+    raw = source.get("LEDGER_MISMATCH_TOLERANCE")
+    if raw is None or not str(raw).strip():
+        return safety_mod.LEDGER_MISMATCH_TOLERANCE
+    try:
+        value = Decimal(str(raw).strip())
+    except Exception as exc:
+        raise ValueError(
+            f"LEDGER_MISMATCH_TOLERANCE={raw!r} is not a decimal"
+        ) from exc
+    if not value.is_finite() or value < 0:
+        raise ValueError(
+            f"LEDGER_MISMATCH_TOLERANCE={raw!r} must be a finite amount >= 0"
+        )
+    return value
+
+
 def resolve_crypto_usdt_caps(
     env: Optional[Mapping[str, str]] = None,
 ) -> tuple[Decimal, Decimal]:
@@ -1598,6 +1620,7 @@ def build_stack(config: Optional[RunnerConfig] = None,
             source, "HEARTBEAT_DEAD_S", safety_mod.DEAD_HEARTBEAT_S),
         stop_confirm_s=safety_mod.env_float(
             source, "NATIVE_STOP_CONFIRM_S", safety_mod.STOP_CONFIRM_S),
+        ledger_mismatch_tolerance=_ledger_tolerance(source),
         # On under pytest so a suite cannot os._exit or dial status.kraken.com.
         # Production (no PYTEST_CURRENT_TEST) enables both unless the env says no.
         watchdog_enabled=safety_mod.env_bool(

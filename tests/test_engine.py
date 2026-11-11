@@ -238,11 +238,12 @@ class CountingCircuit:
         self.reads += 1
         return self._inner.read(asset_class, equity)
 
-    def advance(self, asset_class: AssetClass, equity: Decimal):
+    def advance(self, asset_class: AssetClass, equity: Decimal,
+                equity_basis: str = "full"):
         self.advances += 1
         if self.advance_error is not None:
             raise self.advance_error
-        return self._inner.advance(asset_class, equity)
+        return self._inner.advance(asset_class, equity, equity_basis)
 
 
 # ---------------------------------------------------------------- harness

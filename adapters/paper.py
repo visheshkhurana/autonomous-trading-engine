@@ -679,6 +679,8 @@ class PaperAdapter:
     def place_native_stop(
         self, instrument: Instrument, qty: Decimal, stop_price: Decimal,
         timeout_s: float = 10.0,
+        fill_at: Optional[dt.datetime] = None,
+        use_cached_balance: bool = False,
     ) -> StopPlaceResult:
         if qty <= 0 or stop_price <= 0:
             return StopPlaceResult(False, None, qty, stop_price,
@@ -688,13 +690,18 @@ class PaperAdapter:
                 False, None, qty, stop_price,
                 "paper native stop rejected before it rested",
             )
+        _ = (fill_at, use_cached_balance)  # engine owns the fill budget
         with self._lock:
             self._stop_seq += 1
             txid = f"PAPER-STOP-{self.asset_class.value}-{self._stop_seq:06d}"
             self._stops[txid] = _PaperStop(
                 txid=txid, instrument=instrument, qty=qty, stop_price=stop_price,
             )
-        return StopPlaceResult(True, txid, qty, stop_price, "open")
+        rested = self._now()
+        return StopPlaceResult(
+            True, txid, qty, stop_price, "open",
+            placed_at=rested, confirmed_at=rested,
+        )
 
     def native_stop_open(self, txid: str, instrument: Instrument) -> Optional[bool]:
         with self._lock:

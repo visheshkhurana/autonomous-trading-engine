@@ -35,6 +35,7 @@ from decimal import Decimal
 from typing import Any, Iterator, Mapping, Optional, Sequence
 
 from .gate import GateStateUnavailable
+from .safety import ORIGIN_ENGINE_FILL
 from .types import (
     AssetClass, Fill, Instrument, Intent, Mode, OrderRef, OrderStatus,
     OrderType, Position, Side,
@@ -273,6 +274,11 @@ CREATE TABLE IF NOT EXISTS positions (
     stop_price    TEXT,
     stop_qty      TEXT,
     stop_status   TEXT,
+    origin        TEXT,
+    stop_fill_at  TEXT,
+    stop_placed_at TEXT,
+    stop_confirmed_at TEXT,
+    reserve_check TEXT,
     PRIMARY KEY (mode, symbol, strategy_id)
 );
 CREATE INDEX IF NOT EXISTS idx_positions_mode ON positions (mode, asset_class);
@@ -297,6 +303,27 @@ CREATE TABLE IF NOT EXISTS gate_submissions (
 CREATE INDEX IF NOT EXISTS idx_gate_day
     ON gate_submissions (mode, asset_class, day_key);
 """
+
+
+class _Keep:
+    """Sentinel: set_native_stop should leave this column as it is."""
+
+
+_KEEP = _Keep()
+
+
+def _opt_ts(value: Any) -> Optional[str]:
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, dt.datetime):
+        return _utc_text(value)
+    raise TypeError(f"stop timestamp must be datetime or None, got {type(value).__name__}")
+
+
+def _keep_or(stored: Any, incoming: Any, *, clear: bool) -> Any:
+    if isinstance(incoming, _Keep):
+        return None if clear else stored
+    return incoming
 
 
 class SQLitePositionStore:
@@ -547,7 +574,9 @@ class SQLitePositionStore:
 
             pos = conn.execute(
                 "SELECT qty, avg_price, opened_at, structure_id, "
-                "stop_txid, stop_price, stop_qty, stop_status FROM positions "
+                "stop_txid, stop_price, stop_qty, stop_status, "
+                "stop_fill_at, stop_placed_at, stop_confirmed_at, "
+                "origin, reserve_check FROM positions "
                 "WHERE mode=? AND symbol=? AND strategy_id=?",
                 (mode, inst.symbol, strategy_id),
             ).fetchone()
@@ -599,6 +628,14 @@ class SQLitePositionStore:
             stop_price = None if fresh else pos["stop_price"]
             stop_qty = None if fresh else pos["stop_qty"]
             stop_status = None if fresh else pos["stop_status"]
+            stop_fill_at = None if fresh else pos["stop_fill_at"]
+            stop_placed_at = None if fresh else pos["stop_placed_at"]
+            stop_confirmed_at = None if fresh else pos["stop_confirmed_at"]
+            reserve_check = None if fresh else pos["reserve_check"]
+            # A fill this method applies is the engine's own. Adding to a row
+            # keeps whatever origin it already has, so a foreign row cannot
+            # be laundered into engine_fill by a later fill.
+            origin = ORIGIN_ENGINE_FILL if fresh else pos["origin"]
             conn.execute(
                 """
                 INSERT INTO positions (
@@ -606,8 +643,10 @@ class SQLitePositionStore:
                     asset_class, symbol, broker_id, lot_size, tick_size,
                     qty_precision, min_notional, expiry,
                     qty, avg_price, structure_id, opened_at, updated_at,
-                    stop_txid, stop_price, stop_qty, stop_status
-                ) VALUES (?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?)
+                    stop_txid, stop_price, stop_qty, stop_status,
+                    origin, stop_fill_at, stop_placed_at, stop_confirmed_at,
+                    reserve_check
+                ) VALUES (?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?,?,?,?)
                 ON CONFLICT (mode, symbol, strategy_id) DO UPDATE SET
                     qty=excluded.qty,
                     avg_price=excluded.avg_price,
@@ -617,7 +656,12 @@ class SQLitePositionStore:
                     stop_txid=excluded.stop_txid,
                     stop_price=excluded.stop_price,
                     stop_qty=excluded.stop_qty,
-                    stop_status=excluded.stop_status
+                    stop_status=excluded.stop_status,
+                    origin=excluded.origin,
+                    stop_fill_at=excluded.stop_fill_at,
+                    stop_placed_at=excluded.stop_placed_at,
+                    stop_confirmed_at=excluded.stop_confirmed_at,
+                    reserve_check=excluded.reserve_check
                 """,
                 (
                     mode, strategy_id,
@@ -628,6 +672,8 @@ class SQLitePositionStore:
                     str(result.qty), str(result.avg_price), struct,
                     opened_at, _utc_text(self._now()),
                     stop_txid, stop_price, stop_qty, stop_status,
+                    origin, stop_fill_at, stop_placed_at, stop_confirmed_at,
+                    reserve_check,
                 ),
             )
 
@@ -657,6 +703,10 @@ class SQLitePositionStore:
         stop_price: Optional[Decimal],
         stop_qty: Optional[Decimal],
         status: str,
+        fill_at: Any = _KEEP,
+        placed_at: Any = _KEEP,
+        confirmed_at: Any = _KEEP,
+        reserve_check: Any = _KEEP,
     ) -> None:
         """Record the exchange stop that protects this ledger row.
 
@@ -664,6 +714,10 @@ class SQLitePositionStore:
         from. It is never a wallet balance. Missing row raises: writing a
         txid onto a book we cannot see would report a stop for a position
         that is not there.
+
+        Timestamp and reserve-check arguments default to "leave the stored
+        value". Pass None to clear them. Clearing the txid clears the times
+        unless a caller passes a replacement.
         """
         if not status.strip():
             raise ValueError("native stop status must be non-empty")
@@ -672,11 +726,30 @@ class SQLitePositionStore:
         if stop_qty is not None and stop_qty <= 0:
             raise ValueError(f"stop qty must be > 0, got {stop_qty}")
         with self._write() as conn:
+            current = conn.execute(
+                "SELECT stop_fill_at, stop_placed_at, stop_confirmed_at, "
+                "reserve_check FROM positions "
+                "WHERE mode=? AND symbol=? AND strategy_id=?",
+                (_mode_value(mode), symbol, strategy_id),
+            ).fetchone()
+            if current is None:
+                raise LookupError(
+                    f"no {mode.value} position {symbol}/{strategy_id} to attach "
+                    "a native stop to"
+                )
+            clearing = txid is None
+            fill_at = _keep_or(current["stop_fill_at"], fill_at, clear=clearing)
+            placed_at = _keep_or(current["stop_placed_at"], placed_at, clear=clearing)
+            confirmed_at = _keep_or(
+                current["stop_confirmed_at"], confirmed_at, clear=clearing)
+            reserve_check = _keep_or(
+                current["reserve_check"], reserve_check, clear=clearing)
             cur = conn.execute(
                 """
                 UPDATE positions
                    SET stop_txid=?, stop_price=?, stop_qty=?, stop_status=?,
-                       updated_at=?
+                       stop_fill_at=?, stop_placed_at=?, stop_confirmed_at=?,
+                       reserve_check=?, updated_at=?
                  WHERE mode=? AND symbol=? AND strategy_id=?
                 """,
                 (
@@ -684,6 +757,11 @@ class SQLitePositionStore:
                     None if stop_price is None else str(stop_price),
                     None if stop_qty is None else str(stop_qty),
                     status,
+                    _opt_ts(fill_at),
+                    _opt_ts(placed_at),
+                    _opt_ts(confirmed_at),
+                    reserve_check if isinstance(reserve_check, str) or reserve_check is None
+                    else str(reserve_check),
                     _utc_text(self._now()),
                     _mode_value(mode), symbol, strategy_id,
                 ),
@@ -1038,6 +1116,9 @@ def _ensure_position_stop_columns(conn: sqlite3.Connection) -> None:
 
     ``CREATE TABLE IF NOT EXISTS`` does not alter a table that already
     exists, and a restart onto this build must not refuse to open the book.
+    Rows that already existed were written by ``apply``, so they are marked
+    ``engine_fill`` once, when the origin column is added. A later NULL is
+    not backfilled: that row was not created by this path.
     """
     present = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
     for name, decl in (
@@ -1045,15 +1126,33 @@ def _ensure_position_stop_columns(conn: sqlite3.Connection) -> None:
         ("stop_price", "TEXT"),
         ("stop_qty", "TEXT"),
         ("stop_status", "TEXT"),
+        ("stop_fill_at", "TEXT"),
+        ("stop_placed_at", "TEXT"),
+        ("stop_confirmed_at", "TEXT"),
+        ("reserve_check", "TEXT"),
     ):
         if name not in present:
             conn.execute(f"ALTER TABLE positions ADD COLUMN {name} {decl}")
+    if "origin" not in present:
+        conn.execute("ALTER TABLE positions ADD COLUMN origin TEXT")
+        conn.execute(
+            "UPDATE positions SET origin=? WHERE origin IS NULL",
+            (ORIGIN_ENGINE_FILL,),
+        )
+
+
+def _position_time(row: sqlite3.Row, key: str) -> Optional[dt.datetime]:
+    text = _row_text(row, key)
+    if text is None:
+        return None
+    return dt.datetime.fromisoformat(text)
 
 
 def _position_from_row(row: sqlite3.Row) -> Position:
     opened = row["opened_at"]
     price = _row_text(row, "stop_price")
     qty = _row_text(row, "stop_qty")
+    origin = _row_text(row, "origin")
     return Position(
         instrument=_instrument_from_row(row),
         qty=Decimal(row["qty"]),
@@ -1066,6 +1165,13 @@ def _position_from_row(row: sqlite3.Row) -> Position:
         stop_price=Decimal(price) if price is not None else None,
         stop_qty=Decimal(qty) if qty is not None else None,
         stop_status=_row_text(row, "stop_status"),
+        # NULL origin is not engine_fill. Only the migration of a pre-existing
+        # book, and apply() itself, write that token.
+        origin=origin if origin is not None else "",
+        stop_fill_at=_position_time(row, "stop_fill_at"),
+        stop_placed_at=_position_time(row, "stop_placed_at"),
+        stop_confirmed_at=_position_time(row, "stop_confirmed_at"),
+        reserve_check=_row_text(row, "reserve_check"),
     )
 
 
