@@ -64,6 +64,7 @@ from api import server as api_mod
 from core.gate import ClassLimits, GateConfig, OrderGate
 from core.profiles import IST
 from core.risk import DEFAULT_LIMITS, RiskCircuit
+import core.safety as safety_mod
 from core.store import SQLiteGateStateStore, SQLitePositionStore
 from core.types import AssetClass, Fill, Instrument, Mode, Side
 from engine import ClassWiring, Engine, EngineConfig, EventKind
@@ -1588,7 +1589,22 @@ def build_stack(config: Optional[RunnerConfig] = None,
         else None
     )
 
-    engine_config = EngineConfig(requested_mode=cfg.requested_mode)
+    under_test = "PYTEST_CURRENT_TEST" in os.environ
+    engine_config = EngineConfig(
+        requested_mode=cfg.requested_mode,
+        entry_heartbeat_max_age_s=safety_mod.env_float(
+            source, "HEARTBEAT_ENTRY_MAX_AGE_S", safety_mod.ENTRY_HEARTBEAT_MAX_AGE_S),
+        dead_heartbeat_s=safety_mod.env_float(
+            source, "HEARTBEAT_DEAD_S", safety_mod.DEAD_HEARTBEAT_S),
+        stop_confirm_s=safety_mod.env_float(
+            source, "NATIVE_STOP_CONFIRM_S", safety_mod.STOP_CONFIRM_S),
+        # On under pytest so a suite cannot os._exit or dial status.kraken.com.
+        # Production (no PYTEST_CURRENT_TEST) enables both unless the env says no.
+        watchdog_enabled=safety_mod.env_bool(
+            source, "HEARTBEAT_WATCHDOG", default=not under_test),
+        blackout_status_fetch=safety_mod.env_bool(
+            source, "KRAKEN_STATUS_BLACKOUT", default=not under_test),
+    )
 
     # Resolve each class's real mode with the ENGINE's own resolver, so this
     # file cannot invent a third opinion about what is armed.

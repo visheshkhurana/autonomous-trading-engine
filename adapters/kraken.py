@@ -45,6 +45,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from uuid import uuid4
 
+from core.safety import StopCancelResult, StopPlaceResult, key_freeze_active
 from core.types import (
     AssetClass, Fill, Instrument, Intent, Mode, OrderRef, OrderStatus,
     OrderType, Position, Side,
@@ -294,11 +295,15 @@ def _precision_digits(value: Any) -> Optional[int]:
 class KrakenAdapter:
     """BrokerAdapter for Kraken spot.
 
+    ``manages_native_stops`` tells the engine this adapter can rest an
+    exchange stop sized to the ledger quantity. The wallet is never the size.
+
     `exchange` is any object with the ccxt surface used here. It is injected so
     this class can be exercised without a venue and without credentials.
     """
 
     asset_class: AssetClass = AssetClass.CRYPTO
+    manages_native_stops: bool = True
 
     def __init__(
         self,
@@ -318,6 +323,7 @@ class KrakenAdapter:
         now: Callable[[], dt.datetime] = lambda: dt.datetime.now(UTC),
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        key_freeze: Optional[Callable[[], bool]] = None,
     ) -> None:
         # This class reaches a real venue. A PAPER stamp on a real fill is how a
         # live book gets recorded as paper and then traded against twice, so
@@ -348,6 +354,10 @@ class KrakenAdapter:
         self._now = now
         self._monotonic = monotonic
         self._sleep = sleep
+        # Default reads KEY_FREEZE / the freeze file on every call so a
+        # file dropped on the volume takes effect without rebuilding this
+        # object. Tests inject a lambda so they never touch the real path.
+        self._key_freeze = key_freeze if key_freeze is not None else key_freeze_active
         self._markets: Optional[dict[str, Any]] = None
         # Kraken needs the symbol to cancel, and the protocol's cancel() only gets
         # an id, so the mapping is kept here for orders this adapter placed.
@@ -817,6 +827,14 @@ class KrakenAdapter:
     # ---------------------------------------------------------------- placing
 
     def place(self, intent: Intent, timeout_s: float = 30.0) -> OrderRef:
+        if self._key_freeze():
+            # Before any private call, including the balance read a sell
+            # would otherwise make. A rejection is honest: nothing was sent.
+            return self._unplaced(
+                intent,
+                "key_freeze: private Kraken order calls are blocked; "
+                "native stops already on the exchange are left in place",
+            )
         if intent.instrument.asset_class is not AssetClass.CRYPTO:
             raise ValueError(
                 f"KrakenAdapter cannot place {intent.instrument.asset_class} orders"
@@ -1175,20 +1193,221 @@ class KrakenAdapter:
             error=detail,
         )
 
+    # --------------------------------------------------------- native stops
+
+    def free_base(self, instrument: Instrument) -> Optional[Decimal]:
+        """Spendable base, used only as a capacity check for overlapping stops.
+
+        The stop's size is never this number. A larger free balance (the
+        manual BTC that shares the account) must not become the order qty.
+        """
+        symbol = self.resolve_symbol(instrument)
+        if symbol is None:
+            return None
+        return self._free_base(symbol)
+
+    def place_native_stop(
+        self, instrument: Instrument, qty: Decimal, stop_price: Decimal,
+        timeout_s: float = 10.0,
+    ) -> StopPlaceResult:
+        """Rest a sell stop-loss for ``qty`` at ``stop_price``.
+
+        ``qty`` is the engine ledger size. This method does not read the
+        wallet to choose it. It then polls open orders until the txid is
+        visible or ``timeout_s`` elapses. Unconfirmed is not success: an
+        order id may still be returned so the caller can try to cancel it.
+        """
+        if qty <= 0 or stop_price <= 0:
+            return StopPlaceResult(False, None, qty, stop_price,
+                                   "stop qty and price must be > 0")
+        if self._key_freeze():
+            return StopPlaceResult(
+                False, None, qty, stop_price,
+                "key_freeze: not placing a native stop; existing stops stay",
+            )
+        symbol = self.resolve_symbol(instrument)
+        if symbol is None:
+            return StopPlaceResult(
+                False, None, qty, stop_price,
+                f"{instrument.symbol}: no active Kraken spot market",
+            )
+        try:
+            amount = self._quantize_amount(symbol, qty)
+            price = self._quantize_price(symbol, stop_price)
+        except Exception as exc:
+            return StopPlaceResult(False, None, qty, stop_price,
+                                   f"could not quantize stop: {exc!r}")
+        if amount <= 0 or price <= 0:
+            return StopPlaceResult(
+                False, None, amount, price,
+                f"stop quantized to amount {amount} price {price}",
+            )
+        # Deliberately not clip_spot_sell_qty. That helper is a ceiling for
+        # exits that would otherwise be rejected for insufficient funds. A
+        # stop sized from the free balance would sell the manual BTC that
+        # shares this account. If the ledger qty cannot be reserved, the
+        # order fails and the engine flattens the ledger qty.
+        try:
+            created = self._ex.create_order(
+                symbol, "stop-loss", "sell",
+                self._ccxt_decimal(amount), self._ccxt_decimal(price), {},
+            )
+        except Exception as exc:
+            return StopPlaceResult(
+                False, None, amount, price,
+                f"stop-loss create_order raised {exc!r}; the stop may or may "
+                "not exist. Not confirmed.",
+            )
+        txid = str(created.get("id") or "") if isinstance(created, dict) else ""
+        if not txid:
+            return StopPlaceResult(
+                False, None, amount, price,
+                f"stop-loss create_order returned no id ({created!r})",
+            )
+        self._order_symbols[txid] = symbol
+        if self._confirm_stop(symbol, txid, timeout_s):
+            return StopPlaceResult(True, txid, amount, price, "open")
+        return StopPlaceResult(
+            False, txid, amount, price,
+            f"stop {txid} was not visible on open orders within {timeout_s}s",
+        )
+
+    def _confirm_stop(self, symbol: str, txid: str, timeout_s: float) -> bool:
+        deadline = self._monotonic() + timeout_s
+        while True:
+            visible = self._stop_visible(symbol, txid)
+            if visible is True:
+                return True
+            if self._monotonic() >= deadline:
+                return False
+            self._sleep(self._poll_interval_s)
+
+    def _stop_visible(self, symbol: str, txid: str) -> Optional[bool]:
+        """True if the stop is resting, False if the book was readable and
+        the id was not on it, None if the book could not be read."""
+        try:
+            orders = self._ex.fetch_open_orders(symbol)
+        except Exception:
+            orders = None
+        if isinstance(orders, list):
+            for order in orders:
+                if isinstance(order, dict) and str(order.get("id") or "") == txid:
+                    return True
+        try:
+            order = self._ex.fetch_order(txid, symbol)
+        except Exception:
+            return None if not isinstance(orders, list) else False
+        if not isinstance(order, dict):
+            return None if not isinstance(orders, list) else False
+        status = str(order.get("status") or "").strip().lower()
+        if status in {"open", "pending", "new"}:
+            return True
+        if isinstance(orders, list):
+            return False
+        return None
+
+    def native_stop_open(self, txid: str, instrument: Instrument) -> Optional[bool]:
+        """True / False when the book answers, None when it does not.
+
+        None is not "missing". A blip must not be read as a cancelled stop.
+        """
+        if not txid:
+            return False
+        symbol = self.resolve_symbol(instrument)
+        if symbol is None:
+            return None
+        return self._stop_visible(symbol, txid)
+
+    def cancel_native_stop(self, txid: str, instrument: Instrument) -> StopCancelResult:
+        """Cancel a resting stop. If it already filled, return that fill.
+
+        The fill quantity is whatever the venue reports for the order we
+        placed (the ledger qty). Key freeze does not send the cancel.
+        """
+        if self._key_freeze():
+            return StopCancelResult(
+                "blocked",
+                reason="key_freeze: not cancelling the native stop",
+            )
+        symbol = self.resolve_symbol(instrument)
+        if symbol is None:
+            return StopCancelResult(
+                "unknown",
+                reason=f"{instrument.symbol}: no market, cannot cancel {txid}",
+            )
+        self._order_symbols.setdefault(txid, symbol)
+        cancel_error: Optional[BaseException] = None
+        try:
+            self._ex.cancel_order(txid, symbol)
+        except Exception as exc:
+            cancel_error = exc
+        try:
+            order = self._ex.fetch_order(txid, symbol)
+        except Exception as exc:
+            return StopCancelResult(
+                "unknown",
+                reason=(f"could not read stop {txid} after cancel: {exc!r}"
+                        + (f" (cancel raised {cancel_error!r})" if cancel_error else "")),
+            )
+        if not isinstance(order, dict):
+            return StopCancelResult("unknown", reason=f"stop {txid} read was not an order")
+        requested = _dec_opt(order.get("amount")) or Decimal("0")
+        status = self._map_status(order, requested)
+        filled = _dec_opt(order.get("filled")) or Decimal("0")
+        if status is OrderStatus.FILLED or (filled > 0 and status is OrderStatus.CANCELLED):
+            fill = self._stop_fill(instrument, txid, order, filled)
+            if fill is None:
+                return StopCancelResult(
+                    "unknown",
+                    reason=f"stop {txid} filled but the fill price was unreadable",
+                )
+            return StopCancelResult("filled", fill=fill, reason="stop already filled")
+        if status is OrderStatus.CANCELLED or status is OrderStatus.REJECTED:
+            return StopCancelResult("cancelled", reason="cancelled")
+        return StopCancelResult(
+            "still_open",
+            reason=f"stop {txid} still open after cancel"
+            + (f" ({cancel_error!r})" if cancel_error else ""),
+        )
+
+    def _stop_fill(self, instrument: Instrument, txid: str,
+                   order: Mapping[str, Any], filled: Decimal) -> Optional[Fill]:
+        if filled <= 0:
+            return None
+        price = _dec_opt(order.get("average"))
+        if price is None or price <= 0:
+            cost = _dec_opt(order.get("cost"))
+            if cost is not None and filled > 0:
+                price = cost / filled
+        if price is None or price <= 0:
+            return None
+        return Fill(
+            order_id=txid, instrument=instrument, side=Side.SELL,
+            qty=filled, price=price, fees=Decimal("0"),
+            at=self._timestamp(order) or self._now(), mode=self.mode,
+        )
+
     # --------------------------------------------------------------- cancelling
 
     def cancel(self, order_id: str) -> bool:
         """True only when Kraken confirms the order is cancelled.
 
+        A key freeze returns False without calling the venue. False here
+        means "not confirmed cancelled", which is also what a freeze is.
+
         False can mean 'still working' OR 'it filled before the cancel landed';
         those must not be conflated, so call cancel_detail() when the
         difference matters.
         """
+        if self._key_freeze():
+            return False
         return self.cancel_detail(order_id) is OrderStatus.CANCELLED
 
     def cancel_detail(self, order_id: str, symbol: Optional[str] = None) -> Optional[OrderStatus]:
         """The order's confirmed state after a cancel attempt. None means the
         venue still shows it working."""
+        if self._key_freeze():
+            return None
         symbol = symbol or self._order_symbols.get(order_id)
         if symbol is None:
             raise UnknownOrder(

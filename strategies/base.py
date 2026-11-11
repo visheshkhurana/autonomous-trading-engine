@@ -461,10 +461,20 @@ class StrategyBase:
             )
         return qty
 
+    def protective_stop(self, ctx: MarketContext, position: Position) -> Optional[Decimal]:
+        """Price of the exchange stop that should be resting for ``position``.
+
+        None means this strategy is not naming one (equity, or a bar set too
+        thin to recompute). The engine does not invent a price. A tighter
+        price than the one already resting is a trailing update.
+        """
+        return None
+
     def make_intent(self, *, instrument: Instrument, side: Side, qty: Decimal,
                     reason: str, decision_ts: dt.datetime, tag: str,
                     ref_price: Optional[Decimal],
-                    structure_id: Optional[str] = None) -> Intent:
+                    structure_id: Optional[str] = None,
+                    stop_price: Optional[Decimal] = None) -> Intent:
         """Order type comes from the asset-class profile, never from a literal
         here — NFO rejects MARKET outright, so equity intents are marketable
         LIMITs and crypto spot is MARKET.
@@ -504,6 +514,7 @@ class StrategyBase:
             limit_price=limit_price,
             structure_id=structure_id,
             idempotency_key=idempotency_key(self.id, instrument.symbol, decision_ts, side, tag),
+            stop_price=stop_price,
         )
 
     def finalize(self, intents: Sequence[Intent]) -> list[Intent]:

@@ -321,9 +321,27 @@ class CryptoMandateStrategy(StrategyBase):
         intent = self.make_intent(
             instrument=plan.instrument, side=plan.side, qty=qty,
             reason=card.reason_text(), decision_ts=self._decision_ts_from_plan(plan),
-            tag="entry", ref_price=plan.entry,
+            tag="entry", ref_price=plan.entry, stop_price=plan.stop,
         )
         return card, intent
+
+    def protective_stop(self, ctx, position):
+        """ATR stop floored by the hard fraction, from the position's own entry."""
+        if position.avg_price <= 0:
+            return None
+        try:
+            bars = self.bars_for(
+                ctx, position.instrument.symbol, min_bars=self.min_bars, must_have=False,
+            )
+        except Exception:
+            return None
+        floor = position.avg_price * (Decimal(1) - self.max_loss_pct)
+        if not bars:
+            return floor
+        vol = atr(bars, ATR_PERIOD)
+        if vol is None or vol <= 0:
+            return floor
+        return max(position.avg_price - ATR_STOP_MULT * vol, floor)
 
     def _decision_ts_from_plan(self, plan: TradePlan) -> dt.datetime:
         ts = plan.decision_ts
