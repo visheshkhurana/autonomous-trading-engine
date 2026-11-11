@@ -1979,7 +1979,7 @@ class _ClassRunner:
                     except Exception:
                         rows.append({"asset": asset, "reason": "unreadable_free"})
                         continue
-                    locked = await self._verified_stop_qty(asset, positions)
+                    locked = await self._engine_held(asset, positions)
                     if locked is None:
                         rows.append({"asset": asset, "reason": "unreadable_stops"})
                         continue
@@ -2247,23 +2247,22 @@ class _ClassRunner:
             free = await self._cached_free(position)
         if free is None:
             return None, None, None
-        locked = await self._verified_stop_qty(
-            base_asset(position.instrument.symbol))
+        locked = await self._engine_held(base_asset(position.instrument.symbol))
         if locked is None:
             return free, None, None
         return free, engine_spendable(free, reserved, locked), None
 
-    async def _verified_stop_qty(self, asset: str,
-                                 positions: Optional[Sequence[Position]] = None,
-                                 ) -> Optional[Decimal]:
-        """Open qty of this engine's stops on ``asset``.
+    async def _engine_held(self, asset: str,
+                           positions: Optional[Sequence[Position]] = None,
+                           ) -> Optional[Decimal]:
+        """How much of the venue hold is this engine's open stops.
 
-        None when the open-order book could not be read. Zero when the
-        venue does not lock stop funds, and zero for any order that is
-        not one of our stored txids sitting on the book.
+        ``held`` is total − free. ``engine_held`` is the min of that and
+        the qty of our own stops verified on the open book. None when the
+        book or the balance cannot be read and we would otherwise have to
+        guess. Zero when nothing of ours is open, even if someone else
+        has a hold.
         """
-        if not bool(getattr(self.adapter, "stops_lock_base", False)):
-            return Decimal("0")
         if positions is None:
             try:
                 positions = tuple(self.engine.store.positions(
@@ -2273,7 +2272,7 @@ class _ClassRunner:
                             "could not read positions to verify resting stops",
                             exc)
                 return None
-        total = Decimal("0")
+        open_qty = Decimal("0")
         for row in positions:
             if row.qty == 0 or base_asset(row.instrument.symbol) != asset:
                 continue
@@ -2283,8 +2282,43 @@ class _ClassRunner:
             if visible is None:
                 return None
             if visible:
-                total += row.stop_qty
-        return total
+                open_qty += row.stop_qty
+        if open_qty <= 0:
+            return Decimal("0")
+        held = await self._venue_held(asset)
+        if held is None:
+            return None
+        return open_qty if open_qty < held else held
+
+    async def _venue_held(self, asset: str) -> Optional[Decimal]:
+        """total − free for ``asset``. None if the adapter cannot say.
+
+        An adapter with no balance split reports 0 held, so a stop is not
+        added back. That is the 'venue does not lock' reading.
+        """
+        fn = getattr(self.adapter, "balance_maps", None)
+        if fn is None:
+            return Decimal("0")
+        try:
+            maps = await _offload(fn)
+        except Exception as exc:
+            self._error("native_stop",
+                        f"could not read held {asset}", exc)
+            return None
+        if not isinstance(maps, tuple) or len(maps) != 2:
+            return None
+        free_map, total_map = maps
+        if not isinstance(free_map, Mapping) or not isinstance(total_map, Mapping):
+            return None
+        try:
+            free = free_map.get(asset, ZERO)
+            free = free if isinstance(free, Decimal) else Decimal(str(free))
+            total = total_map.get(asset, free)
+            total = total if isinstance(total, Decimal) else Decimal(str(total))
+        except Exception:
+            return None
+        held = total - free
+        return held if held > 0 else Decimal("0")
 
     async def _publish_engine_stops(self, positions: Sequence[Position]) -> None:
         fn = getattr(self.adapter, "note_engine_stops", None)

@@ -64,14 +64,13 @@ class StopBook:
 
     manages_native_stops = True
     asset_class = AssetClass.CRYPTO
-    # This book does not lock stop funds inside `free`. Tests that model
-    # Kraken set the flag on the instance.
-    stops_lock_base = False
 
     def __init__(self, mode: Mode = Mode.PAPER, *, free: D = D("0.098"),
-                 wallet: D = D("0.088")) -> None:
+                 wallet: D = D("0.088"), total: Optional[D] = None) -> None:
         self.mode = mode
         self.free: Optional[D] = free
+        # None means total == free: the venue is not holding stop funds.
+        self.total: Optional[D] = total
         self.wallet = wallet  # must never become an order qty
         self.fill_at: Optional[dt.datetime] = None
         self.price = D("50000")
@@ -103,6 +102,13 @@ class StopBook:
 
     def free_base(self, instrument: Instrument) -> Optional[D]:
         return self.free
+
+    def balance_maps(self):
+        """(free, total) for BTC. total defaults to free when unset."""
+        if self.free is None:
+            return None
+        total = self.free if self.total is None else self.total
+        return ({"BTC": self.free}, {"BTC": total})
 
     def place(self, intent: Intent, timeout_s: float = 30.0) -> OrderRef:
         self.log.append(("place", intent.side.value, intent.qty, intent.instrument.symbol))
@@ -1556,9 +1562,11 @@ def test_enabling_reserved_exclusion_rebases_the_high_water_once(tmp_path, caplo
         assert row["high_water"] == "38000"
         assert row["equity_basis"] == "engine_only"
         audit = json.loads(row["hwm_rebase_json"])
-        assert audit["old_high_water"] == "100000"
-        assert audit["new_high_water"] == "38000"
-        assert "rebased once" in caplog.text
+        assert audit[0]["from_basis"] == "full"
+        assert audit[0]["to_basis"] == "engine_only"
+        assert audit[0]["old_high_water"] == "100000"
+        assert audit[0]["new_high_water"] == "38000"
+        assert "rebased on reserve-exclusion transition" in caplog.text
         # A later dip uses the rebased mark. It does not rebase again.
         later = circuit.advance(AssetClass.CRYPTO, D("37000"), "engine_only")
         kept = store.read_risk_state(Mode.PAPER, AssetClass.CRYPTO)
@@ -1571,6 +1579,41 @@ def test_enabling_reserved_exclusion_rebases_the_high_water_once(tmp_path, caplo
         live = store.read_risk_state(Mode.LIVE, AssetClass.CRYPTO)
         assert live is not None and live["high_water"] == "100000"
         assert live["equity_basis"] == "full"
+    finally:
+        store.close()
+
+
+def test_hwm_rebases_on_every_reserve_exclusion_transition(tmp_path):
+    store = SQLitePositionStore(str(tmp_path / "toggle.db"))
+    try:
+        circuit = RiskCircuit(store, Mode.PAPER, clock=lambda: WHEN)
+        full = D("100000")
+        engine_only = D("38000")
+        circuit.advance(AssetClass.CRYPTO, full, "full")
+        on = circuit.advance(AssetClass.CRYPTO, engine_only, "engine_only")
+        assert on.drawdown_pct == D("0")
+        off = circuit.advance(AssetClass.CRYPTO, full, "full")
+        assert off.drawdown_pct == D("0")
+        again = circuit.advance(AssetClass.CRYPTO, engine_only, "engine_only")
+        assert again.drawdown_pct == D("0")
+        row = store.read_risk_state(Mode.PAPER, AssetClass.CRYPTO)
+        assert row is not None
+        assert row["high_water"] == "38000"
+        assert row["equity_basis"] == "engine_only"
+        audit = json.loads(row["hwm_rebase_json"])
+        assert [item["to_basis"] for item in audit] == [
+            "engine_only", "full", "engine_only",
+        ]
+        assert audit[0]["old_high_water"] == "100000"
+        assert audit[1]["old_high_water"] == "38000"
+        assert audit[1]["new_high_water"] == "100000"
+        assert audit[2]["new_high_water"] == "38000"
+        # Same basis again: the mark is not rewritten just because equity moved.
+        dipped = circuit.advance(AssetClass.CRYPTO, D("37000"), "engine_only")
+        kept = store.read_risk_state(Mode.PAPER, AssetClass.CRYPTO)
+        assert kept is not None and kept["high_water"] == "38000"
+        assert len(json.loads(kept["hwm_rebase_json"])) == 3
+        assert dipped.drawdown_pct == (D("38000") - D("37000")) / D("38000")
     finally:
         store.close()
 
@@ -1638,34 +1681,34 @@ def test_unconfirmed_replacement_that_cannot_be_cancelled_does_not_sell(tmp_path
         store.close()
 
 
-def test_reconcile_and_recheck_match_whether_or_not_stops_lock_funds(tmp_path):
-    """Held: free excludes the resting stop. Not held: free already includes it."""
-    # Not held. free == ledger. Adding the stop qty would false-mismatch.
+def test_reconcile_when_the_venue_does_not_hold_stop_funds(tmp_path):
+    """total == free, so the resting stop is not added back."""
     plain = _ReconBook(free=D("0.01"))
-    assert plain.stops_lock_base is False
+    assert plain.total is None
     strategy = NamingStrategy([_buy()], stop=D("48000"))
     engine, store, _clock = _engine(tmp_path, plain, strategy)
     try:
         _tick(engine)
-        assert engine._runners[AssetClass.CRYPTO]._entry_halt_reason != "ledger_mismatch"
         assert len(plain.stops) == 1
         strategy.intents = []
         _tick(engine)
-        assert engine._runners[AssetClass.CRYPTO]._ledger_mismatch is None
+        runner = engine._runners[AssetClass.CRYPTO]
+        assert runner._ledger_mismatch is None
+        assert runner._entry_halt_reason != "ledger_mismatch"
         assert not any(row[0] == "cancel" for row in plain.log)
     finally:
         store.close()
 
 
-def test_held_stop_funds_are_added_back_for_reconcile_and_recheck(tmp_path):
-    book = _ReconBook(free=D("0.01"))
-    book.stops_lock_base = True
+def test_reconcile_when_the_venue_holds_stop_funds(tmp_path):
+    book = _ReconBook(free=D("0.01"), total=D("0.01"))
     strategy = NamingStrategy([_buy()], stop=D("48000"))
     engine, store, _clock = _engine(tmp_path, book, strategy)
     try:
         _tick(engine)
-        # Venue moved the position into the stop. free no longer includes it.
+        # The stop now locks the whole position: free is 0, total is the stop.
         book.free = D("0")
+        book.total = D("0.01")
         strategy.intents = []
         strategy.stop = D("48000")
         _tick(engine)
@@ -1674,9 +1717,55 @@ def test_held_stop_funds_are_added_back_for_reconcile_and_recheck(tmp_path):
         assert runner._entry_halt_reason != "ledger_mismatch"
         assert len(book.stops) == 1
         assert not any(row[0] == "place" and row[1] == "sell" for row in book.log)
-        # A foreign-sized free shortfall that the stop does not explain still clips.
-        # free 0 and stop 0.01 is explained. Drop the stop qty by shrinking free
-        # below zero is impossible; raise the reserve instead via env on a new tick.
+    finally:
+        store.close()
+
+
+def test_a_non_engine_hold_is_not_treated_as_spendable(tmp_path):
+    book = _ReconBook(free=D("0.01"), total=D("0.01"))
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        # Ours locks 0.01. Someone else locks another 0.05. free is 0.
+        book.free = D("0")
+        book.total = D("0.06")
+        strategy.intents = []
+        strategy.stop = D("48000")
+        _tick(engine)
+        runner = engine._runners[AssetClass.CRYPTO]
+        assert runner._ledger_mismatch is None
+        assert len(book.stops) == 1
+        position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        assert position.stop_qty == D("0.01")
+    finally:
+        store.close()
+
+
+def test_selling_part_of_the_reserve_reclips_the_resting_stop(tmp_path):
+    reserved = D("0.088")
+    ledger = D("0.01")
+    book = _ReconBook(free=reserved + ledger, total=reserved + ledger)
+    strategy = NamingStrategy([_buy(qty=str(ledger))], stop=D("48000"))
+    engine, store, _clock = _engine(
+        tmp_path, book, strategy,
+        env={"MANUAL_RESERVED_BASE": f"BTC:{reserved}"},
+    )
+    try:
+        _tick(engine)
+        assert len(book.stops) == 1
+        # Vishesh sells 0.003 of the reserve. The engine stop still locks
+        # the 0.01, so free falls by 0.003 and total falls by the same.
+        book.free = reserved + ledger - D("0.003") - ledger
+        book.total = book.free + ledger
+        strategy.intents = []
+        strategy.stop = D("48000")
+        _tick(engine)
+        stops = [row for row in book.log if row[0] == "stop"]
+        assert stops[-1][1] == D("0.007")
+        position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        assert position.stop_qty == D("0.007")
+        assert position.qty == D("0.007")
     finally:
         store.close()
 
@@ -1717,7 +1806,7 @@ def test_trade_level_base_fee_shrinks_the_cached_balance_once():
     assert adapter._cached_amount("BTC") == D("0.088") + D("1") - D("0.004")
 
 
-def test_sell_cap_adds_only_our_open_stop(tmp_path):
+def test_sell_cap_does_not_add_back_the_resting_stop(tmp_path):
     reserved = D("0.088")
     ex = FakeExchange(
         {"BTC/USDT": spot("BTC/USDT", amount_step="0.00000001", price_step="0.1",
@@ -1756,11 +1845,10 @@ def test_sell_cap_adds_only_our_open_stop(tmp_path):
         limit_price=D("100000"), idempotency_key="sell-cap",
     )
     ref = adapter.place(sell)
-    assert ref.status is OrderStatus.FILLED
-    sent = D(str(ex.create_calls[0][3]))
-    # free is only the reserve. Our open stop of 0.01 is added back. Theirs is not.
-    assert sent == D("0.01")
-    assert sent != D("0.06")
+    # free is only the reserve. The resting stop is not added back, so
+    # there is nothing this sell may send.
+    assert ref.status is not OrderStatus.FILLED
+    assert ex.create_calls == []
 
 
 def test_fill_age_is_subtracted_from_the_stop_budget_once(tmp_path):

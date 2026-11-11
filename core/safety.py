@@ -196,11 +196,9 @@ def engine_spendable(
 ) -> Optional[Decimal]:
     """Coins the engine may use: free, plus its own open stops, minus reserve.
 
-    Kraken spot takes the base quantity out of ``free`` while a stop-loss
-    rests. ``locked_stop_qty`` is only the engine's own stops whose txids
-    are on the open-order book. Pass 0 when the venue does not lock stop
-    funds, or when those stops are not open. Orders the engine did not
-    place are never included.
+    ``locked_stop_qty`` is ``min(our open stop qty, total − free)``. That is
+    zero when the venue does not lock stops (total == free) and it never
+    includes another order's hold. Market sells do not use this add-back.
     """
     if locked_stop_qty < 0:
         locked_stop_qty = Decimal("0")
