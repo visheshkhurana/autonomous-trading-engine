@@ -90,9 +90,10 @@ from core.gate import _ARM_ENV as ARM_ENV
 from core.gate import _parse_arm_flag as _parse_arm_flag
 from core.profiles import AssetClassProfile, profile_for
 from core.safety import (
-    REASON_STOP, BlackoutWindow, StopPlaceResult, blackout_active,
-    entry_block_reason, fetch_status_windows, key_freeze_active,
-    load_configured_windows,
+    REASON_STOP, BlackoutWindow, ManualReservedError, StopPlaceResult,
+    base_asset, blackout_active, entry_block_reason, fetch_status_windows,
+    key_freeze_active, load_configured_windows, non_reserved_free,
+    overlap_stops_allowed, reserved_for, stop_qty_for_ledger,
 )
 from core.protocols import (
     BrokerAdapter, OrderGateProto, PositionStoreProto, RiskCircuitProto,
@@ -1720,19 +1721,41 @@ class _ClassRunner:
         tighter = position.stop_price is None or new_price > position.stop_price
         resized = (position.stop_qty is None
                    or abs(position.qty) != position.stop_qty)
-        if not resized and not tighter:
-            return False
         # Never loosen a resting stop. A wider ATR is the strategy's floor
-        # problem; the exchange stop stays at the tighter price.
+        # problem; the exchange stop stays at the tighter price. Whether a
+        # fee clip is required is decided after free balance is read.
         price = new_price if tighter else position.stop_price
         if price is None:
             return False
-        qty = abs(position.qty)
+        ledger = abs(position.qty)
+        try:
+            reserved = self._reserved_base(position)
+        except ManualReservedError as exc:
+            self._error("native_stop",
+                        f"MANUAL_RESERVED_BASE is unreadable: {exc}", exc)
+            self._set_entry_halt(REASON_STOP)
+            return True
         free = await self._free_base(position)
-        can_overlap = free is not None and free >= qty
+        available = non_reserved_free(free, reserved)
+        target, decision = stop_qty_for_ledger(ledger, available)
+        if decision == "halt":
+            await self._fail_unprotected(
+                position, ctx,
+                f"non-reserved free {available} is more than 2% under "
+                f"ledger qty {ledger}")
+            return True
+        needs_clip = decision == "clip" and position.stop_qty != target
+        if not tighter and not resized and not needs_clip:
+            return False
+        old_qty = position.stop_qty if position.stop_qty is not None else ledger
         old_txid = position.stop_txid
+        can_overlap = bool(old_txid) and overlap_stops_allowed(
+            free=free, reserved=reserved, old_qty=old_qty, new_qty=target,
+            ledger_qty=ledger,
+        )
         if can_overlap and old_txid:
-            result = await self._submit_stop(position, price, write=False)
+            result = await self._submit_stop(
+                position, price, write=False, qty=target)
             if result is None or not result.ok or not result.txid:
                 self._error(
                     "native_stop",
@@ -1761,13 +1784,62 @@ class _ClassRunner:
                     "stop to replace it; leaving the existing stop",
                     None, {"txid": old_txid})
                 return False
-        result = await self._submit_stop(position, price, write=True)
+            # The venue stop is gone. Drop the txid before the new place so a
+            # failed replacement can flatten without trying to cancel an id
+            # that no longer exists.
+            try:
+                await self._write_stop(position, None, None, None, "cancelled")
+            except Exception as exc:
+                self._error("native_stop",
+                            "cancelled stop txid could not be cleared", exc)
+        result = await self._submit_stop(position, price, write=True, qty=target)
         if result is None or not result.ok:
             await self._fail_unprotected(
                 position, ctx,
                 "stop replace left the position without a confirmed stop")
             return True
         return False
+
+    def _reserved_base(self, position: Position) -> Decimal:
+        return reserved_for(
+            self.engine.safety_env, base_asset(position.instrument.symbol))
+
+    async def _sync_ledger_qty(self, position: Position,
+                               target: Decimal) -> Optional[Position]:
+        """Write the fee-in-base gap off the book so qty matches the stop.
+
+        The write-off is a sell at the position's own average, so realised
+        P&L on the gap is zero. It is not a venue order and it does not
+        touch the reserved manual balance.
+        """
+        gap = abs(position.qty) - target
+        if gap <= 0:
+            return position
+        if position.avg_price <= 0:
+            self._error("native_stop",
+                        f"{position.instrument.symbol} has no average price; "
+                        "cannot sync the ledger to the clipped stop", None)
+            return None
+        self._writeoff_seq = getattr(self, "_writeoff_seq", 0) + 1
+        fill = Fill(
+            order_id=(f"fee-base-writeoff:{self._writeoff_seq}:"
+                      f"{position.instrument.symbol}"),
+            instrument=position.instrument,
+            side=Side.SELL if position.qty > 0 else Side.BUY,
+            qty=gap, price=position.avg_price, fees=ZERO,
+            at=self.engine.now(), mode=self.mode,
+        )
+        await self._apply_external_fill(
+            position, fill,
+            reason="fee-in-base write-off; ledger synced to the stop qty")
+        synced = self._ledger_position(position.instrument.symbol, position.strategy_id)
+        if synced is None or abs(synced.qty) != target:
+            # apply() nets exactly; a miss means the write did not land.
+            self._error("native_stop",
+                        f"ledger for {position.instrument.symbol} did not "
+                        f"sync to {target}", None)
+            return None
+        return synced
 
     async def _free_base(self, position: Position) -> Optional[Decimal]:
         fn = getattr(self.adapter, "free_base", None)
@@ -1786,11 +1858,33 @@ class _ClassRunner:
         return free
 
     async def _submit_stop(self, position: Position, price: Decimal,
-                           *, write: bool = True) -> Optional[StopPlaceResult]:
+                           *, write: bool = True,
+                           qty: Optional[Decimal] = None) -> Optional[StopPlaceResult]:
         fn = getattr(self.adapter, "place_native_stop", None)
         if fn is None:
             return None
-        qty = abs(position.qty)
+        ledger = abs(position.qty)
+        if qty is None:
+            try:
+                reserved = self._reserved_base(position)
+            except ManualReservedError as exc:
+                return StopPlaceResult(
+                    False, None, ledger, price,
+                    f"MANUAL_RESERVED_BASE unreadable: {exc}")
+            free = await self._free_base(position)
+            available = non_reserved_free(free, reserved)
+            qty, decision = stop_qty_for_ledger(ledger, available)
+            if decision == "halt":
+                return StopPlaceResult(
+                    False, None, qty, price,
+                    "non-reserved free short of ledger by more than 2%")
+        if qty < ledger:
+            synced = await self._sync_ledger_qty(position, qty)
+            if synced is None:
+                return StopPlaceResult(
+                    False, None, qty, price,
+                    "could not sync the ledger down to the clipped stop qty")
+            position = synced
         try:
             result = await _offload(
                 fn, position.instrument, qty, price,
@@ -1830,7 +1924,9 @@ class _ClassRunner:
             _persist_native_stop, fn, self.mode, position.instrument.symbol,
             position.strategy_id, txid, price, qty, status)
 
-    async def _apply_external_fill(self, position: Position, fill: Fill) -> None:
+    async def _apply_external_fill(self, position: Position, fill: Fill,
+                                  *, reason: str = "native exchange stop filled",
+                                  ) -> None:
         """Book a stop that filled at the venue before our own exit did.
 
         Qty is capped at the ledger position. A fill larger than the book
@@ -1851,7 +1947,7 @@ class _ClassRunner:
         intent = Intent(
             instrument=position.instrument, side=fill.side, qty=qty,
             order_type=OrderType.MARKET, strategy_id=position.strategy_id,
-            reason="native exchange stop filled",
+            reason=reason,
             limit_price=fill.price, structure_id=position.structure_id,
             idempotency_key=f"native-stop-fill:{fill.order_id}",
         )

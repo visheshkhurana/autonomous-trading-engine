@@ -187,15 +187,20 @@ using.
 
 After a live crypto entry fills, the engine rests a Kraken `stop-loss` sell
 for the **ledger** quantity at the strategy's stop, and stores the txid on
-the position row. The wallet is not a size: a manual BTC balance on the
-same account is not an engine position and is not sold. The stop must show
-up on open orders within `NATIVE_STOP_CONFIRM_S` (default 10). If it does
-not, that position is market-flattened and new entries halt with
-`native_stop_unconfirmed`. An engine exit cancels the resting stop first.
-A trailing update places the new stop before cancelling the old one when
-free balance can hold both, and never widens a resting stop. On startup an
-open live position is not traded until its stop is confirmed. Paper
-simulates the same sequence.
+the position row. The wallet is not a size. `MANUAL_RESERVED_BASE`
+(default empty, for example `BTC:0.0880257350`) is subtracted from free
+balance for every engine order, so that manual stack cannot fund a sell or
+a stop. A second stop is placed before the old one is cancelled only when
+free balance minus the reserve covers **both** stops and their sum does not
+exceed the ledger qty; otherwise the old stop is cancelled first. If that
+new stop does not confirm, the position is flattened and new entries halt.
+A fee taken in the base asset that leaves non-reserved free within 2% of
+the ledger clips the stop down to the available qty and writes the gap off
+the ledger. A larger shortfall flattens and halts. The stop must show up
+on open orders within `NATIVE_STOP_CONFIRM_S` (default 10). An engine exit
+cancels the resting stop first. A trailing update never widens a resting
+stop. On startup an open live position is not traded until its stop is
+confirmed. Paper simulates the same sequence.
 
 ### Stale heartbeat
 

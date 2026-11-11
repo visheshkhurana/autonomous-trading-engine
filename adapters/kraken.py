@@ -39,13 +39,18 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import os
 import time
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from uuid import uuid4
 
-from core.safety import StopCancelResult, StopPlaceResult, key_freeze_active
+from core.safety import (
+    STOP_FEE_CLIP_LIMIT, ManualReservedError, StopCancelResult, StopPlaceResult,
+    base_asset, key_freeze_active, non_reserved_free, parse_manual_reserved,
+    stop_qty_for_ledger,
+)
 from core.types import (
     AssetClass, Fill, Instrument, Intent, Mode, OrderRef, OrderStatus,
     OrderType, Position, Side,
@@ -324,6 +329,7 @@ class KrakenAdapter:
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         key_freeze: Optional[Callable[[], bool]] = None,
+        manual_reserved: Optional[str] = None,
     ) -> None:
         # This class reaches a real venue. A PAPER stamp on a real fill is how a
         # live book gets recorded as paper and then traded against twice, so
@@ -358,6 +364,10 @@ class KrakenAdapter:
         # file dropped on the volume takes effect without rebuilding this
         # object. Tests inject a lambda so they never touch the real path.
         self._key_freeze = key_freeze if key_freeze is not None else key_freeze_active
+        # None reads MANUAL_RESERVED_BASE from the process environment on
+        # every order, so the reserve can be set without rebuilding the
+        # adapter. A string is an explicit override (tests).
+        self._manual_reserved_raw = manual_reserved
         self._markets: Optional[dict[str, Any]] = None
         # Kraken needs the symbol to cancel, and the protocol's cancel() only gets
         # an id, so the mapping is kept here for orders this adapter placed.
@@ -528,6 +538,22 @@ class KrakenAdapter:
         if amount < 0:
             return None
         return amount
+
+    def _reserved_base(self, symbol: str) -> Decimal:
+        """Manual balance that must not fund an engine order in this base."""
+        if self._manual_reserved_raw is None:
+            raw = os.environ.get("MANUAL_RESERVED_BASE", "")
+        else:
+            raw = self._manual_reserved_raw
+        table = parse_manual_reserved(raw)
+        return table.get(base_asset(self._base_of(symbol)), Decimal("0"))
+
+    def _spendable_base(self, symbol: str) -> Optional[Decimal]:
+        """Free base after the manual reserve. None if free cannot be read."""
+        free = self._free_base(symbol)
+        if free is None:
+            return None
+        return non_reserved_free(free, self._reserved_base(symbol))
 
     def _is_unplaceable_spot_qty(
         self, symbol: str, qty: Decimal, price: Decimal, instrument: Instrument,
@@ -911,6 +937,13 @@ class KrakenAdapter:
         if intent.side is Side.SELL:
             try:
                 free = self._free_base(symbol)
+                reserved = self._reserved_base(symbol)
+            except ManualReservedError as exc:
+                return self._unplaced(
+                    intent,
+                    f"MANUAL_RESERVED_BASE is unreadable ({exc}); refusing to "
+                    "sell, the manual balance must not be spendable",
+                )
             except Exception as exc:
                 return self._unplaced(
                     intent,
@@ -924,15 +957,23 @@ class KrakenAdapter:
                     f"venue free {self._base_of(symbol)} is unreadable; "
                     "refusing to send a spot sell of book qty (Kraken insufficient-funds)",
                 )
+            spendable = non_reserved_free(free, reserved)
+            if spendable is None:
+                return self._unplaced(
+                    intent,
+                    f"spendable {self._base_of(symbol)} is unreadable after "
+                    "the manual reserve",
+                )
             try:
-                sellable = self._quantize_amount(symbol, free)
+                sellable = self._quantize_amount(symbol, spendable)
             except MarketsUnavailable as exc:
                 return self._unplaced(intent, str(exc))
             clipped = clip_spot_sell_qty(amount, sellable)
             if clipped < amount:
                 clip_note = (
                     f"sell qty clipped from {amount} to {clipped} "
-                    f"(venue free {self._base_of(symbol)}={free})"
+                    f"(venue free {self._base_of(symbol)}={free}"
+                    f", reserved {reserved}, spendable {spendable})"
                 )
                 amount = clipped
             if amount <= 0:
@@ -1242,11 +1283,40 @@ class KrakenAdapter:
                 False, None, amount, price,
                 f"stop quantized to amount {amount} price {price}",
             )
-        # Deliberately not clip_spot_sell_qty. That helper is a ceiling for
-        # exits that would otherwise be rejected for insufficient funds. A
-        # stop sized from the free balance would sell the manual BTC that
-        # shares this account. If the ledger qty cannot be reserved, the
-        # order fails and the engine flattens the ledger qty.
+        # Free balance includes the manual reserve. A stop may use only what
+        # is left after that reserve. A fee-sized gap is clipped; a wider
+        # gap is not sent (the engine flattens). Unknown free keeps the
+        # requested ledger qty — the wallet is still not the size.
+        try:
+            spendable = self._spendable_base(symbol)
+        except ManualReservedError as exc:
+            return StopPlaceResult(
+                False, None, qty, stop_price,
+                f"MANUAL_RESERVED_BASE unreadable: {exc}",
+            )
+        except Exception:
+            spendable = None
+        if spendable is not None:
+            sized, decision = stop_qty_for_ledger(qty, spendable)
+            if decision == "halt":
+                return StopPlaceResult(
+                    False, None, qty, stop_price,
+                    f"non-reserved free {spendable} is more than "
+                    f"{STOP_FEE_CLIP_LIMIT * 100}% under ledger qty {qty}",
+                )
+            if decision == "clip":
+                try:
+                    amount = self._quantize_amount(symbol, sized)
+                except Exception as exc:
+                    return StopPlaceResult(
+                        False, None, sized, price,
+                        f"could not quantize clipped stop: {exc!r}",
+                    )
+                if amount <= 0:
+                    return StopPlaceResult(
+                        False, None, amount, price,
+                        "clipped stop quantized to 0",
+                    )
         try:
             created = self._ex.create_order(
                 symbol, "stop-loss", "sell",

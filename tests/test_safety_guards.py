@@ -21,7 +21,7 @@ from core.gate import ClassLimits, GateConfig, OrderGate
 from core.risk import RiskCircuit
 from core.safety import (
     fetch_status_windows, key_freeze_active, load_configured_windows,
-    windows_from_status_payload,
+    overlap_stops_allowed, stop_qty_for_ledger, windows_from_status_payload,
 )
 from core.store import SQLitePositionStore
 from core.types import (
@@ -74,6 +74,9 @@ class StopBook:
         self._n = 0
         self.timeouts: list[float] = []
         self.filled_on_cancel = False
+        self.fail_next = False
+        # Sum of qtys if a new stop is placed while another is still open.
+        self.concurrent: list[D] = []
 
     def equity(self) -> D:
         return D("100000")
@@ -107,6 +110,11 @@ class StopBook:
         from core.safety import StopPlaceResult
         self.timeouts.append(timeout_s)
         self.log.append(("stop", qty, stop_price, instrument.symbol))
+        if self.stops:
+            self.concurrent.append(sum(q for q, _ in self.stops.values()) + qty)
+        if self.fail_next:
+            self.fail_next = False
+            return StopPlaceResult(False, None, qty, stop_price, "rejected")
         if self.fail_stop:
             return StopPlaceResult(False, None, qty, stop_price, "not on open orders")
         self._n += 1
@@ -317,7 +325,9 @@ def test_a_stop_that_already_filled_is_not_sold_again(tmp_path):
         store.close()
 
 
-def test_a_tighter_stop_is_placed_before_the_old_one_is_cancelled_when_qty_allows(tmp_path):
+def test_a_full_size_replace_cancels_before_placing_so_two_stops_never_rest(tmp_path):
+    """Two ledger-sized stops would be 2x the book. That is not allowed,
+    even when raw free balance looks large enough to hold both."""
     book = StopBook(free=D("0.098"), wallet=D("0.088"))
     strategy = NamingStrategy([_buy()], stop=D("48000"))
     engine, store, _clock = _engine(tmp_path, book, strategy)
@@ -326,15 +336,14 @@ def test_a_tighter_stop_is_placed_before_the_old_one_is_cancelled_when_qty_allow
         strategy.intents = []
         strategy.stop = D("49000")
         _tick(engine)
-        # After the original stop, the next stop op is a place, then a cancel.
         tail = book.log[book.log.index(("stop", D("0.01"), D("48000"), "BTC/USDT")) + 1:]
-        assert tail[0][0] == "stop"
-        assert tail[0][1] == D("0.01")
-        assert tail[0][1] != book.wallet
-        assert tail[1][0] == "cancel"
+        assert tail[0][0] == "cancel"
+        assert tail[1] == ("stop", D("0.01"), D("49000"), "BTC/USDT")
+        assert book.concurrent == []
         position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
         assert position.stop_price == D("49000")
         assert position.qty == D("0.01")
+        assert len(book.stops) == 1
     finally:
         store.close()
 
@@ -353,6 +362,107 @@ def test_startup_without_a_native_stop_flattens_a_live_position(tmp_path):
         assert sells and sells[0][2] == D("0.01")
         assert sells[0][2] != book.wallet
         assert store.positions(Mode.LIVE, AssetClass.CRYPTO) == []
+    finally:
+        store.close()
+
+
+def test_manual_reserve_blocks_a_second_stop_funded_by_that_balance(tmp_path):
+    """free = reserve + ledger. Non-reserved free equals the ledger, so two
+    simultaneous stops (2x ledger) cannot be funded without the manual BTC.
+    """
+    reserved = D("0.0880257350")
+    ledger = D("0.01")
+    book = StopBook(free=reserved + ledger, wallet=reserved)
+    strategy = NamingStrategy([_buy(qty=str(ledger))], stop=D("48000"))
+    engine, store, _clock = _engine(
+        tmp_path, book, strategy,
+        env={"MANUAL_RESERVED_BASE": f"BTC:{reserved}"},
+    )
+    try:
+        _tick(engine)
+        assert book.stops
+        strategy.intents = []
+        strategy.stop = D("49000")
+        _tick(engine)
+        assert book.concurrent == [], (
+            "a second stop must not rest while the first still claims the ledger"
+        )
+        kinds = [row[0] for row in book.log]
+        cancel_at = kinds.index("cancel")
+        second_stop = max(i for i, row in enumerate(book.log) if row[0] == "stop")
+        assert cancel_at < second_stop
+        open_qty = sum(q for q, _ in book.stops.values())
+        non_reserved = book.free - reserved
+        assert open_qty <= ledger
+        assert open_qty <= non_reserved
+        assert open_qty != reserved
+        assert len(book.stops) == 1
+    finally:
+        store.close()
+
+
+def test_a_fee_sized_shortfall_clips_the_stop_and_syncs_the_ledger(tmp_path):
+    reserved = D("0.0880257350")
+    ledger = D("0.01")
+    # 1% of the ledger is gone to a base-asset fee. Non-reserved free is short
+    # by less than 2%, so the stop shrinks instead of flattening.
+    book = StopBook(free=reserved + ledger * D("0.99"), wallet=reserved)
+    strategy = NamingStrategy([_buy(qty=str(ledger))], stop=D("48000"))
+    engine, store, _clock = _engine(
+        tmp_path, book, strategy,
+        env={"MANUAL_RESERVED_BASE": f"BTC:{reserved}"},
+    )
+    try:
+        _tick(engine)
+        clipped = ledger * D("0.99")
+        stops = [row for row in book.log if row[0] == "stop"]
+        assert stops[-1][1] == clipped
+        assert not any(row[0] == "place" and row[1] == "sell" for row in book.log)
+        position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        assert position.qty == clipped
+        assert position.stop_qty == clipped
+        assert position.stop_status == "open"
+    finally:
+        store.close()
+
+
+def test_a_shortfall_over_two_percent_flattens_and_halts(tmp_path):
+    reserved = D("0.0880257350")
+    ledger = D("0.01")
+    book = StopBook(free=reserved + ledger * D("0.97"), wallet=reserved)
+    strategy = NamingStrategy([_buy(qty=str(ledger))], stop=D("48000"))
+    engine, store, _clock = _engine(
+        tmp_path, book, strategy,
+        env={"MANUAL_RESERVED_BASE": f"BTC:{reserved}"},
+    )
+    try:
+        _tick(engine)
+        sells = [row for row in book.log if row[0] == "place" and row[1] == "sell"]
+        assert sells and sells[0][2] == ledger
+        assert store.positions(Mode.PAPER, AssetClass.CRYPTO) == []
+        strategy.intents = [_buy(qty=str(ledger), key="k2")]
+        _tick(engine)
+        reasons = [e.data.get("reason") for e in _rejections(engine)]
+        assert "native_stop_unconfirmed" in reasons
+    finally:
+        store.close()
+
+
+def test_replace_that_cannot_place_the_new_stop_flattens_and_halts(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        book.fail_next = True
+        strategy.intents = []
+        strategy.stop = D("49000")
+        _tick(engine)
+        kinds = [row[0] for row in book.log]
+        assert kinds.index("cancel") < len(kinds) - 1
+        sells = [row for row in book.log if row[0] == "place" and row[1] == "sell"]
+        assert sells and sells[-1][2] == D("0.01")
+        assert store.positions(Mode.PAPER, AssetClass.CRYPTO) == []
     finally:
         store.close()
 
@@ -591,6 +701,87 @@ def test_status_page_windows_are_padded_and_a_failed_fetch_adds_none():
     fetched, error = fetch_status_windows(opener=lambda url: (_ for _ in ()).throw(RuntimeError("down")))
     assert fetched == []
     assert error
+
+
+def test_two_stops_cannot_exceed_ledger_qty_from_non_reserved_balance():
+    reserved = D("0.0880257350")
+    ledger = D("0.001")
+    # Wallet is the manual stack plus the engine position. Non-reserved
+    # free is exactly the ledger, which cannot fund two ledger-sized stops.
+    free = reserved + ledger
+    assert overlap_stops_allowed(
+        free=free, reserved=reserved, old_qty=ledger, new_qty=ledger,
+        ledger_qty=ledger,
+    ) is False
+    # Even a fat non-reserved balance cannot justify two stops whose sum
+    # is larger than the ledger. The extra coins are not this position.
+    assert overlap_stops_allowed(
+        free=reserved + ledger * 5, reserved=reserved,
+        old_qty=ledger, new_qty=ledger, ledger_qty=ledger,
+    ) is False
+    # A pair whose sum is the ledger, fully covered by non-reserved free, may overlap.
+    assert overlap_stops_allowed(
+        free=reserved + ledger, reserved=reserved,
+        old_qty=D("0.0004"), new_qty=D("0.0006"), ledger_qty=ledger,
+    ) is True
+    clip, decision = stop_qty_for_ledger(ledger, ledger * D("0.99"))
+    assert decision == "clip"
+    assert clip == ledger * D("0.99")
+    _qty, halt = stop_qty_for_ledger(ledger, ledger * D("0.97"))
+    assert halt == "halt"
+
+
+def test_kraken_sell_and_stop_cannot_spend_the_manual_reserve():
+    reserved = D("0.0880257350")
+    ledger = D("0.001")
+    free = reserved + ledger
+    ex = FakeExchange(
+        {"BTC/USDT": spot("BTC/USDT", amount_step="0.00000001", price_step="0.1",
+                          min_amount="0.00000001")},
+        tickers={"BTC/USDT": {"last": 100000}},
+        balance={"free": {"BTC": format(free, "f"), "USDT": "10000"},
+                 "total": {"BTC": format(free, "f"), "USDT": "10000"}},
+        order_states=[dict(FILLED_ORDER, filled=float(ledger), amount=float(ledger),
+                           average=100000, cost=100000 * float(ledger))],
+    )
+    clock = FakeClock()
+    adapter = KrakenAdapter(
+        ex, mode=Mode.LIVE, poll_interval_s=1.0,
+        monotonic=clock.monotonic, sleep=clock.sleep, now=lambda: WHEN,
+        key_freeze=lambda: False,
+        manual_reserved=f"BTC:{reserved}",
+    )
+    # An intent for the whole wallet must be clipped to the non-reserved ledger.
+    sell = Intent(
+        instrument=BTC, side=Side.SELL, qty=free, order_type=OrderType.MARKET,
+        strategy_id="s1", reason="sell the wallet", limit_price=D("100000"),
+        idempotency_key="sell-wallet",
+    )
+    ref = adapter.place(sell)
+    assert ref.status is OrderStatus.FILLED
+    sent = D(str(ex.create_calls[0][3]))
+    assert sent == ledger
+    assert sent != free
+    assert sent != reserved
+    # A stop 3% above non-reserved free is not sent.
+    ex.create_calls.clear()
+    refused = adapter.place_native_stop(BTC, ledger / D("0.97"), D("90000"))
+    assert refused.ok is False
+    assert ex.create_calls == []
+    # A 1% fee gap is clipped onto the wire, not flattened by the adapter.
+    ex.open_orders = []
+    ex.fetch_open_orders = lambda symbol=None: list(ex.open_orders)
+
+    def create_order(symbol, type_, side, amount, price=None, params=None):
+        ex.create_calls.append((symbol, type_, side, amount, price, params))
+        ex.open_orders.append({"id": "STOP-CLIP", "symbol": symbol, "status": "open",
+                               "amount": amount})
+        return {"id": "STOP-CLIP"}
+
+    ex.create_order = create_order
+    clipped = adapter.place_native_stop(BTC, ledger / D("0.99"), D("90000"))
+    assert clipped.ok is True
+    assert D(str(ex.create_calls[-1][3])) == ledger
 
 
 def test_key_freeze_env_and_file(tmp_path):

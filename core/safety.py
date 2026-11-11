@@ -59,6 +59,139 @@ REASON_BLACKOUT = "blackout"
 REASON_KEY_FREEZE = "key_freeze"
 REASON_STOP = "native_stop_unconfirmed"
 
+# A fee taken in the base asset leaves free balance a hair under the ledger
+# qty. Clip the stop down to that hair. Anything wider is not a fee.
+STOP_FEE_CLIP_LIMIT = Decimal("0.02")
+
+
+class ManualReservedError(ValueError):
+    """``MANUAL_RESERVED_BASE`` is set but cannot be read.
+
+    An unreadable reserve must not be treated as zero: zero would let an
+    order spend the manual balance the variable exists to protect.
+    """
+
+
+def base_asset(symbol: str) -> str:
+    """``BTC/USDT`` and ``BTC/USDT:USDT`` both yield ``BTC``."""
+    head = symbol.split("/", 1)[0]
+    return head.split(":", 1)[0].strip().upper()
+
+
+def parse_manual_reserved(raw: Optional[str]) -> dict[str, Decimal]:
+    """Parse ``MANUAL_RESERVED_BASE`` (``BTC:0.0880257350``, comma-separated).
+
+    Empty means nothing is reserved. A malformed entry raises rather than
+    becoming zero.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    out: dict[str, Decimal] = {}
+    for part in text.split(","):
+        piece = part.strip()
+        if not piece:
+            continue
+        if ":" not in piece:
+            raise ManualReservedError(
+                f"MANUAL_RESERVED_BASE entry {piece!r} must be ASSET:QTY"
+            )
+        asset, amount = piece.split(":", 1)
+        asset = asset.strip().upper()
+        if not asset:
+            raise ManualReservedError(
+                f"MANUAL_RESERVED_BASE entry {piece!r} has no asset"
+            )
+        try:
+            qty = Decimal(amount.strip())
+        except Exception as exc:
+            raise ManualReservedError(
+                f"MANUAL_RESERVED_BASE amount {amount!r} is not a number"
+            ) from exc
+        if not qty.is_finite() or qty < 0:
+            raise ManualReservedError(
+                f"MANUAL_RESERVED_BASE {asset} qty must be >= 0, got {qty}"
+            )
+        out[asset] = out.get(asset, Decimal("0")) + qty
+    return out
+
+
+def reserved_for(env: Optional[Mapping[str, str]], asset: str) -> Decimal:
+    """Qty of ``asset`` that is not available to the engine.
+
+    Default is 0 when the variable is unset. A bad value raises
+    ``ManualReservedError``.
+    """
+    source: Mapping[str, str] = os.environ if env is None else env
+    table = parse_manual_reserved(source.get("MANUAL_RESERVED_BASE"))
+    return table.get(asset.upper(), Decimal("0"))
+
+
+def non_reserved_free(free: Optional[Decimal], reserved: Decimal) -> Optional[Decimal]:
+    """Venue free minus the manual reserve. None stays None (unreadable).
+
+    Negative results are 0: the reserve is larger than free, so the engine
+    has nothing it may spend.
+    """
+    if free is None:
+        return None
+    available = free - reserved
+    if available < 0:
+        return Decimal("0")
+    return available
+
+
+def overlap_stops_allowed(
+    *,
+    free: Optional[Decimal],
+    reserved: Decimal,
+    old_qty: Decimal,
+    new_qty: Decimal,
+    ledger_qty: Decimal,
+) -> bool:
+    """True only when a second stop can rest without touching reserved coins.
+
+    Both stops together must fit in free balance after the reserve is
+    removed, and that combined qty must not exceed the engine ledger. Two
+    full-size stops are ``2 * ledger`` and are therefore refused: the
+    second order would be funded by the manual balance.
+    """
+    available = non_reserved_free(free, reserved)
+    if available is None or ledger_qty <= 0:
+        return False
+    both = old_qty + new_qty
+    if both <= 0:
+        return False
+    return available >= both and both <= ledger_qty
+
+
+def stop_qty_for_ledger(
+    ledger: Decimal,
+    available: Optional[Decimal],
+    *,
+    limit: Decimal = STOP_FEE_CLIP_LIMIT,
+) -> tuple[Decimal, str]:
+    """How large a stop may be, and what to do about the gap.
+
+    ``full`` — available covers the ledger (or free could not be read, so
+    the caller sends the ledger qty and the venue is the backstop).
+    ``clip`` — shortfall is within ``limit`` (a fee in base). Use
+    ``available`` and sync the ledger down to it.
+    ``halt`` — shortfall is wider than ``limit``, or nothing is available.
+    """
+    if ledger <= 0:
+        return Decimal("0"), "halt"
+    if available is None:
+        return ledger, "full"
+    if available >= ledger:
+        return ledger, "full"
+    if available <= 0:
+        return Decimal("0"), "halt"
+    shortfall = (ledger - available) / ledger
+    if shortfall <= limit:
+        return available, "clip"
+    return available, "halt"
+
 
 @dataclass(frozen=True)
 class StopPlaceResult:
