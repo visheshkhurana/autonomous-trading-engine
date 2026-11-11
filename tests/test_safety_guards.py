@@ -1,0 +1,996 @@
+"""Safety gates the risk officer asked for: native stops, heartbeat, blackout, key freeze.
+
+Adapters are fakes. Nothing here opens a socket or signs a Kraken request.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import json
+from decimal import Decimal
+from typing import Optional
+
+import pytest
+from fastapi.testclient import TestClient
+
+import engine as eng
+from adapters.kraken import KrakenAdapter
+from api.server import ApiSettings, create_app
+from core.gate import ClassLimits, GateConfig, OrderGate
+from core.risk import RiskCircuit
+from core.safety import (
+    fetch_status_windows, key_freeze_active, load_configured_windows,
+    overlap_stops_allowed, stop_qty_for_ledger, windows_from_status_payload,
+)
+from core.store import SQLitePositionStore
+from core.types import (
+    AssetClass, Fill, Instrument, Intent, MarketContext, Mode, OrderRef,
+    OrderStatus, OrderType, Position, Side,
+)
+from tests.test_api_server import (
+    AUTH, NOW as API_NOW, TOKEN, MemoryControlStore, build_handle,
+)
+from tests.test_okx_adapter import FILLED_ORDER, FakeClock, FakeExchange, spot
+
+UTC = dt.timezone.utc
+D = Decimal
+WHEN = dt.datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
+
+BTC = Instrument(symbol="BTC/USDT", asset_class=AssetClass.CRYPTO,
+                 broker_id="BTC/USDT", lot_size=1, tick_size=D("0.01"),
+                 qty_precision=8, min_notional=D("5"))
+ETH = Instrument(symbol="ETH/USDT", asset_class=AssetClass.CRYPTO,
+                 broker_id="ETH/USDT", lot_size=1, tick_size=D("0.01"),
+                 qty_precision=8, min_notional=D("5"))
+
+
+class Clock:
+    def __init__(self, at: dt.datetime = WHEN) -> None:
+        self.at = at
+
+    def __call__(self) -> dt.datetime:
+        return self.at
+
+    def advance(self, seconds: float) -> None:
+        self.at = self.at + dt.timedelta(seconds=seconds)
+
+
+class StopBook:
+    """Paper-shaped adapter that records stop lifecycle without a wallet size."""
+
+    manages_native_stops = True
+    asset_class = AssetClass.CRYPTO
+
+    def __init__(self, mode: Mode = Mode.PAPER, *, free: D = D("0.098"),
+                 wallet: D = D("0.088")) -> None:
+        self.mode = mode
+        self.free = free
+        self.wallet = wallet  # must never become an order qty
+        self.price = D("50000")
+        self.fail_stop = False
+        self.stops: dict[str, tuple[D, D]] = {}
+        self.log: list[tuple] = []
+        self._n = 0
+        self.timeouts: list[float] = []
+        self.filled_on_cancel = False
+        self.fail_next = False
+        self.sticky_ids: set[str] = set()
+        self.filled_reports: dict[str, Fill] = {}
+        # Sum of qtys if a new stop is placed while another is still open.
+        self.concurrent: list[D] = []
+
+    def equity(self) -> D:
+        return D("100000")
+
+    def quote(self, instrument: Instrument) -> D:
+        return self.price
+
+    def positions(self):
+        return ()
+
+    def cancel(self, order_id: str) -> bool:
+        return False
+
+    def free_base(self, instrument: Instrument) -> D:
+        return self.free
+
+    def place(self, intent: Intent, timeout_s: float = 30.0) -> OrderRef:
+        self.log.append(("place", intent.side.value, intent.qty, intent.instrument.symbol))
+        fill = Fill(
+            order_id=f"ORD-{len(self.log)}", instrument=intent.instrument,
+            side=intent.side, qty=intent.qty, price=self.price, fees=D("0"),
+            at=WHEN, mode=self.mode,
+        )
+        return OrderRef(
+            order_id=fill.order_id, status=OrderStatus.FILLED, intent=intent,
+            mode=self.mode, filled_qty=intent.qty, avg_price=self.price,
+            fills=(fill,),
+        )
+
+    def place_native_stop(self, instrument, qty, stop_price, timeout_s=10.0):
+        from core.safety import StopPlaceResult
+        self.timeouts.append(timeout_s)
+        self.log.append(("stop", qty, stop_price, instrument.symbol))
+        if self.stops:
+            self.concurrent.append(sum(q for q, _ in self.stops.values()) + qty)
+        if self.fail_next:
+            self.fail_next = False
+            return StopPlaceResult(False, None, qty, stop_price, "rejected")
+        if self.fail_stop:
+            return StopPlaceResult(False, None, qty, stop_price, "not on open orders")
+        self._n += 1
+        txid = f"STOP-{self._n}"
+        self.stops[txid] = (qty, stop_price)
+        return StopPlaceResult(True, txid, qty, stop_price, "open")
+
+    def native_stop_open(self, txid, instrument):
+        return txid in self.stops
+
+    def describe_native_stop(self, txid, instrument):
+        from core.safety import StopCancelResult
+        if txid in self.stops:
+            return StopCancelResult("still_open", reason="resting")
+        fill = self.filled_reports.get(txid)
+        if fill is not None:
+            return StopCancelResult("filled", fill=fill, reason="filled away")
+        return StopCancelResult("unknown", reason="not on the book")
+
+    def cancel_native_stop(self, txid, instrument):
+        from core.safety import StopCancelResult
+        self.log.append(("cancel", txid))
+        if txid in self.sticky_ids:
+            return StopCancelResult("unknown", reason="cancel unconfirmed")
+        qty, price = self.stops.pop(txid, (None, None))
+        if qty is None:
+            return StopCancelResult("unknown", reason="gone")
+        if self.filled_on_cancel:
+            fill = Fill(
+                order_id=txid, instrument=instrument, side=Side.SELL,
+                qty=qty, price=price, fees=D("0"), at=WHEN, mode=self.mode,
+            )
+            return StopCancelResult("filled", fill=fill, reason="already filled")
+        return StopCancelResult("cancelled", reason="cancelled")
+
+
+class NamingStrategy:
+    def __init__(self, intents=None, stop: Optional[D] = D("48000")) -> None:
+        self.id = "s1"
+        self.asset_class = AssetClass.CRYPTO
+        self.intents = list(intents or [])
+        self.stop = stop
+        self.calls = 0
+
+    def propose(self, ctx: MarketContext):
+        self.calls += 1
+        return list(self.intents)
+
+    def protective_stop(self, ctx, position) -> Optional[D]:
+        return self.stop
+
+
+def _buy(qty="0.01", stop="48000", key="k1", instrument=BTC) -> Intent:
+    return Intent(
+        instrument=instrument, side=Side.BUY, qty=D(qty),
+        order_type=OrderType.MARKET, strategy_id="s1", reason="test entry",
+        limit_price=D("50000"), idempotency_key=key, stop_price=D(stop),
+    )
+
+
+def _sell(qty="0.01", key="x1", instrument=BTC) -> Intent:
+    return Intent(
+        instrument=instrument, side=Side.SELL, qty=D(qty),
+        order_type=OrderType.MARKET, strategy_id="s1", reason="test exit",
+        limit_price=D("50000"), idempotency_key=key,
+    )
+
+
+def _engine(tmp_path, adapter, strategy, *, env=None, live=False, clock=None):
+    clock = clock or Clock()
+    env = {} if env is None else dict(env)
+    store = SQLitePositionStore(str(tmp_path / "book.db"))
+    mode = Mode.LIVE if live else Mode.PAPER
+    if live:
+        env["CRYPTO_LIVE"] = "1"
+    circuit = RiskCircuit(store, mode, clock=clock)
+    gate = OrderGate(
+        position_store=store, gate_state=_Gate(), risk_circuit=circuit,
+        config=GateConfig(
+            requested_mode=mode,
+            default_limits=ClassLimits(
+                max_order_notional=D("100000"),
+                max_daily_notional=D("100000"),
+            ),
+        ),
+        env=env,
+    )
+    paper = adapter if not live else StopBook(Mode.PAPER)
+    live_adapter = adapter if live else None
+    if live:
+        adapter.mode = Mode.LIVE
+    engine = eng.Engine(
+        wirings=[eng.ClassWiring(
+            asset_class=AssetClass.CRYPTO,
+            paper_adapter=paper,
+            live_adapter=live_adapter,
+            risk=circuit,
+            strategies=(strategy,),
+            instruments=(BTC, ETH),
+        )],
+        store=store, gate=gate,
+        config=eng.EngineConfig(
+            requested_mode=mode,
+            close_store_on_stop=False,
+            watchdog_enabled=False,
+            blackout_status_fetch=False,
+        ),
+        clock=clock, env=env,
+    )
+    return engine, store, clock
+
+
+class _Gate:
+    def __init__(self) -> None:
+        self.seen: dict[str, dt.datetime] = {}
+
+    def seen_recently(self, key, window_s, now):
+        ts = self.seen.get(key)
+        return ts is not None and (now - ts).total_seconds() < window_s
+
+    def order_count(self, asset_class, day_key):
+        return 0
+
+    def daily_notional(self, asset_class, day_key):
+        return D("0")
+
+    def record_submission(self, key, asset_class, day_key, now, notional=D("0")):
+        self.seen[key] = now
+
+
+def _tick(engine):
+    asyncio.run(engine.tick_once(AssetClass.CRYPTO))
+
+
+def _rejections(engine):
+    return [e for e in engine.events.recent() if e.kind is eng.EventKind.REJECTION]
+
+
+# ---------------------------------------------------------------- native stop
+
+
+def test_fill_is_followed_by_a_stop_sized_to_the_ledger_within_the_confirm_window(tmp_path):
+    book = StopBook(free=D("0.098"), wallet=D("0.088"))
+    strategy = NamingStrategy([_buy()])
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        stops = [row for row in book.log if row[0] == "stop"]
+        assert stops, "entry fill must be followed by a native stop"
+        _kind, qty, price, symbol = stops[0]
+        assert qty == D("0.01")
+        assert qty != book.wallet
+        assert qty != book.free
+        assert price == D("48000")
+        assert symbol == "BTC/USDT"
+        assert book.timeouts[0] <= 10
+        position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        assert position.stop_txid
+        assert position.stop_qty == D("0.01")
+        assert position.stop_status == "open"
+        assert position.qty == D("0.01")
+    finally:
+        store.close()
+
+
+def test_stop_that_is_not_confirmed_flattens_the_ledger_qty_and_halts_entries(tmp_path):
+    book = StopBook()
+    book.fail_stop = True
+    strategy = NamingStrategy([_buy()])
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        sells = [row for row in book.log if row[0] == "place" and row[1] == "sell"]
+        assert sells, "an unconfirmed stop must market-flatten"
+        assert sells[0][2] == D("0.01")
+        assert sells[0][2] != book.wallet
+        assert store.positions(Mode.PAPER, AssetClass.CRYPTO) == []
+        strategy.intents = [_buy(key="k2")]
+        _tick(engine)
+        reasons = [e.data.get("reason") for e in _rejections(engine)]
+        assert "native_stop_unconfirmed" in reasons
+        assert not any(row[0] == "place" and row[1] == "buy" and row[3] == "BTC/USDT"
+                       for row in book.log[2:])
+    finally:
+        store.close()
+
+
+def test_engine_exit_cancels_the_native_stop_before_selling(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()])
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        assert any(row[0] == "stop" for row in book.log)
+        strategy.intents = [_sell()]
+        _tick(engine)
+        cancel_at = max(i for i, row in enumerate(book.log) if row[0] == "cancel")
+        exit_places = [i for i, row in enumerate(book.log)
+                       if row[0] == "place" and row[1] == "sell"]
+        assert exit_places and exit_places[0] > cancel_at
+        assert store.positions(Mode.PAPER, AssetClass.CRYPTO) == []
+    finally:
+        store.close()
+
+
+def test_a_stop_that_already_filled_is_not_sold_again(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()])
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        book.filled_on_cancel = True
+        strategy.intents = [_sell()]
+        _tick(engine)
+        sells = [row for row in book.log if row[0] == "place" and row[1] == "sell"]
+        assert sells == []
+        assert store.positions(Mode.PAPER, AssetClass.CRYPTO) == []
+    finally:
+        store.close()
+
+
+def test_a_full_size_replace_cancels_before_placing_so_two_stops_never_rest(tmp_path):
+    """Two ledger-sized stops would be 2x the book. That is not allowed,
+    even when raw free balance looks large enough to hold both."""
+    book = StopBook(free=D("0.098"), wallet=D("0.088"))
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        strategy.intents = []
+        strategy.stop = D("49000")
+        _tick(engine)
+        tail = book.log[book.log.index(("stop", D("0.01"), D("48000"), "BTC/USDT")) + 1:]
+        assert tail[0][0] == "cancel"
+        assert tail[1] == ("stop", D("0.01"), D("49000"), "BTC/USDT")
+        assert book.concurrent == []
+        position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        assert position.stop_price == D("49000")
+        assert position.qty == D("0.01")
+        assert len(book.stops) == 1
+    finally:
+        store.close()
+
+
+def test_startup_without_a_native_stop_flattens_a_live_position(tmp_path):
+    book = StopBook(mode=Mode.LIVE)
+    strategy = NamingStrategy([], stop=None)
+    engine, store, _clock = _engine(tmp_path, book, strategy, live=True)
+    try:
+        store.apply(Fill(
+            order_id="seed", instrument=BTC, side=Side.BUY, qty=D("0.01"),
+            price=D("50000"), fees=D("0"), at=WHEN, mode=Mode.LIVE,
+        ), "s1")
+        _tick(engine)
+        sells = [row for row in book.log if row[0] == "place" and row[1] == "sell"]
+        assert sells and sells[0][2] == D("0.01")
+        assert sells[0][2] != book.wallet
+        assert store.positions(Mode.LIVE, AssetClass.CRYPTO) == []
+    finally:
+        store.close()
+
+
+def test_manual_reserve_blocks_a_second_stop_funded_by_that_balance(tmp_path):
+    """free = reserve + ledger. Non-reserved free equals the ledger, so two
+    simultaneous stops (2x ledger) cannot be funded without the manual BTC.
+    """
+    reserved = D("0.0880257350")
+    ledger = D("0.01")
+    book = StopBook(free=reserved + ledger, wallet=reserved)
+    strategy = NamingStrategy([_buy(qty=str(ledger))], stop=D("48000"))
+    engine, store, _clock = _engine(
+        tmp_path, book, strategy,
+        env={"MANUAL_RESERVED_BASE": f"BTC:{reserved}"},
+    )
+    try:
+        _tick(engine)
+        assert book.stops
+        strategy.intents = []
+        strategy.stop = D("49000")
+        _tick(engine)
+        assert book.concurrent == [], (
+            "a second stop must not rest while the first still claims the ledger"
+        )
+        kinds = [row[0] for row in book.log]
+        cancel_at = kinds.index("cancel")
+        second_stop = max(i for i, row in enumerate(book.log) if row[0] == "stop")
+        assert cancel_at < second_stop
+        open_qty = sum(q for q, _ in book.stops.values())
+        non_reserved = book.free - reserved
+        assert open_qty <= ledger
+        assert open_qty <= non_reserved
+        assert open_qty != reserved
+        assert len(book.stops) == 1
+    finally:
+        store.close()
+
+
+def test_a_fee_sized_shortfall_clips_the_stop_and_syncs_the_ledger(tmp_path):
+    reserved = D("0.0880257350")
+    ledger = D("0.01")
+    # 1% of the ledger is gone to a base-asset fee. Non-reserved free is short
+    # by less than 2%, so the stop shrinks instead of flattening.
+    book = StopBook(free=reserved + ledger * D("0.99"), wallet=reserved)
+    strategy = NamingStrategy([_buy(qty=str(ledger))], stop=D("48000"))
+    engine, store, _clock = _engine(
+        tmp_path, book, strategy,
+        env={"MANUAL_RESERVED_BASE": f"BTC:{reserved}"},
+    )
+    try:
+        _tick(engine)
+        clipped = ledger * D("0.99")
+        stops = [row for row in book.log if row[0] == "stop"]
+        assert stops[-1][1] == clipped
+        assert not any(row[0] == "place" and row[1] == "sell" for row in book.log)
+        position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        assert position.qty == clipped
+        assert position.stop_qty == clipped
+        assert position.stop_status == "open"
+    finally:
+        store.close()
+
+
+def test_a_shortfall_over_two_percent_flattens_and_halts(tmp_path):
+    reserved = D("0.0880257350")
+    ledger = D("0.01")
+    book = StopBook(free=reserved + ledger * D("0.97"), wallet=reserved)
+    strategy = NamingStrategy([_buy(qty=str(ledger))], stop=D("48000"))
+    engine, store, _clock = _engine(
+        tmp_path, book, strategy,
+        env={"MANUAL_RESERVED_BASE": f"BTC:{reserved}"},
+    )
+    try:
+        _tick(engine)
+        sells = [row for row in book.log if row[0] == "place" and row[1] == "sell"]
+        assert sells and sells[0][2] == ledger
+        assert store.positions(Mode.PAPER, AssetClass.CRYPTO) == []
+        strategy.intents = [_buy(qty=str(ledger), key="k2")]
+        _tick(engine)
+        reasons = [e.data.get("reason") for e in _rejections(engine)]
+        assert "native_stop_unconfirmed" in reasons
+    finally:
+        store.close()
+
+
+def test_replace_that_cannot_place_the_new_stop_flattens_and_halts(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        book.fail_next = True
+        strategy.intents = []
+        strategy.stop = D("49000")
+        _tick(engine)
+        kinds = [row[0] for row in book.log]
+        assert kinds.index("cancel") < len(kinds) - 1
+        sells = [row for row in book.log if row[0] == "place" and row[1] == "sell"]
+        assert sells and sells[-1][2] == D("0.01")
+        assert store.positions(Mode.PAPER, AssetClass.CRYPTO) == []
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------- heartbeat
+
+
+def test_stale_heartbeat_blocks_entries_but_not_exits(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()])
+    clock = Clock()
+    engine, store, clock = _engine(tmp_path, book, strategy, clock=clock)
+    try:
+        _tick(engine)
+        assert store.positions(Mode.PAPER, AssetClass.CRYPTO)
+        clock.advance(90)
+        strategy.intents = [_sell(), _buy(key="k-eth", instrument=ETH, qty="0.02")]
+        _tick(engine)
+        reasons = [e.data.get("reason") for e in _rejections(engine)]
+        assert "stale_heartbeat" in reasons
+        eth_buys = [row for row in book.log
+                    if row[0] == "place" and row[1] == "buy" and row[3] == "ETH/USDT"]
+        assert eth_buys == []
+        sells = [row for row in book.log if row[0] == "place" and row[1] == "sell"]
+        assert sells, "a stale loop must still allow the exit"
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------- blackout / freeze
+
+
+def test_blackout_blocks_entries_and_leaves_the_native_stop(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()])
+    clock = Clock()
+    window = json.dumps([{
+        "start": "2026-08-27T00:00:00+00:00",
+        "end": "2026-08-28T00:00:00+00:00",
+    }])
+    engine, store, _clock = _engine(
+        tmp_path, book, strategy, clock=clock,
+        env={"BLACKOUT_WINDOWS": window},
+    )
+    try:
+        _tick(engine)
+        assert not any(row[0] == "place" for row in book.log)
+        reasons = [e.data.get("reason") for e in _rejections(engine)]
+        assert "blackout" in reasons
+    finally:
+        store.close()
+
+
+def test_blackout_keeps_the_native_stop_and_still_allows_an_exit(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()])
+    engine, store, clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        assert book.stops
+        txid = next(iter(book.stops))
+        clock.advance(1)
+        strategy.intents = []
+        engine.safety_env = {
+            "BLACKOUT_WINDOWS": json.dumps([{
+                "start": "2026-08-27T00:00:00+00:00",
+                "end": "2026-08-28T00:00:00+00:00",
+            }]),
+        }
+        _tick(engine)
+        assert txid in book.stops, "blackout must leave the resting stop in place"
+        assert not any(row[0] == "cancel" for row in book.log)
+        strategy.intents = [_sell()]
+        clock.advance(1)
+        _tick(engine)
+        assert any(row[0] == "place" and row[1] == "sell" for row in book.log)
+    finally:
+        store.close()
+
+
+def test_key_freeze_blocks_new_orders(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()])
+    engine, store, clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        assert book.stops
+        clock.advance(1)
+        engine.safety_env = {"KEY_FREEZE": "1"}
+        strategy.intents = [_sell(), _buy(key="k2", instrument=ETH, qty="0.02")]
+        before = len(book.log)
+        _tick(engine)
+        assert book.log[before:] == [], "key freeze must not place, cancel, or replace"
+        assert book.stops, "a stop already on the book stays there"
+        reasons = [e.data.get("reason") for e in _rejections(engine)]
+        assert reasons
+        assert all(r == "key_freeze" for r in reasons)
+    finally:
+        store.close()
+
+
+def test_key_freeze_file_blocks_kraken_private_order_calls(tmp_path):
+    freeze = tmp_path / "KEY_FREEZE"
+    freeze.write_text("1")
+    ex = FakeExchange(
+        {"BTC/USDT": spot("BTC/USDT")},
+        tickers={"BTC/USDT": {"last": 100}},
+        balance={"free": {"BTC": "0.098"}, "total": {"BTC": "0.098"}},
+        order_states=[FILLED_ORDER],
+    )
+    adapter = KrakenAdapter(
+        ex, mode=Mode.LIVE,
+        key_freeze=lambda: key_freeze_active({"KEY_FREEZE_PATH": str(freeze)}),
+        monotonic=FakeClock().monotonic, sleep=FakeClock().sleep,
+        now=lambda: WHEN,
+    )
+    intent = Intent(
+        instrument=BTC, side=Side.BUY, qty=D("0.01"), order_type=OrderType.MARKET,
+        strategy_id="s1", reason="frozen", limit_price=D("100"),
+        idempotency_key="frozen-buy",
+    )
+    ref = adapter.place(intent)
+    assert ref.status is OrderStatus.REJECTED
+    assert "key_freeze" in (ref.error or "")
+    assert ex.create_calls == []
+    stopped = adapter.place_native_stop(BTC, D("0.01"), D("90"))
+    assert stopped.ok is False
+    assert ex.create_calls == []
+    assert adapter.cancel("OID-1") is False
+    assert ex.cancel_calls == []
+
+
+def test_kraken_stop_uses_ledger_qty_not_the_manual_btc_balance():
+    engine_qty = D("0.001")
+    manual = D("0.088")
+    free = manual + engine_qty
+    ex = FakeExchange(
+        {"BTC/USDT": spot("BTC/USDT", amount_step="0.00000001", price_step="0.1",
+                          min_amount="0.00001")},
+        tickers={"BTC/USDT": {"last": 100000}},
+        balance={"free": {"BTC": format(free, "f"), "USDT": "10000"},
+                 "total": {"BTC": format(free, "f"), "USDT": "10000"}},
+    )
+    ex.open_orders = []
+
+    def fetch_open_orders(symbol=None):
+        return list(ex.open_orders)
+
+    def create_order(symbol, type_, side, amount, price=None, params=None):
+        ex.create_calls.append((symbol, type_, side, amount, price, params))
+        ex.open_orders.append({
+            "id": "STOP-1", "symbol": symbol, "status": "open",
+            "amount": amount, "type": type_,
+        })
+        return {"id": "STOP-1"}
+
+    ex.fetch_open_orders = fetch_open_orders
+    ex.create_order = create_order
+    clock = FakeClock()
+    adapter = KrakenAdapter(
+        ex, mode=Mode.LIVE, poll_interval_s=1.0,
+        monotonic=clock.monotonic, sleep=clock.sleep, now=lambda: WHEN,
+        key_freeze=lambda: False,
+    )
+    result = adapter.place_native_stop(BTC, engine_qty, D("90000"), timeout_s=10)
+    assert result.ok is True
+    assert result.txid == "STOP-1"
+    _symbol, typ, side, amount, price, _params = ex.create_calls[0]
+    assert typ == "stop-loss"
+    assert side == "sell"
+    assert D(str(amount)) == engine_qty
+    assert D(str(amount)) != manual
+    assert D(str(amount)) != free
+    assert clock.t < 10
+
+
+def test_kraken_stop_that_never_appears_on_open_orders_is_not_ok():
+    ex = FakeExchange(
+        {"BTC/USDT": spot("BTC/USDT")},
+        tickers={"BTC/USDT": {"last": 100}},
+    )
+    ex.open_orders = []
+    ex.fetch_open_orders = lambda symbol=None: []
+    ex.fetch_order = lambda order_id, symbol=None: {
+        "id": order_id, "status": "open", "amount": "0.001", "filled": "0",
+    }
+    # Visible via fetch_order counts as confirmed. A book that stays empty
+    # AND an order that is not open must time out.
+    ex.fetch_order = lambda order_id, symbol=None: {
+        "id": order_id, "status": "canceled", "amount": "0.001", "filled": "0",
+    }
+    clock = FakeClock()
+    adapter = KrakenAdapter(
+        ex, mode=Mode.LIVE, poll_interval_s=1.0,
+        monotonic=clock.monotonic, sleep=clock.sleep, now=lambda: WHEN,
+        key_freeze=lambda: False,
+    )
+    result = adapter.place_native_stop(BTC, D("0.001"), D("90"), timeout_s=10)
+    assert result.ok is False
+    assert clock.t >= 10
+
+
+# ---------------------------------------------------------------- pure policy
+
+
+def test_configured_windows_apply_and_a_bad_file_does_not_fail_closed(tmp_path):
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps([{
+        "start": "2026-11-12T00:00:00Z",
+        "end": "2026-11-12T02:00:00Z",
+        "cancel_before": "15m",
+    }]))
+    windows, err = load_configured_windows({
+        "BLACKOUT_WINDOWS_FILE": str(good),
+        "BLACKOUT_WINDOWS": "{not json",
+    })
+    assert err
+    assert len(windows) == 1
+    assert windows[0].start == dt.datetime(2026, 11, 11, 23, 45, tzinfo=UTC)
+    missing, miss_err = load_configured_windows({
+        "BLACKOUT_WINDOWS_FILE": str(tmp_path / "nope.json"),
+    })
+    assert missing == []
+    assert miss_err
+
+
+def test_status_page_windows_are_padded_and_a_failed_fetch_adds_none():
+    payload = {"scheduled_maintenances": [{
+        "name": "matching engine",
+        "scheduled_for": "2026-11-12T12:00:00.000Z",
+        "scheduled_until": "2026-11-12T13:00:00.000Z",
+    }]}
+    windows = windows_from_status_payload(payload)
+    assert windows[0].start == dt.datetime(2026, 11, 12, 11, 45, tzinfo=UTC)
+    assert windows[0].end == dt.datetime(2026, 11, 12, 13, 30, tzinfo=UTC)
+    fetched, error = fetch_status_windows(opener=lambda url: (_ for _ in ()).throw(RuntimeError("down")))
+    assert fetched == []
+    assert error
+
+
+def test_two_stops_cannot_exceed_ledger_qty_from_non_reserved_balance():
+    reserved = D("0.0880257350")
+    ledger = D("0.001")
+    # Wallet is the manual stack plus the engine position. Non-reserved
+    # free is exactly the ledger, which cannot fund two ledger-sized stops.
+    free = reserved + ledger
+    assert overlap_stops_allowed(
+        free=free, reserved=reserved, old_qty=ledger, new_qty=ledger,
+        ledger_qty=ledger,
+    ) is False
+    # Even a fat non-reserved balance cannot justify two stops whose sum
+    # is larger than the ledger. The extra coins are not this position.
+    assert overlap_stops_allowed(
+        free=reserved + ledger * 5, reserved=reserved,
+        old_qty=ledger, new_qty=ledger, ledger_qty=ledger,
+    ) is False
+    # A pair whose sum is the ledger, fully covered by non-reserved free, may overlap.
+    assert overlap_stops_allowed(
+        free=reserved + ledger, reserved=reserved,
+        old_qty=D("0.0004"), new_qty=D("0.0006"), ledger_qty=ledger,
+    ) is True
+    clip, decision = stop_qty_for_ledger(ledger, ledger * D("0.99"))
+    assert decision == "clip"
+    assert clip == ledger * D("0.99")
+    _qty, halt = stop_qty_for_ledger(ledger, ledger * D("0.97"))
+    assert halt == "halt"
+
+
+def test_kraken_sell_and_stop_cannot_spend_the_manual_reserve():
+    reserved = D("0.0880257350")
+    ledger = D("0.001")
+    free = reserved + ledger
+    ex = FakeExchange(
+        {"BTC/USDT": spot("BTC/USDT", amount_step="0.00000001", price_step="0.1",
+                          min_amount="0.00000001")},
+        tickers={"BTC/USDT": {"last": 100000}},
+        balance={"free": {"BTC": format(free, "f"), "USDT": "10000"},
+                 "total": {"BTC": format(free, "f"), "USDT": "10000"}},
+        order_states=[dict(FILLED_ORDER, filled=float(ledger), amount=float(ledger),
+                           average=100000, cost=100000 * float(ledger))],
+    )
+    clock = FakeClock()
+    adapter = KrakenAdapter(
+        ex, mode=Mode.LIVE, poll_interval_s=1.0,
+        monotonic=clock.monotonic, sleep=clock.sleep, now=lambda: WHEN,
+        key_freeze=lambda: False,
+        manual_reserved=f"BTC:{reserved}",
+    )
+    # An intent for the whole wallet must be clipped to the non-reserved ledger.
+    sell = Intent(
+        instrument=BTC, side=Side.SELL, qty=free, order_type=OrderType.MARKET,
+        strategy_id="s1", reason="sell the wallet", limit_price=D("100000"),
+        idempotency_key="sell-wallet",
+    )
+    ref = adapter.place(sell)
+    assert ref.status is OrderStatus.FILLED
+    sent = D(str(ex.create_calls[0][3]))
+    assert sent == ledger
+    assert sent != free
+    assert sent != reserved
+    # A stop 3% above non-reserved free is not sent.
+    ex.create_calls.clear()
+    refused = adapter.place_native_stop(BTC, ledger / D("0.97"), D("90000"))
+    assert refused.ok is False
+    assert ex.create_calls == []
+    # A 1% fee gap is clipped onto the wire, not flattened by the adapter.
+    ex.open_orders = []
+    ex.fetch_open_orders = lambda symbol=None: list(ex.open_orders)
+
+    def create_order(symbol, type_, side, amount, price=None, params=None):
+        ex.create_calls.append((symbol, type_, side, amount, price, params))
+        ex.open_orders.append({"id": "STOP-CLIP", "symbol": symbol, "status": "open",
+                               "amount": amount})
+        return {"id": "STOP-CLIP"}
+
+    ex.create_order = create_order
+    clipped = adapter.place_native_stop(BTC, ledger / D("0.99"), D("90000"))
+    assert clipped.ok is True
+    assert D(str(ex.create_calls[-1][3])) == ledger
+
+
+def test_a_stop_that_filled_off_book_is_booked_before_any_new_sell(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        txid = next(iter(book.stops))
+        qty, price = book.stops.pop(txid)
+        book.filled_reports[txid] = Fill(
+            order_id=txid, instrument=BTC, side=Side.SELL, qty=qty, price=price,
+            fees=D("1.25"), at=WHEN, mode=Mode.PAPER,
+        )
+        strategy.intents = []
+        stops_before = [row for row in book.log if row[0] == "stop"]
+        _tick(engine)
+        assert [row for row in book.log if row[0] == "stop"] == stops_before
+        assert not any(row[0] == "place" and row[1] == "sell" for row in book.log)
+        assert store.positions(Mode.PAPER, AssetClass.CRYPTO) == []
+        assert any(f.order_id == txid and f.fees == D("1.25")
+                   for f in store.fills(Mode.PAPER))
+    finally:
+        store.close()
+
+
+def test_an_unreadable_missing_stop_is_not_replaced(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        txid = next(iter(book.stops))
+        book.stops.pop(txid)
+        strategy.intents = []
+        stops_before = len([row for row in book.log if row[0] == "stop"])
+        _tick(engine)
+        assert len([row for row in book.log if row[0] == "stop"]) == stops_before
+        position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        assert position.stop_txid == txid
+        assert position.qty == D("0.01")
+    finally:
+        store.close()
+
+
+def test_an_unconfirmed_overlap_cancel_keeps_the_old_stop_id(tmp_path, monkeypatch):
+    """If the old stop cannot be confirmed cancelled, its txid stays put
+    and the replacement is rolled back instead of becoming the only record."""
+    book = StopBook(free=D("1"))
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    monkeypatch.setattr(eng, "overlap_stops_allowed", lambda **_kw: True)
+    try:
+        _tick(engine)
+        position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        old = position.stop_txid
+        book.sticky_ids.add(old)
+        strategy.intents = []
+        strategy.stop = D("49000")
+        _tick(engine)
+        kept = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        assert kept.stop_txid == old
+        assert old in book.stops
+        # The replacement was cancelled; it must not be the stored id.
+        assert not (kept.stop_status or "").startswith("overlap:")
+        assert any(row[0] == "cancel" and row[1] != old for row in book.log)
+    finally:
+        store.close()
+
+
+def test_kraken_stop_fill_keeps_the_venue_fee():
+    ex = FakeExchange(
+        {"BTC/USDT": spot("BTC/USDT")},
+        tickers={"BTC/USDT": {"last": 90000}},
+    )
+    ex.fetch_order = lambda order_id, symbol=None: {
+        "id": order_id, "status": "closed", "filled": "0.001", "amount": "0.001",
+        "average": "90000", "symbol": "BTC/USDT",
+        "fee": {"cost": "1.25", "currency": "USDT"},
+    }
+    clock = FakeClock()
+    adapter = KrakenAdapter(
+        ex, mode=Mode.LIVE, poll_interval_s=1.0,
+        monotonic=clock.monotonic, sleep=clock.sleep, now=lambda: WHEN,
+        key_freeze=lambda: False,
+    )
+    described = adapter.describe_native_stop("STOP-FEE", BTC)
+    assert described.outcome == "filled"
+    assert described.fill is not None
+    assert described.fill.fees == D("1.25")
+    assert described.fill.qty == D("0.001")
+
+
+def test_key_freeze_env_and_file(tmp_path):
+    assert key_freeze_active({"KEY_FREEZE": "1"}) is True
+    assert key_freeze_active({"KEY_FREEZE": "0"}) is False
+    path = tmp_path / "KEY_FREEZE"
+    assert key_freeze_active({"KEY_FREEZE_PATH": str(path)}) is False
+    path.write_text("")
+    assert key_freeze_active({"KEY_FREEZE_PATH": str(path)}) is True
+
+
+def test_store_keeps_the_stop_txid_on_the_position_row(tmp_path):
+    store = SQLitePositionStore(str(tmp_path / "stops.db"))
+    try:
+        store.apply(Fill(
+            order_id="o1", instrument=BTC, side=Side.BUY, qty=D("0.01"),
+            price=D("50000"), fees=D("0"), at=WHEN, mode=Mode.PAPER,
+        ), "s1")
+        store.set_native_stop(
+            Mode.PAPER, "BTC/USDT", "s1", txid="STOP-9",
+            stop_price=D("48000"), stop_qty=D("0.01"), status="open",
+        )
+        store.apply(Fill(
+            order_id="o2", instrument=BTC, side=Side.BUY, qty=D("0.01"),
+            price=D("50000"), fees=D("0"), at=WHEN, mode=Mode.PAPER,
+        ), "s1")
+        position = store.positions(Mode.PAPER)[0]
+        assert position.qty == D("0.02")
+        assert position.stop_txid == "STOP-9"
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------- api surface
+
+
+def test_state_reports_heartbeat_blackout_freeze_and_native_stop(tmp_path):
+    beat = (API_NOW - dt.timedelta(seconds=90)).astimezone(UTC).isoformat()
+    control = MemoryControlStore()
+    control.rows["__engine__"] = {"heartbeat_at": beat, "paused": "0"}
+    position = Position(
+        instrument=BTC, qty=D("0.01"), avg_price=D("50000"),
+        mode=Mode.PAPER, strategy_id="s1",
+        stop_txid="STOP-1", stop_price=D("48000"), stop_qty=D("0.01"),
+        stop_status="open",
+    )
+    handle = build_handle(
+        ledger=_Ledger([position]), control=control, clock=lambda: API_NOW,
+    )
+    window = json.dumps([{
+        "start": "2026-08-27T00:00:00+00:00",
+        "end": "2026-08-28T00:00:00+00:00",
+    }])
+    app = create_app(handle, ApiSettings(token=TOKEN), env={
+        "BLACKOUT_WINDOWS": window,
+        "KEY_FREEZE": "1",
+    })
+    body = TestClient(app).get("/api/state", headers=AUTH).json()
+    assert body["key_freeze"] is True
+    assert body["entries_allowed"] is False
+    assert body["entries_block_reason"] == "key_freeze"
+    assert body["heartbeat_age_s"] == pytest.approx(90, abs=1)
+    assert body["blackout_active"] is True
+    assert body["next_window"]["source"] == "config"
+    native = body["classes"]["crypto"]["positions"][0]["native_stop"]
+    assert native["status"] == "open"
+    assert native["txid"] == "STOP-1"
+    assert native["qty"] == "0.01"
+    ready = TestClient(app).get("/ready", headers=AUTH).json()
+    assert ready["entries_allowed"] is False
+    assert ready["entries_block_reason"] == "key_freeze"
+
+
+def test_health_and_live_fail_when_the_heartbeat_is_past_the_dead_threshold():
+    control = MemoryControlStore()
+    control.rows["__engine__"] = {
+        "heartbeat_at": (API_NOW - dt.timedelta(seconds=181)).astimezone(UTC).isoformat(),
+    }
+    handle = build_handle(control=control, clock=lambda: API_NOW)
+    app = create_app(handle, ApiSettings(token=TOKEN), env={})
+    client = TestClient(app)
+    assert client.get("/health").status_code == 503
+    assert client.get("/health").json()["status"] == "stale_heartbeat"
+    assert client.get("/live").status_code == 503
+    fresh = MemoryControlStore()
+    fresh.rows["__engine__"] = {"heartbeat_at": API_NOW.astimezone(UTC).isoformat()}
+    alive = create_app(
+        build_handle(control=fresh, clock=lambda: API_NOW),
+        ApiSettings(token=TOKEN), env={},
+    )
+    assert TestClient(alive).get("/health").json() == {"status": "ok"}
+
+
+class _Ledger:
+    def __init__(self, positions) -> None:
+        self._positions = positions
+
+    def positions(self, mode, asset_class=None):
+        rows = [p for p in self._positions if p.mode is mode]
+        if asset_class is not None:
+            rows = [p for p in rows if p.instrument.asset_class is asset_class]
+        return rows
+
+    def orders(self, mode, asset_class=None, since_iso=None, limit=None):
+        return []
+
+    def realized_pnl(self, mode, asset_class, since_iso):
+        return D("0")

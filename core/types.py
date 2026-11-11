@@ -103,6 +103,10 @@ class Intent:
     # Stable across retries of the SAME decision, different across new ones.
     # The gate dedups on this.
     idempotency_key: str = ""
+    # Protective stop the strategy already computed for an entry. The engine
+    # places the native exchange stop at this price after the fill. Absent on
+    # exits and on strategies that do not name a stop.
+    stop_price: Optional[Decimal] = None
 
     def __post_init__(self) -> None:
         if self.qty <= 0:
@@ -111,6 +115,9 @@ class Intent:
             raise ValueError("LIMIT intent requires limit_price")
         if not self.reason.strip():
             raise ValueError("every Intent must carry a reason")
+        if self.stop_price is not None and (
+                not self.stop_price.is_finite() or self.stop_price <= 0):
+            raise ValueError("stop_price must be a finite Decimal > 0")
 
 
 @dataclass(frozen=True)
@@ -187,6 +194,13 @@ class Position:
     strategy_id: str
     structure_id: Optional[str] = None
     opened_at: Optional[dt.datetime] = None
+    # Native exchange stop resting against THIS ledger qty. txid is the
+    # venue order id (Kraken) or the paper stop id. None means no stop has
+    # been confirmed. The wallet balance is never stored here.
+    stop_txid: Optional[str] = None
+    stop_price: Optional[Decimal] = None
+    stop_qty: Optional[Decimal] = None
+    stop_status: Optional[str] = None
 
 
 @dataclass

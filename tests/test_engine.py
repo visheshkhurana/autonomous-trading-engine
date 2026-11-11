@@ -213,6 +213,9 @@ class BreakableStore:
     def write_risk_state(self, mode: Mode, asset_class: AssetClass, state) -> None:
         self._inner.write_risk_state(mode, asset_class, state)
 
+    def set_native_stop(self, *args, **kwargs):
+        return self._inner.set_native_stop(*args, **kwargs)
+
     def close(self) -> None:
         self.closed = True
         self._inner.close()

@@ -176,6 +176,67 @@ README.
 
 ---
 
+## Live safety controls
+
+Three gates sit in front of a new crypto entry. Exits still run unless
+`KEY_FREEZE` is on. None of them places an order by itself except the
+native-stop path, which only talks to the adapter the engine was already
+using.
+
+### Native exchange stop
+
+After a live crypto entry fills, the engine rests a Kraken `stop-loss` sell
+for the **ledger** quantity at the strategy's stop, and stores the txid on
+the position row. The wallet is not a size. `MANUAL_RESERVED_BASE`
+(default empty, for example `BTC:0.0880257350`) is subtracted from free
+balance for every engine order, so that manual stack cannot fund a sell or
+a stop. A second stop is placed before the old one is cancelled only when
+free balance minus the reserve covers **both** stops and their sum does not
+exceed the ledger qty; otherwise the old stop is cancelled first. If that
+new stop does not confirm, the position is flattened and new entries halt.
+A fee taken in the base asset that leaves non-reserved free within 2% of
+the ledger clips the stop down to the available qty and writes the gap off
+the ledger. A larger shortfall flattens and halts. The stop must show up
+on open orders within `NATIVE_STOP_CONFIRM_S` (default 10). An engine exit
+cancels the resting stop first. A trailing update never widens a resting
+stop. On startup an open live position is not traded until its stop is
+confirmed. Paper simulates the same sequence.
+
+### Stale heartbeat
+
+The loop stamps a heartbeat every tick. If the oldest class beat is older
+than `HEARTBEAT_ENTRY_MAX_AGE_S` (default 60), new entries stop with reason
+`stale_heartbeat`. `/api/state` and `/ready` report `entries_allowed` and
+`heartbeat_age_s`. `/health` and `/live` return 503 once a recorded beat is
+older than `HEARTBEAT_DEAD_S` (default 180), which is what a Fly check
+should hit so the machine restarts. A beat that was never written stays
+200 so boot is not a restart loop. Outside tests the process also runs a
+watchdog thread that exits if the loop is wedged and cannot serve HTTP.
+Set `HEARTBEAT_WATCHDOG=0` to disable it.
+
+### Blackout and key freeze
+
+`BLACKOUT_WINDOWS` is a JSON list (or `{"windows":[...]}`) of UTC
+`start` / `end`. `BLACKOUT_WINDOWS_FILE` is the same document on disk.
+Optional `cancel_before` (seconds, or `15m` / `1h`) begins the entry block
+that long before `start`. It does **not** cancel the native stop. A file
+that cannot be read is logged and ignored; it does not halt trading.
+Windows that did parse always apply.
+
+Kraken scheduled maintenance is read from the status page
+(`KRAKEN_STATUS_BLACKOUT`, default on outside tests) and padded 15 minutes
+before and 30 minutes after. A failed fetch adds no window and does not
+drop configured ones.
+
+`KEY_FREEZE=1` or a file at `KEY_FREEZE_PATH` (default `/data/KEY_FREEZE`)
+blocks every private Kraken call that places or modifies an order, including
+cancels. Stops already resting at the venue stay there. The API reports
+`key_freeze: true`.
+
+`/api/state` carries `entries_allowed`, `entries_block_reason`,
+`heartbeat_age_s`, `blackout_active`, `next_window`, `key_freeze`, and
+`native_stop` on each open position.
+
 ## The two arming switches
 
 ```

@@ -301,10 +301,13 @@ def test_env_with_wildcard_in_the_list_still_refuses() -> None:
 # auth
 # ==========================================================================
 
-def test_health_is_the_only_unauthenticated_route() -> None:
+def test_health_and_live_are_the_unauthenticated_probes() -> None:
     c = client()
     assert c.get("/health").status_code == 200
     assert c.get("/health").json() == {"status": "ok"}
+    live = c.get("/live")
+    assert live.status_code == 200
+    assert live.json()["status"] == "ok"
 
 
 def test_every_other_route_401s_without_a_token() -> None:

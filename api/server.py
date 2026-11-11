@@ -67,6 +67,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.profiles import AssetClassProfile, profile_for
+from core.safety import (
+    ENTRY_HEARTBEAT_MAX_AGE_S, DEAD_HEARTBEAT_S, BlackoutWindow,
+    entry_block_reason, entry_block_reasons, env_float, heartbeat_age_s,
+    key_freeze_active, load_configured_windows, next_window, windows_from_payload,
+)
 from core.protocols import BrokerAdapter, RiskCircuitProto
 from core.types import (
     Approval, AssetClass, Fill, Instrument, Mode, OrderRef, OrderStatus,
@@ -131,8 +136,11 @@ class ApiSettings:
     # where the reconnect is a resume the backlog can fill, than to have one
     # die at a moment nobody chose.
     sse_max_stream_s: float = 900.0
-    # A heartbeat older than this means the engine process is not ticking.
-    engine_stale_after_s: float = 120.0
+    # A heartbeat older than this means the engine process is not ticking,
+    # and new entries are closed. Exits are not.
+    engine_stale_after_s: float = 60.0
+    # Older than this, /health and /live fail so a supervisor restarts us.
+    dead_heartbeat_s: float = 180.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.token, str) or not self.token.strip():
@@ -154,12 +162,18 @@ class ApiSettings:
             if not origin.strip():
                 raise ValueError("CORS origin entries must be non-empty")
         for name in ("sse_poll_interval_s", "sse_heartbeat_s",
-                     "sse_max_stream_s", "engine_stale_after_s"):
+                     "sse_max_stream_s", "engine_stale_after_s",
+                     "dead_heartbeat_s"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 raise TypeError(f"{name} must be a number")
             if value <= 0:
                 raise ValueError(f"{name} must be > 0, got {value}")
+        if self.dead_heartbeat_s < self.engine_stale_after_s:
+            raise ValueError(
+                "dead_heartbeat_s must be >= engine_stale_after_s "
+                "(the restart threshold cannot be tighter than the entry block)"
+            )
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None,
@@ -181,7 +195,16 @@ class ApiSettings:
             )
         raw_origins = source.get("ENGINE_API_CORS_ORIGINS", "")
         origins = tuple(o.strip() for o in raw_origins.split(",") if o.strip())
-        return cls(token=token, cors_origins=origins, **overrides)
+        params: dict[str, Any] = dict(
+            token=token,
+            cors_origins=origins,
+            engine_stale_after_s=env_float(
+                source, "HEARTBEAT_ENTRY_MAX_AGE_S", ENTRY_HEARTBEAT_MAX_AGE_S),
+            dead_heartbeat_s=env_float(
+                source, "HEARTBEAT_DEAD_S", DEAD_HEARTBEAT_S),
+        )
+        params.update(overrides)
+        return cls(**params)
 
 
 # ==========================================================================
@@ -916,6 +939,18 @@ def _position_json(pos: Position) -> dict[str, Any]:
         "strategy_id": pos.strategy_id,
         "structure_id": pos.structure_id,
         "opened_at": _ts(pos.opened_at),
+        "native_stop": _native_stop_json(pos),
+    }
+
+
+def _native_stop_json(pos: Position) -> dict[str, Any]:
+    """Exchange stop recorded against the ledger row, never a wallet qty."""
+    status = pos.stop_status or ("open" if pos.stop_txid else "absent")
+    return {
+        "status": status,
+        "txid": pos.stop_txid,
+        "price": _dec(pos.stop_price),
+        "qty": _dec(pos.stop_qty),
     }
 
 
@@ -1035,7 +1070,10 @@ def _strategy_json(status: StrategyStatus) -> dict[str, Any]:
 # auth
 # ==========================================================================
 
-_EXEMPT_PATHS = frozenset({"/health"})
+# /live is the supervisor probe. It stays unauthenticated for the same reason
+# /health does: Fly cannot present the bearer token, and a probe that 401s
+# looks the same as a process that is up.
+_EXEMPT_PATHS = frozenset({"/health", "/live"})
 
 
 class BearerAuthMiddleware:
@@ -1163,6 +1201,7 @@ def create_app(handle: EngineHandle,
     )
     app.state.handle = handle
     app.state.settings = resolved
+    app.state.safety_env = os.environ if env is None else env
 
     # Added first so it ends up INNERMOST: Starlette builds the stack with the
     # most recently added middleware outermost, and CORS must see the request
@@ -1249,9 +1288,39 @@ def _register_routes(app: FastAPI, handle: EngineHandle,
 
     @app.get("/health")
     def health() -> JSONResponse:
-        """The one unauthenticated route. Says nothing about the book, the
-        account or whether trading is armed — only that this process is up."""
-        return JSONResponse({"status": "ok"})
+        """Process up, unless the trading loop's heartbeat is past the dead
+        threshold. A supervisor that polls this then restarts a wedged loop.
+
+        No heartbeat yet is still 200: the process has not had a tick, and
+        failing that would restart a machine that is still booting. The body
+        stays exactly ``{"status": "ok"}`` in that case.
+        """
+        dead = _dead_heartbeat_age(handle, settings)
+        if dead is None:
+            return JSONResponse({"status": "ok"})
+        return JSONResponse(
+            {"status": "stale_heartbeat", "heartbeat_age_s": dead},
+            status_code=503,
+        )
+
+    @app.get("/live")
+    def live() -> JSONResponse:
+        """Same dead-heartbeat contract as /health, named for a Fly check.
+
+        Unauthenticated. Reports the age so an operator can see why a restart
+        is about to happen. Unknown (no beat yet) is 200, not a failure.
+        """
+        dead = _dead_heartbeat_age(handle, settings)
+        if dead is None:
+            age = _heartbeat_age(handle, settings)
+            return JSONResponse({
+                "status": "ok",
+                "heartbeat_age_s": age,
+            })
+        return JSONResponse(
+            {"status": "stale_heartbeat", "heartbeat_age_s": dead},
+            status_code=503,
+        )
 
     @app.get("/ready")
     def ready() -> JSONResponse:
@@ -1301,6 +1370,7 @@ def _register_routes(app: FastAPI, handle: EngineHandle,
         except ControlUnavailable as exc:
             problems.append(_problem("control", str(exc)))
 
+        safety = _safety_public(handle, settings, app.state.safety_env)
         payload = {
             "ready": not problems,
             "mode": handle.mode.value,
@@ -1309,6 +1379,12 @@ def _register_routes(app: FastAPI, handle: EngineHandle,
             "feed": handle.feed,
             "classes": classes,
             "problems": problems,
+            "entries_allowed": safety["entries_allowed"],
+            "entries_block_reason": safety["entries_block_reason"],
+            "heartbeat_age_s": safety["heartbeat_age_s"],
+            "blackout_active": safety["blackout_active"],
+            "next_window": safety["next_window"],
+            "key_freeze": safety["key_freeze"],
         }
         return JSONResponse(payload, status_code=200 if not problems else 503)
 
@@ -1349,6 +1425,7 @@ def _register_routes(app: FastAPI, handle: EngineHandle,
                     {"detail": f"ledger read failed for {asset_class.value}: {exc!r}"},
                     status_code=503)
             block["open_positions"] = len(positions)
+            block["positions"] = [_position_json(p) for p in positions]
             total_positions += len(positions)
 
             equity, equity_detail = _adapter_equity(handle, asset_class)
@@ -1382,10 +1459,22 @@ def _register_routes(app: FastAPI, handle: EngineHandle,
 
             classes[asset_class.value] = block
 
+        safety = _safety_public(handle, settings, app.state.safety_env, engine_row)
+        engine_block["heartbeat_age_s"] = safety["heartbeat_age_s"]
+        engine_block["entries_allowed"] = safety["entries_allowed"]
+        engine_block["entries_block_reason"] = safety["entries_block_reason"]
         return JSONResponse({
             "at": now.astimezone(UTC).isoformat(),
             "mode": handle.mode.value,
             "engine": engine_block,
+            "entries_allowed": safety["entries_allowed"],
+            "entries_block_reason": safety["entries_block_reason"],
+            "entry_blocks": safety["entry_blocks"],
+            "heartbeat_age_s": safety["heartbeat_age_s"],
+            "blackout_active": safety["blackout_active"],
+            "next_window": safety["next_window"],
+            "blackout_config_error": safety["blackout_config_error"],
+            "key_freeze": safety["key_freeze"],
             # No cross-class total. Equity is INR for the equity book and USDT
             # for crypto; adding them produces a number with no unit, and a
             # unitless "total equity" is what the risk ladder would divide by.
@@ -1692,6 +1781,101 @@ def _register_routes(app: FastAPI, handle: EngineHandle,
 # route helpers
 # --------------------------------------------------------------------------
 
+def _cached_status_windows(row: Optional[Mapping[str, str]]) -> list[BlackoutWindow]:
+    if row is None:
+        return []
+    raw = row.get("blackout_status_json")
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+        return windows_from_payload(payload, source="kraken_status")
+    except (ValueError, json.JSONDecodeError):
+        return []
+
+
+def _safety_public(handle: EngineHandle, settings: ApiSettings,
+                   env: Mapping[str, str],
+                   engine_row: Optional[Mapping[str, str]] = None,
+                   ) -> dict[str, Any]:
+    """Entry block, blackout and key freeze for /api/state and /ready.
+
+    Configured windows are loaded here, every request, so a file the
+    operator edited is visible without a restart. Status-page windows come
+    from the cache the engine writes; this process does not fetch them
+    (a dashboard poll must not depend on status.kraken.com).
+    """
+    source = env
+    now = handle.now()
+    if engine_row is None and handle.control is not None:
+        try:
+            engine_row = handle.control.read(ENGINE_SCOPE)
+        except Exception:
+            engine_row = None
+    age = _heartbeat_age(handle, settings, engine_row)
+    configured, config_error = load_configured_windows(source)
+    windows = list(configured) + _cached_status_windows(engine_row)
+    frozen = key_freeze_active(source)
+    halted = bool(engine_row and engine_row.get("entry_halt_reason"))
+    reason = entry_block_reason(
+        key_freeze=frozen,
+        blackout=any(w.contains(now) for w in windows),
+        heartbeat_age=age,
+        entry_max_age_s=settings.engine_stale_after_s,
+        stop_halt=halted,
+    )
+    upcoming = next_window(now, windows)
+    row_error = None if engine_row is None else engine_row.get("blackout_config_error")
+    return {
+        "entries_allowed": reason is None,
+        "entries_block_reason": reason,
+        "entry_blocks": entry_block_reasons(
+            key_freeze=frozen,
+            blackout=any(w.contains(now) for w in windows),
+            heartbeat_age=age,
+            entry_max_age_s=settings.engine_stale_after_s,
+            stop_halt=halted,
+        ),
+        "heartbeat_age_s": None if age is None else round(age, 3),
+        "blackout_active": any(w.contains(now) for w in windows),
+        "next_window": None if upcoming is None else upcoming.to_json(),
+        "blackout_config_error": config_error or row_error,
+        "key_freeze": frozen,
+    }
+
+
+def _heartbeat_age(handle: EngineHandle, settings: ApiSettings,
+                   engine_row: Optional[Mapping[str, str]] = None,
+                   ) -> Optional[float]:
+    if engine_row is None:
+        try:
+            engine_row = handle.control.read(ENGINE_SCOPE)
+        except Exception:
+            return None
+    raw = None if engine_row is None else engine_row.get("heartbeat_at")
+    if not raw:
+        return None
+    try:
+        beat = dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if beat.tzinfo is None or beat.utcoffset() is None:
+        return None
+    return heartbeat_age_s(handle.now(), beat)
+
+
+def _dead_heartbeat_age(handle: EngineHandle, settings: ApiSettings) -> Optional[float]:
+    """Age when a recorded beat is past the restart threshold, else None.
+
+    A missing or unparseable beat is None: that is "unknown", and unknown
+    must not restart the machine during boot.
+    """
+    age = _heartbeat_age(handle, settings)
+    if age is None or age <= settings.dead_heartbeat_s:
+        return None
+    return round(age, 3)
+
+
 def _engine_block(row: Optional[Mapping[str, str]], now: dt.datetime,
                   settings: ApiSettings) -> dict[str, Any]:
     """Whether the engine process is ticking.
@@ -1719,6 +1903,7 @@ def _engine_block(row: Optional[Mapping[str, str]], now: dt.datetime,
         "heartbeat_at": beat.astimezone(UTC).isoformat(),
         "status": "stale" if stale else "alive",
         "age_s": round(age, 3),
+        "heartbeat_age_s": round(age, 3),
         "detail": (f"last heartbeat {age:.0f}s ago, older than the "
                    f"{settings.engine_stale_after_s:.0f}s threshold"
                    if stale else "engine is ticking"),

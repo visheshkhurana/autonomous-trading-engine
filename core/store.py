@@ -269,6 +269,10 @@ CREATE TABLE IF NOT EXISTS positions (
     structure_id  TEXT,
     opened_at     TEXT,
     updated_at    TEXT NOT NULL,
+    stop_txid     TEXT,
+    stop_price    TEXT,
+    stop_qty      TEXT,
+    stop_status   TEXT,
     PRIMARY KEY (mode, symbol, strategy_id)
 );
 CREATE INDEX IF NOT EXISTS idx_positions_mode ON positions (mode, asset_class);
@@ -336,6 +340,7 @@ class SQLitePositionStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        _ensure_position_stop_columns(self._conn)
 
     # -- plumbing ---------------------------------------------------------
 
@@ -541,7 +546,8 @@ class SQLitePositionStore:
                 index = fill_index
 
             pos = conn.execute(
-                "SELECT qty, avg_price, opened_at, structure_id FROM positions "
+                "SELECT qty, avg_price, opened_at, structure_id, "
+                "stop_txid, stop_price, stop_qty, stop_status FROM positions "
                 "WHERE mode=? AND symbol=? AND strategy_id=?",
                 (mode, inst.symbol, strategy_id),
             ).fetchone()
@@ -585,20 +591,33 @@ class SQLitePositionStore:
 
             opened_at = at_utc if (pos is None or result.reopened) else pos["opened_at"]
             struct = structure_id if (pos is None or result.reopened) else pos["structure_id"]
+            # A new position does not inherit the previous one's stop. Adding
+            # to a position keeps the resting stop until the engine replaces
+            # it; wiping it here would forget a live txid between ticks.
+            fresh = pos is None or result.reopened
+            stop_txid = None if fresh else pos["stop_txid"]
+            stop_price = None if fresh else pos["stop_price"]
+            stop_qty = None if fresh else pos["stop_qty"]
+            stop_status = None if fresh else pos["stop_status"]
             conn.execute(
                 """
                 INSERT INTO positions (
                     mode, strategy_id,
                     asset_class, symbol, broker_id, lot_size, tick_size,
                     qty_precision, min_notional, expiry,
-                    qty, avg_price, structure_id, opened_at, updated_at
-                ) VALUES (?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?)
+                    qty, avg_price, structure_id, opened_at, updated_at,
+                    stop_txid, stop_price, stop_qty, stop_status
+                ) VALUES (?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?)
                 ON CONFLICT (mode, symbol, strategy_id) DO UPDATE SET
                     qty=excluded.qty,
                     avg_price=excluded.avg_price,
                     structure_id=excluded.structure_id,
                     opened_at=excluded.opened_at,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    stop_txid=excluded.stop_txid,
+                    stop_price=excluded.stop_price,
+                    stop_qty=excluded.stop_qty,
+                    stop_status=excluded.stop_status
                 """,
                 (
                     mode, strategy_id,
@@ -608,6 +627,7 @@ class SQLitePositionStore:
                     inst.expiry.isoformat() if inst.expiry is not None else None,
                     str(result.qty), str(result.avg_price), struct,
                     opened_at, _utc_text(self._now()),
+                    stop_txid, stop_price, stop_qty, stop_status,
                 ),
             )
 
@@ -629,6 +649,50 @@ class SQLitePositionStore:
             (_mode_value(mode), symbol, strategy_id),
         )
         return _position_from_row(rows[0]) if rows else None
+
+    def set_native_stop(
+        self, mode: Mode, symbol: str, strategy_id: str,
+        *,
+        txid: Optional[str],
+        stop_price: Optional[Decimal],
+        stop_qty: Optional[Decimal],
+        status: str,
+    ) -> None:
+        """Record the exchange stop that protects this ledger row.
+
+        The qty stored here is the engine position size the stop was built
+        from. It is never a wallet balance. Missing row raises: writing a
+        txid onto a book we cannot see would report a stop for a position
+        that is not there.
+        """
+        if not status.strip():
+            raise ValueError("native stop status must be non-empty")
+        if stop_price is not None and stop_price <= 0:
+            raise ValueError(f"stop price must be > 0, got {stop_price}")
+        if stop_qty is not None and stop_qty <= 0:
+            raise ValueError(f"stop qty must be > 0, got {stop_qty}")
+        with self._write() as conn:
+            cur = conn.execute(
+                """
+                UPDATE positions
+                   SET stop_txid=?, stop_price=?, stop_qty=?, stop_status=?,
+                       updated_at=?
+                 WHERE mode=? AND symbol=? AND strategy_id=?
+                """,
+                (
+                    txid,
+                    None if stop_price is None else str(stop_price),
+                    None if stop_qty is None else str(stop_qty),
+                    status,
+                    _utc_text(self._now()),
+                    _mode_value(mode), symbol, strategy_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise LookupError(
+                    f"no {mode.value} position {symbol}/{strategy_id} to attach "
+                    "a native stop to"
+                )
 
     def fills(self, mode: Mode, asset_class: Optional[AssetClass] = None,
               since_iso: Optional[str] = None) -> Sequence[Fill]:
@@ -960,8 +1024,36 @@ def _instrument_from_row(row: sqlite3.Row) -> Instrument:
     })
 
 
+def _row_text(row: sqlite3.Row, key: str) -> Optional[str]:
+    if key not in row.keys():
+        return None
+    value = row[key]
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def _ensure_position_stop_columns(conn: sqlite3.Connection) -> None:
+    """Add native-stop columns to a ledger created before they existed.
+
+    ``CREATE TABLE IF NOT EXISTS`` does not alter a table that already
+    exists, and a restart onto this build must not refuse to open the book.
+    """
+    present = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+    for name, decl in (
+        ("stop_txid", "TEXT"),
+        ("stop_price", "TEXT"),
+        ("stop_qty", "TEXT"),
+        ("stop_status", "TEXT"),
+    ):
+        if name not in present:
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {name} {decl}")
+
+
 def _position_from_row(row: sqlite3.Row) -> Position:
     opened = row["opened_at"]
+    price = _row_text(row, "stop_price")
+    qty = _row_text(row, "stop_qty")
     return Position(
         instrument=_instrument_from_row(row),
         qty=Decimal(row["qty"]),
@@ -970,6 +1062,10 @@ def _position_from_row(row: sqlite3.Row) -> Position:
         strategy_id=row["strategy_id"],
         structure_id=row["structure_id"],
         opened_at=dt.datetime.fromisoformat(opened) if opened else None,
+        stop_txid=_row_text(row, "stop_txid"),
+        stop_price=Decimal(price) if price is not None else None,
+        stop_qty=Decimal(qty) if qty is not None else None,
+        stop_status=_row_text(row, "stop_status"),
     )
 
 

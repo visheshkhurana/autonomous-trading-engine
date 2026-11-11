@@ -66,12 +66,14 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import logging
 import os
 import threading
+import time
 import traceback
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from enum import Enum
 from types import MappingProxyType
@@ -87,13 +89,19 @@ from typing import (
 from core.gate import _ARM_ENV as ARM_ENV
 from core.gate import _parse_arm_flag as _parse_arm_flag
 from core.profiles import AssetClassProfile, profile_for
+from core.safety import (
+    REASON_STOP, BlackoutWindow, ManualReservedError, StopPlaceResult,
+    base_asset, blackout_active, entry_block_reason, fetch_status_windows,
+    key_freeze_active, load_configured_windows, non_reserved_free,
+    overlap_stops_allowed, reserved_for, stop_qty_for_ledger,
+)
 from core.protocols import (
     BrokerAdapter, OrderGateProto, PositionStoreProto, RiskCircuitProto,
     Strategy,
 )
 from core.types import (
-    Approval, AssetClass, Instrument, Intent, MarketContext, Mode,
-    OrderRef, OrderType, Position, Side,
+    Approval, AssetClass, Fill, Instrument, Intent, MarketContext, Mode,
+    OrderRef, OrderStatus, OrderType, Position, Side,
 )
 
 __all__ = [
@@ -122,6 +130,20 @@ UTC = dt.timezone.utc
 
 def _utc_now() -> dt.datetime:
     return dt.datetime.now(UTC)
+
+
+def _persist_native_stop(fn: Callable[..., Any], mode: Mode, symbol: str,
+                         strategy_id: str, txid: Optional[str],
+                         price: Optional[Decimal], qty: Optional[Decimal],
+                         status: str) -> None:
+    """Adapter for set_native_stop's keyword-only arguments.
+
+    ``_offload`` only forwards positional args, and a keyword slipped
+    through a thread pool is how a txid write silently targets the wrong
+    parameter.
+    """
+    fn(mode, symbol, strategy_id, txid=txid, stop_price=price,
+       stop_qty=qty, status=status)
 
 
 class ControlRowGone(RuntimeError):
@@ -479,8 +501,19 @@ class EngineConfig:
     close_store_on_stop: bool = True
     unmanaged_alarm_interval_s: float = 300.0
     # How often the engine stamps the heartbeat the API reads. Must stay well
-    # under ApiSettings.engine_stale_after_s or a healthy engine reads as dead.
+    # under the entry-block threshold or a healthy engine reads as stale.
     heartbeat_interval_s: float = 10.0
+    # Loop beat older than this blocks new entries. Exits still run.
+    entry_heartbeat_max_age_s: float = 60.0
+    # Older than this, /health and /live fail and the watchdog exits.
+    dead_heartbeat_s: float = 180.0
+    # Native stop must be visible on open orders inside this window.
+    stop_confirm_s: float = 10.0
+    # Off in tests. The runner turns it on outside pytest.
+    watchdog_enabled: bool = False
+    # Best-effort Kraken status page. Off unless the runner enables it, so
+    # a unit test tick never opens a socket.
+    blackout_status_fetch: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.requested_mode, Mode):
@@ -489,7 +522,9 @@ class EngineConfig:
             raise EngineConfigError("event_buffer must be >= 1")
         for name in ("place_timeout_s", "flatten_lead_s",
                      "square_off_retry_bucket_s", "shutdown_drain_s",
-                     "unmanaged_alarm_interval_s", "heartbeat_interval_s"):
+                     "unmanaged_alarm_interval_s", "heartbeat_interval_s",
+                     "entry_heartbeat_max_age_s", "dead_heartbeat_s",
+                     "stop_confirm_s"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 raise EngineConfigError(f"{name} must be a number")
@@ -505,6 +540,15 @@ class EngineConfig:
             raise EngineConfigError("max_consecutive_tick_errors must be an int")
         if self.max_consecutive_tick_errors < 1:
             raise EngineConfigError("max_consecutive_tick_errors must be >= 1")
+        if self.dead_heartbeat_s < self.entry_heartbeat_max_age_s:
+            raise EngineConfigError(
+                "dead_heartbeat_s must be >= entry_heartbeat_max_age_s"
+            )
+        if not isinstance(self.watchdog_enabled, bool) or not isinstance(
+                self.blackout_status_fetch, bool):
+            raise EngineConfigError(
+                "watchdog_enabled and blackout_status_fetch must be bools"
+            )
 
 
 @dataclass(frozen=True)
@@ -803,6 +847,14 @@ class _ClassRunner:
         self._control_paused: Optional[bool] = None
         self._control_known: Optional[bool] = None
         self._flatten_acked: Optional[str] = None
+        # Set when a native stop could not be confirmed. Entries stay closed
+        # until a later tick sees every open crypto position protected.
+        self._entry_halt_reason: Optional[str] = None
+        self._entry_halt_loaded = False
+        # True only when THIS process latched the halt. A reason loaded from
+        # the control row on restart may be cleared once the book is flat or
+        # every open position is protected again.
+        self._entry_halt_latched = False
 
     # -- plumbing -------------------------------------------------------
 
@@ -1083,6 +1135,10 @@ class _ClassRunner:
 
     async def tick(self) -> None:
         now = self.engine.now()
+        # Age is read BEFORE this tick's stamp. A loop that was wedged comes
+        # back, refuses new entries for this pass, and only then looks alive.
+        heartbeat_age = self.engine.heartbeat_age_s(now)
+        self.engine.mark_loop_heartbeat(self.asset_class, now)
         # Before the market-open early return: a closed market is not a dead
         # process, and the API decides "engine alive" purely from this beat.
         await self.engine.beat()
@@ -1103,7 +1159,7 @@ class _ClassRunner:
 
         equity = await self._read_equity()
         try:
-            await self._trade(now, equity)
+            await self._trade(now, equity, heartbeat_age)
         finally:
             # The circuit advances even when the trading half failed. A tick
             # that could not read positions still moved the account's value,
@@ -1137,7 +1193,8 @@ class _ClassRunner:
             return None
         return equity
 
-    async def _trade(self, now: dt.datetime, equity: Optional[Decimal]) -> None:
+    async def _trade(self, now: dt.datetime, equity: Optional[Decimal],
+                     heartbeat_age: Optional[float] = None) -> None:
         try:
             positions = tuple(await _offload(
                 self.engine.store.positions, self.mode, self.asset_class))
@@ -1197,6 +1254,24 @@ class _ClassRunner:
         ctx = MarketContext(now=now, quotes=quotes, positions=positions,
                             equity=equity, extra=extra)
 
+        if self.asset_class is AssetClass.CRYPTO:
+            await _offload(self.engine.refresh_blackout)
+            await self._maintain_native_stops(ctx)
+            # Maintain may have flattened a position whose stop could not be
+            # confirmed. The strategy has to see that book, not the one from
+            # the start of the tick, or it will sell a qty the ledger no
+            # longer holds.
+            try:
+                positions = tuple(await _offload(
+                    self.engine.store.positions, self.mode, self.asset_class))
+            except Exception as exc:
+                self._error("positions",
+                            "position store unreadable after stop maintenance; "
+                            "skipping this tick", exc)
+                raise
+            ctx = MarketContext(now=now, quotes=quotes, positions=positions,
+                                equity=equity, extra=extra)
+
         flatten_from = self._square_off_starts(now)
         session_flatten = flatten_from is not None and now >= flatten_from
         operator_flatten = control.flatten_pending
@@ -1206,7 +1281,22 @@ class _ClassRunner:
         # a position because the operator paused, or because a control row could
         # not be read, would trap the book in exactly the state they reached for
         # the button to get out of.
-        if session_flatten:
+        #
+        # Safety reasons are checked first and use the stable tokens the API
+        # reports (`stale_heartbeat`, `blackout`, `key_freeze`,
+        # `native_stop_unconfirmed`). Key freeze also refuses exits, in
+        # `_route`, because that one forbids every new private order.
+        safety_block = entry_block_reason(
+            key_freeze=self._orders_frozen(),
+            blackout=(self.asset_class is AssetClass.CRYPTO
+                      and self.engine.blackout_is_active(now)),
+            heartbeat_age=heartbeat_age,
+            entry_max_age_s=self.engine.config.entry_heartbeat_max_age_s,
+            stop_halt=self._entry_halt_reason is not None,
+        )
+        if safety_block is not None:
+            entry_block = safety_block
+        elif session_flatten:
             entry_block = "square-off window: entries are closed"
         elif operator_flatten:
             entry_block = f"operator flatten requested: {control.flatten_reason or 'no reason given'}"
@@ -1424,10 +1514,702 @@ class _ClassRunner:
             quotes[symbol] = price
         return quotes
 
+    # -- native exchange stops ------------------------------------------
+
+    def _manages_stops(self) -> bool:
+        return bool(getattr(self.adapter, "manages_native_stops", False))
+
+    def _orders_frozen(self) -> bool:
+        """Key freeze: no new crypto orders. Equity is a different venue."""
+        return (self.asset_class is AssetClass.CRYPTO
+                and key_freeze_active(self.engine.safety_env))
+
+    def _ledger_position(self, symbol: str, strategy_id: str) -> Optional[Position]:
+        try:
+            rows = self.engine.store.positions(self.mode, self.asset_class)
+        except Exception:
+            return None
+        for position in rows:
+            if position.instrument.symbol == symbol and position.strategy_id == strategy_id:
+                return position
+        return None
+
+    def _strategy_for(self, strategy_id: str) -> Optional[Strategy]:
+        for strategy in self.wiring.strategies:
+            if strategy.id == strategy_id:
+                return strategy
+        return None
+
+    def _protective_price(self, position: Position,
+                          ctx: MarketContext) -> Optional[Decimal]:
+        strategy = self._strategy_for(position.strategy_id)
+        if strategy is None:
+            return position.stop_price
+        fn = getattr(strategy, "protective_stop", None)
+        if fn is None:
+            return position.stop_price
+        try:
+            price = fn(ctx, position)
+        except Exception as exc:
+            self._error("native_stop",
+                        f"protective_stop raised for {position.instrument.symbol}",
+                        exc)
+            return position.stop_price
+        if price is None:
+            return position.stop_price
+        if not isinstance(price, Decimal) or not price.is_finite() or price <= 0:
+            return position.stop_price
+        return price
+
+    def _stop_required(self, position: Position) -> bool:
+        """Live crypto must not sit without a stop. Paper only when one was
+        already asked for (a stored price or txid), so a pre-existing paper
+        book is not flattened for lacking a feature it never had."""
+        if not self._manages_stops():
+            return False
+        if position.qty <= 0:
+            return False
+        if self.mode is Mode.LIVE and self.asset_class is AssetClass.CRYPTO:
+            return True
+        return bool(position.stop_txid or position.stop_price)
+
+    def _load_entry_halt_once(self) -> None:
+        if self._entry_halt_loaded:
+            return
+        self._entry_halt_loaded = True
+        control = self.engine.control
+        if control is None:
+            return
+        try:
+            row = control.read(CONTROL_ENGINE_SCOPE)
+        except Exception as exc:
+            self._error("native_stop",
+                        "could not read the persisted entry halt; entries stay "
+                        "closed until it can be read", exc)
+            self._entry_halt_reason = REASON_STOP
+            return
+        if row and row.get("entry_halt_reason"):
+            self._entry_halt_reason = row["entry_halt_reason"]
+
+    def _set_entry_halt(self, reason: Optional[str]) -> None:
+        self._entry_halt_reason = reason
+        if reason:
+            self._entry_halt_latched = True
+        else:
+            self._entry_halt_latched = False
+        control = self.engine.control
+        if control is None:
+            return
+
+        def mutation(row: Optional[Mapping[str, str]]) -> Mapping[str, str]:
+            current = dict(row or {})
+            current.setdefault("paused", "0")
+            if reason:
+                current["entry_halt_reason"] = reason
+            else:
+                current.pop("entry_halt_reason", None)
+            return current
+
+        try:
+            control.mutate(CONTROL_ENGINE_SCOPE, mutation)
+        except Exception as exc:
+            self._error("native_stop",
+                        f"could not persist entry halt {reason!r}", exc)
+
+    async def _maintain_native_stops(self, ctx: MarketContext) -> None:
+        """Confirm, replace, or re-place the stop on each open long.
+
+        Runs before entries are considered. A failure flattens that ledger
+        qty and latches the entry halt. Key freeze only looks: it does not
+        place, cancel, or flatten.
+        """
+        self._load_entry_halt_once()
+        if not self._manages_stops():
+            return
+        frozen = self._orders_frozen()
+        failed = False
+        protected_required = False
+        for position in ctx.positions:
+            if position.qty <= 0:
+                continue
+            if frozen:
+                await self._note_stop_readonly(position)
+                continue
+            if position.stop_txid:
+                visible = await self._stop_is_open(position)
+                if visible is None:
+                    continue
+                if visible:
+                    protected_required = True
+                    if await self._maybe_replace_stop(position, ctx):
+                        failed = True
+                    continue
+                # Not on the open book. That can be a fill, a cancel, or a
+                # read we cannot trust. Reconcile the txid before any new sell.
+                reconciled = await self._reconcile_absent_stop(position)
+                if reconciled != "place":
+                    if reconciled == "filled":
+                        protected_required = False
+                    continue
+            if not self._stop_required(position):
+                continue
+            price = self._protective_price(position, ctx)
+            if price is None:
+                await self._fail_unprotected(
+                    position, ctx, "open position has no strategy stop to rest")
+                failed = True
+                continue
+            result = await self._submit_stop(position, price, write=False)
+            if result is not None and result.ok and result.txid:
+                try:
+                    await self._write_stop(position, result.txid, result.stop_price,
+                                           result.qty, "open")
+                    protected_required = True
+                except Exception as exc:
+                    self._error("native_stop", "could not store stop txid", exc)
+                    failed = True
+                continue
+            if result is not None and result.txid:
+                cancel = await self._cancel_stop(result.txid, position)
+                if cancel is not None and cancel.outcome == "still_open":
+                    await self._write_stop(position, result.txid, result.stop_price,
+                                           result.qty, "open")
+                    continue
+                if cancel is not None and cancel.outcome == "filled" and cancel.fill is not None:
+                    await self._apply_external_fill(position, cancel.fill)
+                    failed = True
+                    continue
+            await self._fail_unprotected(
+                position, ctx,
+                result.reason if result is not None else "native stop was not confirmed")
+            failed = True
+        if failed:
+            self._set_entry_halt(REASON_STOP)
+        elif self._entry_halt_reason == REASON_STOP and (
+                protected_required
+                or (not self._entry_halt_latched
+                    and not any(p.qty > 0 for p in ctx.positions))):
+            # A halt this process just latched stays up while the book is
+            # flat, so the next tick cannot re-enter. A halt only inherited
+            # from the control row lifts once nothing is open, and either
+            # kind lifts once a required position is protected again.
+            self._set_entry_halt(None)
+
+    async def _note_stop_readonly(self, position: Position) -> None:
+        if not position.stop_txid:
+            return
+        visible = await self._stop_is_open(position)
+        if visible is not False:
+            return
+        # Keep the txid. An open-order miss is not proof the stop is gone,
+        # and key freeze must not forget an order it is not allowed to replace.
+        await self._write_stop(position, position.stop_txid, position.stop_price,
+                               position.stop_qty, "not_open")
+
+    async def _reconcile_absent_stop(self, position: Position) -> str:
+        """What to do with a stop that is not on the open-order book.
+
+        ``filled`` — the fill was booked. ``keep`` — outcome unknown or still
+        working; the txid stays. ``place`` — the venue confirmed the order is
+        gone with no fill, so a new stop may be rested.
+        """
+        described = await self._describe_stop(position)
+        outcome = None if described is None else described.outcome
+        if outcome == "filled" and described is not None and described.fill is not None:
+            await self._apply_external_fill(position, described.fill)
+            return "filled"
+        if outcome == "cancelled":
+            try:
+                await self._write_stop(position, None, None, None, "cancelled")
+            except Exception as exc:
+                self._error("native_stop",
+                            f"could not clear cancelled stop {position.stop_txid}", exc)
+                return "keep"
+            return "place"
+        self._error(
+            "native_stop",
+            f"stop {position.stop_txid} on {position.instrument.symbol} is "
+            f"not open and its outcome is {outcome or 'unknown'}; keeping the txid",
+            None)
+        return "keep"
+
+    async def _describe_stop(self, position: Position):
+        fn = getattr(self.adapter, "describe_native_stop", None)
+        if fn is None or not position.stop_txid:
+            return None
+        try:
+            return await _offload(fn, position.stop_txid, position.instrument)
+        except Exception as exc:
+            self._error("native_stop",
+                        f"could not read stop {position.stop_txid}", exc)
+            return None
+
+    async def _stop_is_open(self, position: Position) -> Optional[bool]:
+        fn = getattr(self.adapter, "native_stop_open", None)
+        if fn is None or not position.stop_txid:
+            return None
+        try:
+            return await _offload(fn, position.stop_txid, position.instrument)
+        except Exception as exc:
+            self._error("native_stop",
+                        f"could not read open orders for {position.instrument.symbol}",
+                        exc)
+            return None
+
+    async def _maybe_replace_stop(self, position: Position,
+                                  ctx: MarketContext) -> bool:
+        """Replace a resting stop. True when the position was left unprotected."""
+        if self.engine.blackout_is_active(self.engine.now()):
+            # Leave the resting stop. A replace cancels or overlaps an order
+            # during the window the blackout exists to avoid.
+            return False
+        new_price = self._protective_price(position, ctx)
+        if new_price is None:
+            return False
+        tighter = position.stop_price is None or new_price > position.stop_price
+        resized = (position.stop_qty is None
+                   or abs(position.qty) != position.stop_qty)
+        # Never loosen a resting stop. A wider ATR is the strategy's floor
+        # problem; the exchange stop stays at the tighter price. Whether a
+        # fee clip is required is decided after free balance is read.
+        price = new_price if tighter else position.stop_price
+        if price is None:
+            return False
+        ledger = abs(position.qty)
+        try:
+            reserved = self._reserved_base(position)
+        except ManualReservedError as exc:
+            self._error("native_stop",
+                        f"MANUAL_RESERVED_BASE is unreadable: {exc}", exc)
+            self._set_entry_halt(REASON_STOP)
+            return True
+        free = await self._free_base(position)
+        available = non_reserved_free(free, reserved)
+        target, decision = stop_qty_for_ledger(ledger, available)
+        if decision == "halt":
+            await self._fail_unprotected(
+                position, ctx,
+                f"non-reserved free {available} is more than 2% under "
+                f"ledger qty {ledger}")
+            return True
+        needs_clip = decision == "clip" and position.stop_qty != target
+        if not tighter and not resized and not needs_clip:
+            return False
+        old_qty = position.stop_qty if position.stop_qty is not None else ledger
+        old_txid = position.stop_txid
+        can_overlap = bool(old_txid) and overlap_stops_allowed(
+            free=free, reserved=reserved, old_qty=old_qty, new_qty=target,
+            ledger_qty=ledger,
+        )
+        if can_overlap and old_txid:
+            result = await self._submit_stop(
+                position, price, write=False, qty=target)
+            if result is None or not result.ok or not result.txid:
+                self._error(
+                    "native_stop",
+                    f"{position.instrument.symbol}: replacement stop was not "
+                    "confirmed; the previous stop is still resting",
+                    None)
+                return False
+            cancel = await self._cancel_stop(old_txid, position)
+            if cancel is not None and cancel.outcome == "filled" and cancel.fill is not None:
+                if result.txid:
+                    await self._cancel_stop(result.txid, position)
+                await self._apply_external_fill(position, cancel.fill)
+                return False
+            if cancel is None or cancel.outcome != "cancelled":
+                # The new stop may be live and the old one may be too. Do not
+                # forget the old txid. Roll the new order back; if that also
+                # fails, remember its id on the status without replacing the
+                # stored txid.
+                rolled = None
+                if result.txid:
+                    rolled = await self._cancel_stop(result.txid, position)
+                if rolled is not None and rolled.outcome == "filled" and rolled.fill is not None:
+                    await self._apply_external_fill(position, rolled.fill)
+                    return False
+                remembered = (rolled is not None and rolled.outcome == "cancelled")
+                if not remembered and result.txid:
+                    try:
+                        await self._write_stop(
+                            position, old_txid, position.stop_price,
+                            position.stop_qty, f"overlap:{result.txid}")
+                    except Exception as exc:
+                        self._error("native_stop",
+                                    "could not remember the unretired replacement stop",
+                                    exc)
+                self._error(
+                    "native_stop",
+                    f"{position.instrument.symbol}: previous stop {old_txid} "
+                    f"was not confirmed cancelled "
+                    f"({None if cancel is None else cancel.outcome}); "
+                    "the stored txid is unchanged",
+                    None, {"txid": old_txid, "replacement": result.txid})
+                return False
+            await self._write_stop(position, result.txid, result.stop_price,
+                                   result.qty, "open")
+            return False
+        if old_txid:
+            cancel = await self._cancel_stop(old_txid, position)
+            if cancel is not None and cancel.outcome == "filled" and cancel.fill is not None:
+                await self._apply_external_fill(position, cancel.fill)
+                return False
+            if cancel is None or cancel.outcome != "cancelled":
+                self._error(
+                    "native_stop",
+                    f"{position.instrument.symbol}: could not cancel the resting "
+                    "stop to replace it; leaving the existing stop",
+                    None, {"txid": old_txid})
+                return False
+            # The venue stop is gone. Drop the txid before the new place so a
+            # failed replacement can flatten without trying to cancel an id
+            # that no longer exists.
+            try:
+                await self._write_stop(position, None, None, None, "cancelled")
+            except Exception as exc:
+                self._error("native_stop",
+                            "cancelled stop txid could not be cleared", exc)
+        result = await self._submit_stop(position, price, write=True, qty=target)
+        if result is None or not result.ok:
+            await self._fail_unprotected(
+                position, ctx,
+                "stop replace left the position without a confirmed stop")
+            return True
+        return False
+
+    def _reserved_base(self, position: Position) -> Decimal:
+        return reserved_for(
+            self.engine.safety_env, base_asset(position.instrument.symbol))
+
+    async def _sync_ledger_qty(self, position: Position,
+                               target: Decimal) -> Optional[Position]:
+        """Write the fee-in-base gap off the book so qty matches the stop.
+
+        The write-off is a sell at the position's own average, so realised
+        P&L on the gap is zero. It is not a venue order and it does not
+        touch the reserved manual balance.
+        """
+        gap = abs(position.qty) - target
+        if gap <= 0:
+            return position
+        if position.avg_price <= 0:
+            self._error("native_stop",
+                        f"{position.instrument.symbol} has no average price; "
+                        "cannot sync the ledger to the clipped stop", None)
+            return None
+        self._writeoff_seq = getattr(self, "_writeoff_seq", 0) + 1
+        fill = Fill(
+            order_id=(f"fee-base-writeoff:{self._writeoff_seq}:"
+                      f"{position.instrument.symbol}"),
+            instrument=position.instrument,
+            side=Side.SELL if position.qty > 0 else Side.BUY,
+            qty=gap, price=position.avg_price, fees=ZERO,
+            at=self.engine.now(), mode=self.mode,
+        )
+        await self._apply_external_fill(
+            position, fill,
+            reason="fee-in-base write-off; ledger synced to the stop qty")
+        synced = self._ledger_position(position.instrument.symbol, position.strategy_id)
+        if synced is None or abs(synced.qty) != target:
+            # apply() nets exactly; a miss means the write did not land.
+            self._error("native_stop",
+                        f"ledger for {position.instrument.symbol} did not "
+                        f"sync to {target}", None)
+            return None
+        return synced
+
+    async def _free_base(self, position: Position) -> Optional[Decimal]:
+        fn = getattr(self.adapter, "free_base", None)
+        if fn is None:
+            return None
+        try:
+            free = await _offload(fn, position.instrument)
+        except Exception as exc:
+            self._error("native_stop",
+                        f"could not read free {position.instrument.symbol}", exc)
+            return None
+        if free is None:
+            return None
+        if not isinstance(free, Decimal):
+            return None
+        return free
+
+    async def _submit_stop(self, position: Position, price: Decimal,
+                           *, write: bool = True,
+                           qty: Optional[Decimal] = None) -> Optional[StopPlaceResult]:
+        fn = getattr(self.adapter, "place_native_stop", None)
+        if fn is None:
+            return None
+        ledger = abs(position.qty)
+        if qty is None:
+            try:
+                reserved = self._reserved_base(position)
+            except ManualReservedError as exc:
+                return StopPlaceResult(
+                    False, None, ledger, price,
+                    f"MANUAL_RESERVED_BASE unreadable: {exc}")
+            free = await self._free_base(position)
+            available = non_reserved_free(free, reserved)
+            qty, decision = stop_qty_for_ledger(ledger, available)
+            if decision == "halt":
+                return StopPlaceResult(
+                    False, None, qty, price,
+                    "non-reserved free short of ledger by more than 2%")
+        if qty < ledger:
+            synced = await self._sync_ledger_qty(position, qty)
+            if synced is None:
+                return StopPlaceResult(
+                    False, None, qty, price,
+                    "could not sync the ledger down to the clipped stop qty")
+            position = synced
+        try:
+            result = await _offload(
+                fn, position.instrument, qty, price,
+                self.engine.config.stop_confirm_s)
+        except Exception as exc:
+            self._error("native_stop",
+                        f"place_native_stop raised for {position.instrument.symbol}",
+                        exc)
+            return None
+        if not isinstance(result, StopPlaceResult):
+            self._error("native_stop",
+                        f"place_native_stop returned {type(result).__name__}", None)
+            return None
+        if result.ok and result.txid and write:
+            await self._write_stop(position, result.txid, result.stop_price,
+                                   result.qty, "open")
+        return result
+
+    async def _cancel_stop(self, txid: str, position: Position):
+        fn = getattr(self.adapter, "cancel_native_stop", None)
+        if fn is None:
+            return None
+        try:
+            return await _offload(fn, txid, position.instrument)
+        except Exception as exc:
+            self._error("native_stop",
+                        f"cancel of stop {txid} raised", exc)
+            return None
+
+    async def _write_stop(self, position: Position, txid: Optional[str],
+                          price: Optional[Decimal], qty: Optional[Decimal],
+                          status: str) -> None:
+        fn = getattr(self.engine.store, "set_native_stop", None)
+        if fn is None:
+            raise RuntimeError("position store cannot persist a native stop txid")
+        await _offload(
+            _persist_native_stop, fn, self.mode, position.instrument.symbol,
+            position.strategy_id, txid, price, qty, status)
+
+    async def _apply_external_fill(self, position: Position, fill: Fill,
+                                  *, reason: str = "native exchange stop filled",
+                                  ) -> None:
+        """Book a stop that filled at the venue before our own exit did.
+
+        Qty is capped at the ledger position. A fill larger than the book
+        would be the manual balance, and this ledger does not own it.
+        """
+        qty = fill.qty
+        if qty > abs(position.qty):
+            self._error(
+                "native_stop",
+                f"stop fill {qty} on {position.instrument.symbol} exceeds "
+                f"ledger qty {abs(position.qty)}; booking the ledger qty only",
+                None)
+            qty = abs(position.qty)
+        if qty <= 0:
+            return
+        if qty != fill.qty or fill.mode is not self.mode:
+            fill = replace(fill, qty=qty, mode=self.mode)
+        intent = Intent(
+            instrument=position.instrument, side=fill.side, qty=qty,
+            order_type=OrderType.MARKET, strategy_id=position.strategy_id,
+            reason=reason,
+            limit_price=fill.price, structure_id=position.structure_id,
+            idempotency_key=f"native-stop-fill:{fill.order_id}",
+        )
+        ref = OrderRef(
+            order_id=fill.order_id, status=OrderStatus.FILLED, intent=intent,
+            mode=self.mode, filled_qty=qty, avg_price=fill.price, fills=(fill,),
+        )
+        try:
+            await _offload(self.engine.store.record_order, ref)
+            await _offload(self.engine.store.apply, fill, position.strategy_id,
+                           position.structure_id, 0)
+        except Exception as exc:
+            self._error("native_stop",
+                        f"stop fill on {fill.order_id} could not be booked", exc)
+            self.halt(f"ledger write failed for native stop fill {fill.order_id}")
+            return
+        self.fills_applied += 1
+        self._emit(EventKind.FILL,
+                   f"native stop filled {fill.side.value} {qty} "
+                   f"{fill.instrument.symbol} @ {fill.price}",
+                   {"order_id": fill.order_id, "symbol": fill.instrument.symbol,
+                    "qty": qty, "price": fill.price,
+                    "strategy_id": position.strategy_id, "source": "native_stop"})
+
+    async def _fail_unprotected(self, position: Position, ctx: MarketContext,
+                                reason: str) -> None:
+        self._error(
+            "native_stop",
+            f"{position.instrument.symbol}: {reason}; market-flattening the "
+            f"ledger qty and halting new entries",
+            None, {"qty": abs(position.qty), "reason": reason})
+        self._set_entry_halt(REASON_STOP)
+        await self._flatten_ledger(position, ctx, reason)
+
+    async def _flatten_ledger(self, position: Position, ctx: MarketContext,
+                              reason: str) -> None:
+        """Sell (or cover) exactly the ledger qty. Not the wallet."""
+        mark = ctx.quote(position.instrument.symbol)
+        if mark is None or not isinstance(mark, Decimal) or mark <= 0:
+            self._error(
+                "native_stop",
+                f"no quote for {position.instrument.symbol}; cannot flatten "
+                "without inventing a price",
+                None)
+            return
+        side = Side.SELL if position.qty > 0 else Side.BUY
+        order_type = (OrderType.MARKET if self.profile.market_orders_allowed
+                      else OrderType.LIMIT)
+        limit = mark
+        if order_type is OrderType.LIMIT:
+            snapped = _marketable_limit(
+                position.instrument, side, mark,
+                self.engine.config.square_off_cross_ticks)
+            if snapped is None:
+                self._error("native_stop",
+                            f"no marketable flatten price for "
+                            f"{position.instrument.symbol}", None)
+                return
+            limit = snapped
+        intent = Intent(
+            instrument=position.instrument, side=side, qty=abs(position.qty),
+            order_type=order_type, strategy_id=position.strategy_id,
+            reason=f"native stop unconfirmed: {reason}",
+            limit_price=limit, structure_id=position.structure_id,
+            idempotency_key=(
+                f"native-stop-flatten:{self.mode.value}:"
+                f"{position.instrument.symbol}:{position.strategy_id}:"
+                f"{self.engine.now().astimezone(UTC).isoformat()}"
+            ),
+        )
+        await self._route(intent, ctx, IntentSource.OPERATOR)
+
+    async def _arm_stop_after_entry(self, intent: Intent,
+                                    ctx: MarketContext) -> None:
+        if not self._manages_stops():
+            return
+        if intent.side is not Side.BUY:
+            return
+        live_crypto = (self.mode is Mode.LIVE
+                       and self.asset_class is AssetClass.CRYPTO)
+        if intent.stop_price is None and not live_crypto:
+            return
+        if self._orders_frozen():
+            return
+        position = self._ledger_position(intent.instrument.symbol, intent.strategy_id)
+        if position is None or position.qty <= 0:
+            return
+        price = intent.stop_price or self._protective_price(position, ctx)
+        if price is None:
+            await self._fail_unprotected(
+                position, ctx, "entry fill has no strategy stop")
+            return
+        result = await self._submit_stop(position, price, write=False)
+        if result is not None and result.ok and result.txid:
+            try:
+                await self._write_stop(position, result.txid, result.stop_price,
+                                       result.qty, "open")
+            except Exception as exc:
+                self._error("native_stop",
+                            "stop is live but its txid could not be stored", exc)
+                await self._fail_unprotected(
+                    position, ctx, "stop txid could not be stored on the position")
+            return
+        if result is not None and result.txid:
+            cancel = await self._cancel_stop(result.txid, position)
+            if cancel is not None and cancel.outcome == "filled" and cancel.fill is not None:
+                await self._apply_external_fill(position, cancel.fill)
+                self._set_entry_halt(REASON_STOP)
+                return
+            if cancel is not None and cancel.outcome == "still_open":
+                try:
+                    await self._write_stop(
+                        position, result.txid, result.stop_price, result.qty, "open")
+                except Exception as exc:
+                    self._error("native_stop", "could not adopt a visible stop", exc)
+                return
+        detail = result.reason if result is not None else "stop placement failed"
+        await self._fail_unprotected(position, ctx, detail)
+
+    async def _release_stop_before_exit(self, intent: Intent,
+                                        ctx: MarketContext) -> bool:
+        """Cancel the resting stop before an engine exit.
+
+        Returns True when the exit order itself should still be sent.
+        A stop that already filled closes the ledger and the exit is skipped.
+        """
+        if not self._manages_stops():
+            return True
+        if not _reduces(intent, ctx.positions):
+            return True
+        position = self._ledger_position(intent.instrument.symbol, intent.strategy_id)
+        if position is None or not position.stop_txid:
+            held = next((p for p in ctx.positions
+                         if p.instrument.symbol == intent.instrument.symbol
+                         and p.strategy_id == intent.strategy_id
+                         and p.stop_txid), None)
+            position = position or held
+        if position is None or not position.stop_txid:
+            return True
+        cancel = await self._cancel_stop(position.stop_txid, position)
+        if cancel is None:
+            self._error("native_stop",
+                        f"stop {position.stop_txid} could not be cancelled; "
+                        "not sending a second sell", None)
+            self._emit(EventKind.REJECTION,
+                       f"native stop on {intent.instrument.symbol} was not "
+                       "cancelled cleanly; exit not sent",
+                       {"symbol": intent.instrument.symbol,
+                        "reason": "native_stop", "txid": position.stop_txid})
+            return False
+        if cancel.outcome == "filled" and cancel.fill is not None:
+            await self._apply_external_fill(position, cancel.fill)
+            return False
+        if cancel.outcome == "cancelled":
+            return True
+        if cancel.outcome == "blocked":
+            self._emit(EventKind.REJECTION,
+                       f"key_freeze; not cancelling the stop on "
+                       f"{intent.instrument.symbol}",
+                       {"symbol": intent.instrument.symbol,
+                        "reason": "key_freeze"})
+            return False
+        self._error(
+            "native_stop",
+            f"stop {position.stop_txid} is {cancel.outcome}; not sending an "
+            f"exit that could sell twice ({cancel.reason})",
+            None)
+        self._emit(EventKind.REJECTION,
+                   f"native stop on {intent.instrument.symbol} is "
+                   f"{cancel.outcome}; exit not sent",
+                   {"symbol": intent.instrument.symbol,
+                    "reason": "native_stop", "outcome": cancel.outcome})
+        return False
+
     # -- one intent, end to end -----------------------------------------
 
     async def _route(self, intent: Intent, ctx: MarketContext,
                      source: IntentSource) -> None:
+        if self._orders_frozen():
+            self._emit(EventKind.REJECTION,
+                       f"key_freeze; refusing {intent.side.value} "
+                       f"{intent.instrument.symbol}",
+                       {**_intent_data(intent, source),
+                        "reason": "key_freeze"})
+            return
         self._emit(EventKind.INTENT,
                    f"{intent.strategy_id}: {intent.side.value} {intent.qty} "
                    f"{intent.instrument.symbol}",
@@ -1468,7 +2250,9 @@ class _ClassRunner:
         adapter = self._adapter_for(approval, source, effective)
         if adapter is None:
             return
-        await self._place(adapter, approval, effective, source)
+        if not await self._release_stop_before_exit(effective, ctx):
+            return
+        await self._place(adapter, approval, effective, source, ctx)
 
     def _adapter_for(self, approval: Approval, source: IntentSource,
                      effective: Intent) -> Optional[BrokerAdapter]:
@@ -1514,7 +2298,8 @@ class _ClassRunner:
         return adapter
 
     async def _place(self, adapter: BrokerAdapter, approval: Approval,
-                     effective: Intent, source: IntentSource) -> None:
+                     effective: Intent, source: IntentSource,
+                     ctx: Optional[MarketContext] = None) -> None:
         try:
             ref = await _offload(adapter.place, effective,
                                  self.engine.config.place_timeout_s)
@@ -1553,10 +2338,11 @@ class _ClassRunner:
                     "error": ref.error, "fills": len(ref.fills),
                     "order_mode": ref.mode})
 
-        await self._record(ref, effective, source)
+        await self._record(ref, effective, source, ctx)
 
     async def _record(self, ref: OrderRef, effective: Intent,
-                      source: IntentSource) -> None:
+                      source: IntentSource,
+                      ctx: Optional[MarketContext] = None) -> None:
         """Write the order and net every fill.
 
         record_order() stores what the venue said; apply() is what moves the
@@ -1607,6 +2393,9 @@ class _ClassRunner:
                         "strategy_id": effective.strategy_id,
                         "structure_id": effective.structure_id,
                         "source": source.value, "fill_mode": fill.mode})
+
+        if ctx is not None and any(f.side is Side.BUY and f.qty > 0 for f in ref.fills):
+            await self._arm_stop_after_entry(effective, ctx)
 
     # -- risk -----------------------------------------------------------
 
@@ -1689,8 +2478,18 @@ class Engine:
         self.events = bus or EventBus(self.config.event_buffer, clock)
         self._last_beat: Optional[dt.datetime] = None
         self._beat_lock = threading.Lock()
+        self._class_heartbeats: dict[AssetClass, dt.datetime] = {}
+        self._class_heartbeat_mono: dict[AssetClass, float] = {}
+        self._watchdog_stop = threading.Event()
+        self._watchdog: Optional[threading.Thread] = None
+        self._status_windows: list[BlackoutWindow] = []
+        self._status_fetched_mono: Optional[float] = None
+        self._blackout_config_error: Optional[str] = None
+        self._blackout_status_error: Optional[str] = None
+        self._status_fetcher: Optional[Callable[..., Any]] = None
 
         source: Mapping[str, str] = os.environ if env is None else env
+        self.safety_env: Mapping[str, str] = source
         seen_classes: set[AssetClass] = set()
         seen_strategies: dict[str, AssetClass] = {}
         runners: dict[AssetClass, _ClassRunner] = {}
@@ -1810,24 +2609,112 @@ class Engine:
 
     # -- lifecycle -------------------------------------------------------
 
+    def heartbeat_age_s(self, now: dt.datetime) -> Optional[float]:
+        """Age of the oldest class loop beat, or None if none has ticked.
+
+        The oldest, not the newest: one wedged class must not be hidden by
+        a sibling that is still looping.
+        """
+        with self._beat_lock:
+            if not self._class_heartbeats:
+                return None
+            oldest = min(self._class_heartbeats.values())
+        return (now - oldest).total_seconds()
+
+    def mark_loop_heartbeat(self, asset_class: AssetClass, now: dt.datetime) -> None:
+        with self._beat_lock:
+            self._class_heartbeats[asset_class] = now
+            self._class_heartbeat_mono[asset_class] = time.monotonic()
+
+    def heartbeat_is_stale(self, now: dt.datetime) -> bool:
+        age = self.heartbeat_age_s(now)
+        if age is None:
+            return False
+        return age > self.config.entry_heartbeat_max_age_s
+
+    def blackout_windows(self) -> list[BlackoutWindow]:
+        configured, error = load_configured_windows(self.safety_env)
+        self._blackout_config_error = error
+        return list(configured) + list(self._status_windows)
+
+    def blackout_is_active(self, now: Optional[dt.datetime] = None) -> bool:
+        moment = self.now() if now is None else now
+        return blackout_active(moment, self.blackout_windows())
+
+    def refresh_blackout(self) -> None:
+        """Reload configured windows and, on a timer, the status page.
+
+        A failed fetch keeps the previous status windows and records the
+        error. It does not clear configured windows and it does not invent
+        a blackout.
+        """
+        configured, error = load_configured_windows(self.safety_env)
+        self._blackout_config_error = error
+        if not self.config.blackout_status_fetch:
+            self._persist_blackout_cache(configured)
+            return
+        now_m = time.monotonic()
+        due = (self._status_fetched_mono is None
+               or now_m - self._status_fetched_mono >= 60.0)
+        if due:
+            self._status_fetched_mono = now_m
+            try:
+                fetched, fetch_error = fetch_status_windows(self._status_fetcher)
+            except Exception as exc:
+                fetched, fetch_error = [], repr(exc)
+            if fetch_error and not fetched:
+                self._blackout_status_error = fetch_error
+            else:
+                self._status_windows = fetched
+                self._blackout_status_error = None
+        self._persist_blackout_cache(configured)
+
+    def _persist_blackout_cache(self, configured: Sequence[BlackoutWindow]) -> None:
+        control = self.control
+        if control is None:
+            return
+        payload = json.dumps(
+            [w.to_json() for w in self._status_windows],
+            separators=(",", ":"),
+        )
+
+        def mutation(row: Optional[Mapping[str, str]]) -> Mapping[str, str]:
+            current = dict(row or {})
+            current.setdefault("paused", "0")
+            current["blackout_status_json"] = payload
+            if self._blackout_config_error:
+                current["blackout_config_error"] = self._blackout_config_error
+            else:
+                current.pop("blackout_config_error", None)
+            return current
+
+        try:
+            control.mutate(CONTROL_ENGINE_SCOPE, mutation)
+        except Exception as exc:
+            LOG.error("blackout cache write failed: %r", exc)
+
     async def beat(self) -> None:
         """Stamp the engine-wide heartbeat the API reads to decide "alive".
 
-        Throttled to `heartbeat_interval_s` because it is a database write on
-        the tick path and every class calls it. A failure is logged and NOT
-        raised: a heartbeat that cannot be written must not take down the
-        trading loop it exists to describe — the API will report the beat as
-        stale, which is the truth.
+        The stamp is the oldest class beat, so a wedged sibling is not
+        painted over by a class that is still looping. Throttled to
+        `heartbeat_interval_s` because it is a database write on the tick
+        path. A failure is logged and NOT raised: a heartbeat that cannot
+        be written must not take down the trading loop it exists to
+        describe — the API will report the beat as stale, which is the truth.
         """
         if self.control is None:
             return
         now = self.now()
+        oldest = None
         with self._beat_lock:
             last = self._last_beat
             if last is not None and (now - last).total_seconds() < self.config.heartbeat_interval_s:
                 return
             self._last_beat = now
-        stamp = now.astimezone(UTC).isoformat()
+            if self._class_heartbeats:
+                oldest = min(self._class_heartbeats.values())
+        stamp = (oldest or now).astimezone(UTC).isoformat()
 
         def mutation(row: Optional[Mapping[str, str]]) -> Mapping[str, str]:
             # Copied through so an engine-wide control row written by anything
@@ -1876,6 +2763,51 @@ class Engine:
                 ],
             })
 
+    def _start_watchdog(self) -> None:
+        """Kill the process if the loop stops stamping beats.
+
+        A thread, not a task: a wedged event loop cannot serve /health, so
+        the thing that notices has to be off that loop. ``os._exit`` is
+        deliberate — ``sys.exit`` can be swallowed by a stuck interpreter
+        frame, and Fly only restarts a process that has actually died.
+        """
+        if not self.config.watchdog_enabled or self._watchdog is not None:
+            return
+        self._watchdog_stop.clear()
+        thread = threading.Thread(
+            target=self._watchdog_loop, name="heartbeat-watchdog", daemon=True)
+        thread.start()
+        self._watchdog = thread
+
+    def _stop_watchdog(self) -> None:
+        self._watchdog_stop.set()
+        thread = self._watchdog
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        self._watchdog = None
+
+    def _watchdog_loop(self) -> None:
+        dead = self.config.dead_heartbeat_s
+        started = time.monotonic()
+        while not self._watchdog_stop.wait(min(5.0, max(dead / 4.0, 0.5))):
+            if not self._running:
+                continue
+            with self._beat_lock:
+                stamps = list(self._class_heartbeat_mono.values())
+            now_m = time.monotonic()
+            if not stamps:
+                if now_m - started > dead:
+                    LOG.critical(
+                        "watchdog: engine running %.0fs with no loop heartbeat; exiting",
+                        dead)
+                    os._exit(3)
+                continue
+            if now_m - min(stamps) > dead:
+                LOG.critical(
+                    "watchdog: loop heartbeat older than %.0fs; exiting so the "
+                    "supervisor restarts the machine", dead)
+                os._exit(3)
+
     async def start(self) -> None:
         """Spawn one loop per asset class. Returns immediately."""
         if self._running:
@@ -1885,6 +2817,7 @@ class Engine:
         self._stopping = False
         self._running = True
         self._started_at = self.now()
+        self._start_watchdog()
         self._tasks = [
             asyncio.create_task(runner.loop(self._stop),
                                 name=f"trader-{runner.asset_class.value}")
@@ -1914,6 +2847,7 @@ class Engine:
                    else drain_timeout_s)
         self._stopping = True
         self._stop.set()
+        self._stop_watchdog()
         self.events.publish(EventKind.SHUTDOWN, "shutdown requested; draining",
                             data={"drain_timeout_s": timeout})
 

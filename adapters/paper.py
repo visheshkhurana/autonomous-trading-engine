@@ -31,6 +31,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable, Optional, Protocol, Sequence, runtime_checkable
 
 from core.profiles import AssetClassProfile, profile_for
+from core.safety import StopCancelResult, StopPlaceResult
 from core.types import (
     AssetClass,
     Fill,
@@ -301,6 +302,10 @@ class PaperAdapter:
     """
 
     mode: Mode = Mode.PAPER
+    # Same stop lifecycle as KrakenAdapter, against this process's book.
+    # The resting stop qty is the qty the caller passes (the ledger), never
+    # this adapter's cash or the sum of its simulated positions.
+    manages_native_stops: bool = True
 
     def __init__(
         self,
@@ -341,6 +346,12 @@ class PaperAdapter:
         self._orders: dict[str, OrderRef] = {}
         self._working: set[str] = set()
         self._cancel_requested: set[str] = set()
+        self._stops: dict[str, "_PaperStop"] = {}
+        self._stop_seq = 0
+        # Capacity for a second overlapping stop. Not a size. None means
+        # "cannot tell", and the engine then cancels before replacing.
+        self._stop_free: Optional[Decimal] = Decimal("1000000")
+        self.fail_native_stop = False
 
     # -- introspection ------------------------------------------------------
 
@@ -659,3 +670,80 @@ class PaperAdapter:
         with self._lock:
             self._orders[ref.order_id] = ref
         return ref
+
+    # -- native stops (same contract as KrakenAdapter) ---------------------
+
+    def free_base(self, instrument: Instrument) -> Optional[Decimal]:
+        return self._stop_free
+
+    def place_native_stop(
+        self, instrument: Instrument, qty: Decimal, stop_price: Decimal,
+        timeout_s: float = 10.0,
+    ) -> StopPlaceResult:
+        if qty <= 0 or stop_price <= 0:
+            return StopPlaceResult(False, None, qty, stop_price,
+                                   "stop qty and price must be > 0")
+        if self.fail_native_stop:
+            return StopPlaceResult(
+                False, None, qty, stop_price,
+                "paper native stop rejected before it rested",
+            )
+        with self._lock:
+            self._stop_seq += 1
+            txid = f"PAPER-STOP-{self.asset_class.value}-{self._stop_seq:06d}"
+            self._stops[txid] = _PaperStop(
+                txid=txid, instrument=instrument, qty=qty, stop_price=stop_price,
+            )
+        return StopPlaceResult(True, txid, qty, stop_price, "open")
+
+    def native_stop_open(self, txid: str, instrument: Instrument) -> Optional[bool]:
+        with self._lock:
+            return txid in self._stops
+
+    def describe_native_stop(self, txid: str, instrument: Instrument) -> StopCancelResult:
+        """Read a paper stop without cancelling it.
+
+        A trigger that already printed is a fill. An id this book does not
+        hold is unknown, not a licence to sell again.
+        """
+        with self._lock:
+            resting = self._stops.get(txid)
+            if resting is None:
+                return StopCancelResult("unknown", reason=f"no paper stop {txid}")
+            quote = self._live_quote(resting.instrument)
+            triggered = quote is not None and quote.price <= resting.stop_price
+            if not triggered:
+                return StopCancelResult("still_open", reason="resting")
+            self._stops.pop(txid, None)
+            fill = Fill(
+                order_id=txid, instrument=resting.instrument, side=Side.SELL,
+                qty=resting.qty, price=resting.stop_price, fees=Decimal("0"),
+                at=self._now(), mode=Mode.PAPER,
+            )
+            return StopCancelResult("filled", fill=fill, reason="paper stop triggered")
+
+    def cancel_native_stop(self, txid: str, instrument: Instrument) -> StopCancelResult:
+        with self._lock:
+            resting = self._stops.get(txid)
+            if resting is None:
+                return StopCancelResult("unknown", reason=f"no paper stop {txid}")
+            quote = self._live_quote(resting.instrument)
+            triggered = quote is not None and quote.price <= resting.stop_price
+            self._stops.pop(txid, None)
+            if triggered:
+                fill = Fill(
+                    order_id=txid, instrument=resting.instrument, side=Side.SELL,
+                    qty=resting.qty, price=resting.stop_price, fees=Decimal("0"),
+                    at=self._now(), mode=Mode.PAPER,
+                )
+                return StopCancelResult("filled", fill=fill,
+                                        reason="paper stop already triggered")
+        return StopCancelResult("cancelled", reason="cancelled")
+
+
+@dataclass(frozen=True)
+class _PaperStop:
+    txid: str
+    instrument: Instrument
+    qty: Decimal
+    stop_price: Decimal

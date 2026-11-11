@@ -141,7 +141,23 @@ class CryptoEmaTrendStrategy(StrategyBase):
             instrument=instrument, side=Side.BUY,
             qty=self.entry_unit_qty(instrument),
             reason=reason, decision_ts=last.ts, tag="entry", ref_price=quote,
+            stop_price=stop,
         )
+
+    def protective_stop(self, ctx, position):
+        """Current ATR/hard-floor stop for the open long. None if bars are short."""
+        try:
+            bars = self.bars_for(
+                ctx, position.instrument.symbol, min_bars=self.min_bars, must_have=False,
+            )
+        except Exception:
+            return None
+        if not bars or position.avg_price <= 0:
+            return None
+        vol = atr(bars, self.atr_period)
+        if vol is None or vol <= 0:
+            return None
+        return self._stop_level(position.avg_price, vol)
 
     def _stop_level(self, entry_price: Decimal, vol: Decimal) -> Decimal:
         atr_stop = entry_price - self.atr_stop_mult * vol

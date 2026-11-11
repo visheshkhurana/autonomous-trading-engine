@@ -148,7 +148,15 @@ class CryptoBreakoutStrategy(StrategyBase):
             instrument=instrument, side=Side.BUY,
             qty=self.entry_unit_qty(instrument),
             reason=reason, decision_ts=last.ts, tag="entry", ref_price=quote,
+            stop_price=stop,
         )
+
+    def protective_stop(self, ctx, position):
+        """Hard percentage floor under the fill. The channel exit is the
+        strategy's own sell, not a second exchange price."""
+        if position.avg_price <= 0:
+            return None
+        return position.avg_price * (Decimal(1) - self.max_loss_pct)
 
     def _exit(self, instrument: Instrument, entry_price: Decimal, qty: Decimal,
               bars: Sequence[Bar], quote: Decimal) -> Optional[Intent]:
