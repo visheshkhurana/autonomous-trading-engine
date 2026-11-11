@@ -9,6 +9,7 @@ import asyncio
 import datetime as dt
 import json
 from decimal import Decimal
+from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -20,8 +21,9 @@ from api.server import ApiSettings, create_app
 from core.gate import ClassLimits, GateConfig, OrderGate
 from core.risk import RiskCircuit
 from core.safety import (
-    fetch_status_windows, key_freeze_active, load_configured_windows,
-    overlap_stops_allowed, stop_qty_for_ledger, windows_from_status_payload,
+    blackout_active, blackout_causes, fetch_status_windows, key_freeze_active,
+    load_configured_windows, overlap_stops_allowed, status_max_window,
+    stop_qty_for_ledger, windows_from_status_payload,
 )
 from core.store import SQLitePositionStore
 from core.types import (
@@ -185,7 +187,8 @@ def _sell(qty="0.01", key="x1", instrument=BTC) -> Intent:
     )
 
 
-def _engine(tmp_path, adapter, strategy, *, env=None, live=False, clock=None):
+def _engine(tmp_path, adapter, strategy, *, env=None, live=False, clock=None,
+            blackout_status_fetch=False):
     clock = clock or Clock()
     env = {} if env is None else dict(env)
     store = SQLitePositionStore(str(tmp_path / "book.db"))
@@ -222,7 +225,7 @@ def _engine(tmp_path, adapter, strategy, *, env=None, live=False, clock=None):
             requested_mode=mode,
             close_store_on_stop=False,
             watchdog_enabled=False,
-            blackout_status_fetch=False,
+            blackout_status_fetch=blackout_status_fetch,
         ),
         clock=clock, env=env,
     )
@@ -704,9 +707,10 @@ def test_configured_windows_apply_and_a_bad_file_does_not_fail_closed(tmp_path):
 
 def test_status_page_windows_are_padded_and_a_failed_fetch_adds_none():
     payload = {"scheduled_maintenances": [{
-        "name": "matching engine",
+        "name": "REST API maintenance",
         "scheduled_for": "2026-11-12T12:00:00.000Z",
         "scheduled_until": "2026-11-12T13:00:00.000Z",
+        "components": [{"name": "REST"}],
     }]}
     windows = windows_from_status_payload(payload)
     assert windows[0].start == dt.datetime(2026, 11, 12, 11, 45, tzinfo=UTC)
@@ -714,6 +718,188 @@ def test_status_page_windows_are_padded_and_a_failed_fetch_adds_none():
     fetched, error = fetch_status_windows(opener=lambda url: (_ for _ in ()).throw(RuntimeError("down")))
     assert fetched == []
     assert error
+
+
+STATUS_FIXTURE = Path(__file__).parent / "fixtures" / "kraken_status_2026_11_11.json"
+
+
+def _status_fixture() -> dict:
+    return json.loads(STATUS_FIXTURE.read_text(encoding="utf-8"))
+
+
+def _windows_from_fixture(doc: dict, **kw) -> list:
+    windows = []
+    for key in ("active", "upcoming"):
+        windows.extend(windows_from_status_payload(doc[key], **kw))
+    return windows
+
+
+def test_today_status_page_ignores_the_delisting_and_ends_stale_api_maintenance():
+    """The 11 Nov 2026 status page, as published.
+
+    The delisting notice is scheduled_for 24 Sep 14:25Z through scheduled_until
+    10 Dec 15:05Z. The previous gate padded that to 14:10Z–15:35Z and blocked
+    every new entry inside it. It must not be a blackout.
+
+    The WebSocket/FIX/REST maintenance is still ``in_progress`` after 14:00Z.
+    It ends at scheduled_until plus the 30 minute pad (14:30Z), not "until
+    Kraken edits the page".
+    """
+    windows = _windows_from_fixture(_status_fixture())
+    names = {w.name for w in windows}
+    assert names == {
+        "WebSocket, FIX + REST API Maintenance",
+        "Derivatives Platform Maintenance",
+        "Kraken Website and API Maintenance",
+    }
+    api = next(w for w in windows if w.name.startswith("WebSocket"))
+    assert api.end == dt.datetime(2026, 11, 11, 14, 30, tzinfo=UTC)
+    assert api.start == dt.datetime(2026, 11, 11, 6, 45, tzinfo=UTC)
+    assert api.contains(dt.datetime(2026, 11, 11, 13, 0, tzinfo=UTC))
+    # Still inside the 30 minute pad, even though scheduled_until has passed.
+    assert api.contains(dt.datetime(2026, 11, 11, 14, 15, tzinfo=UTC))
+    assert not api.contains(dt.datetime(2026, 11, 11, 14, 30, tzinfo=UTC))
+    stale = dt.datetime(2026, 11, 11, 14, 36, tzinfo=UTC)
+    assert not api.contains(stale)
+    assert blackout_active(stale, windows) is False
+    # Dual-investments (15:00Z) and the banking window are not trading.
+    assert blackout_active(dt.datetime(2026, 11, 11, 15, 5, tzinfo=UTC), windows) is False
+    assert blackout_active(dt.datetime(2026, 11, 21, 12, 0, tzinfo=UTC), windows) is False
+    # The old padded delisting bounds themselves are not a blackout.
+    assert blackout_active(dt.datetime(2026, 9, 24, 14, 10, tzinfo=UTC), windows) is False
+    assert blackout_active(dt.datetime(2026, 12, 10, 15, 35, tzinfo=UTC), windows) is False
+
+    website = next(w for w in windows if "Website and API" in w.name)
+    assert website.start == dt.datetime(2026, 11, 12, 7, 46, tzinfo=UTC)
+    assert website.end == dt.datetime(2026, 11, 12, 8, 46, tzinfo=UTC)
+    assert website.contains(dt.datetime(2026, 11, 12, 7, 50, tzinfo=UTC))
+    assert website.contains(dt.datetime(2026, 11, 12, 8, 10, tzinfo=UTC))
+    assert website.contains(dt.datetime(2026, 11, 12, 8, 40, tzinfo=UTC))
+    assert not website.contains(dt.datetime(2026, 11, 12, 7, 45, tzinfo=UTC))
+    assert not website.contains(dt.datetime(2026, 11, 12, 8, 46, tzinfo=UTC))
+
+
+def test_a_short_delisting_and_asset_rails_are_not_blackouts():
+    """The 12 hour cap is not what drops a delisting. The subject is."""
+    short = {"scheduled_maintenances": [{
+        "name": "Notice of scheduled asset delistings - August 2026",
+        "status": "scheduled",
+        "scheduled_for": "2026-11-11T14:00:00.000Z",
+        "scheduled_until": "2026-11-11T14:30:00.000Z",
+        "components": [{"name": "REST"}],
+    }, {
+        "name": "API3 (API3) - Ethereum funding",
+        "status": "scheduled",
+        "scheduled_for": "2026-11-11T14:00:00.000Z",
+        "scheduled_until": "2026-11-11T14:30:00.000Z",
+        "components": [{"name": "API3 (API3) - Ethereum"}],
+    }, {
+        "name": "Website maintenance",
+        "status": "scheduled",
+        "scheduled_for": "2026-11-11T14:00:00.000Z",
+        "scheduled_until": "2026-11-11T14:15:00.000Z",
+        "components": [{"name": "Website"}],
+    }, {
+        "name": "US derivatives maintenance",
+        "status": "scheduled",
+        "scheduled_for": "2026-11-11T14:00:00.000Z",
+        "scheduled_until": "2026-11-11T14:15:00.000Z",
+        "components": [{"name": "Order Placement"}],
+    }]}
+    windows = windows_from_status_payload(short)
+    assert [w.name for w in windows] == ["US derivatives maintenance"]
+    assert windows[0].start == dt.datetime(2026, 11, 11, 13, 45, tzinfo=UTC)
+    assert windows[0].end == dt.datetime(2026, 11, 11, 14, 45, tzinfo=UTC)
+
+
+def test_status_windows_longer_than_the_cap_are_ignored_and_the_cap_is_configurable():
+    twelve = {
+        "name": "REST API maintenance",
+        "status": "scheduled",
+        "scheduled_for": "2026-11-11T07:00:00.000Z",
+        "scheduled_until": "2026-11-11T19:00:00.000Z",
+        "components": [{"name": "REST"}],
+    }
+    just_over = dict(twelve, scheduled_until="2026-11-11T19:00:01.000Z")
+    kept = windows_from_status_payload({"scheduled_maintenances": [twelve]})
+    assert len(kept) == 1
+    assert kept[0].end == dt.datetime(2026, 11, 11, 19, 30, tzinfo=UTC)
+    assert windows_from_status_payload({"scheduled_maintenances": [just_over]}) == []
+    assert status_max_window({}) == dt.timedelta(hours=12)
+    wider = status_max_window({"KRAKEN_STATUS_MAX_WINDOW_H": "13"})
+    assert windows_from_status_payload(
+        {"scheduled_maintenances": [just_over]}, max_window=wider)
+    doc = _status_fixture()
+
+    def opener(url: str) -> dict:
+        if url.endswith("/active.json"):
+            return doc["active"]
+        return doc["upcoming"]
+
+    fetched, error = fetch_status_windows(
+        opener, env={"KRAKEN_STATUS_MAX_WINDOW_H": "6"})
+    assert error is None
+    assert "WebSocket, FIX + REST API Maintenance" not in {w.name for w in fetched}
+    assert "Kraken Website and API Maintenance" in {w.name for w in fetched}
+
+
+def test_configured_blackout_applies_when_the_status_page_does_not():
+    doc = _status_fixture()
+    status = _windows_from_fixture(doc)
+    now = dt.datetime(2026, 11, 11, 14, 36, tzinfo=UTC)
+    assert blackout_active(now, status) is False
+    configured, err = load_configured_windows({
+        "BLACKOUT_WINDOWS": json.dumps([{
+            "start": "2026-09-24T14:10:00Z",
+            "end": "2026-12-10T15:35:00Z",
+            "name": "owner halt",
+        }]),
+    })
+    assert err is None
+    assert len(configured) == 1
+    combined = list(configured) + status
+    assert blackout_active(now, combined) is True
+    assert blackout_causes(now, combined) == [
+        {"source": "configured", "name": "owner halt"},
+    ]
+    failed, fetch_err = fetch_status_windows(
+        opener=lambda url: (_ for _ in ()).throw(RuntimeError("down")))
+    assert failed == []
+    assert fetch_err
+    assert blackout_active(now, list(configured) + failed) is True
+
+
+def test_engine_refresh_drops_the_delisting_and_honours_the_window_cap(tmp_path):
+    doc = _status_fixture()
+
+    def opener(url: str) -> dict:
+        if url.endswith("/active.json"):
+            return doc["active"]
+        if url.endswith("/upcoming.json"):
+            return doc["upcoming"]
+        raise AssertionError(url)
+
+    engine, store, _clock = _engine(
+        tmp_path, StopBook(), NamingStrategy([]),
+        env={"KRAKEN_STATUS_MAX_WINDOW_H": "6"},
+        blackout_status_fetch=True,
+    )
+    engine._status_fetcher = opener
+    try:
+        engine.refresh_blackout()
+        names = {w.name for w in engine._status_windows}
+        assert "WebSocket, FIX + REST API Maintenance" not in names
+        assert "Notice of scheduled asset delistings - August 2026" not in names
+        assert "Kraken Website and API Maintenance" in names
+        assert engine.blackout_is_active(dt.datetime(2026, 11, 11, 14, 36, tzinfo=UTC)) is False
+        assert engine.blackout_is_active(dt.datetime(2026, 11, 12, 8, 0, tzinfo=UTC)) is True
+        engine._status_fetcher = lambda url: (_ for _ in ()).throw(RuntimeError("down"))
+        engine._status_fetched_mono = None
+        engine.refresh_blackout()
+        assert {w.name for w in engine._status_windows} == names
+        assert engine._blackout_status_error
+    finally:
+        store.close()
 
 
 def test_two_stops_cannot_exceed_ledger_qty_from_non_reserved_balance():
@@ -949,6 +1135,7 @@ def test_state_reports_heartbeat_blackout_freeze_and_native_stop(tmp_path):
     assert body["entries_block_reason"] == "key_freeze"
     assert body["heartbeat_age_s"] == pytest.approx(90, abs=1)
     assert body["blackout_active"] is True
+    assert body["blackout_causes"] == [{"source": "configured", "name": ""}]
     assert body["next_window"]["source"] == "config"
     native = body["classes"]["crypto"]["positions"][0]["native_stop"]
     assert native["status"] == "open"
@@ -957,6 +1144,81 @@ def test_state_reports_heartbeat_blackout_freeze_and_native_stop(tmp_path):
     ready = TestClient(app).get("/ready", headers=AUTH).json()
     assert ready["entries_allowed"] is False
     assert ready["entries_block_reason"] == "key_freeze"
+
+
+def test_state_names_the_status_page_incident_and_drops_a_cached_delisting():
+    """A cache written before the filter still names today's delisting.
+
+    The old gate stored it as 24 Sep 14:10Z–10 Dec 15:35Z (the published
+    span plus padding). /api/state must not report that as the cause.
+    """
+    moment = dt.datetime(2026, 11, 11, 14, 36, tzinfo=UTC)
+    control = MemoryControlStore()
+    control.rows["__engine__"] = {
+        "heartbeat_at": moment.isoformat(),
+        "paused": "0",
+        "blackout_status_json": json.dumps([
+            {
+                "start": "2026-09-24T14:10:00+00:00",
+                "end": "2026-12-10T15:35:00+00:00",
+                "source": "kraken_status",
+                "name": "Notice of scheduled asset delistings - August 2026",
+            },
+            {
+                "start": "2026-11-11T00:00:00+00:00",
+                "end": "2026-11-11T16:00:00+00:00",
+                "source": "kraken_status",
+                "name": "REST API maintenance",
+            },
+            {
+                "start": "2026-11-12T07:46:00+00:00",
+                "end": "2026-11-12T08:46:00+00:00",
+                "source": "kraken_status",
+                "name": "Kraken Website and API Maintenance",
+            },
+        ]),
+    }
+
+    class _Clock:
+        def __init__(self, at: dt.datetime) -> None:
+            self.at = at
+
+        def __call__(self) -> dt.datetime:
+            return self.at
+
+    clock = _Clock(moment)
+    handle = build_handle(control=control, clock=clock)
+    app = create_app(handle, ApiSettings(token=TOKEN), env={})
+    client = TestClient(app)
+    body = client.get("/api/state", headers=AUTH).json()
+    assert body["blackout_active"] is False
+    assert body["blackout_causes"] == []
+    assert body["entries_allowed"] is True
+    assert body["next_window"]["name"] == "Kraken Website and API Maintenance"
+    assert body["next_window"]["source"] == "kraken_status"
+
+    clock.at = dt.datetime(2026, 11, 12, 8, 0, tzinfo=UTC)
+    control.rows["__engine__"]["heartbeat_at"] = clock.at.isoformat()
+    during = client.get("/api/state", headers=AUTH).json()
+    assert during["blackout_active"] is True
+    assert during["blackout_causes"] == [{
+        "source": "status_page",
+        "name": "Kraken Website and API Maintenance",
+    }]
+    assert during["entries_block_reason"] == "blackout"
+
+    both = create_app(handle, ApiSettings(token=TOKEN), env={
+        "BLACKOUT_WINDOWS": json.dumps([{
+            "start": "2026-11-12T08:00:00Z",
+            "end": "2026-11-12T09:00:00Z",
+            "name": "owner halt",
+        }]),
+    })
+    stacked = TestClient(both).get("/api/state", headers=AUTH).json()
+    assert stacked["blackout_causes"] == [
+        {"source": "status_page", "name": "Kraken Website and API Maintenance"},
+        {"source": "configured", "name": "owner halt"},
+    ]
 
 
 def test_health_and_live_fail_when_the_heartbeat_is_past_the_dead_threshold():
