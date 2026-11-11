@@ -1421,6 +1421,61 @@ class KrakenAdapter:
             )
         if not isinstance(order, dict):
             return StopCancelResult("unknown", reason=f"stop {txid} read was not an order")
+        return self._stop_order_result(txid, instrument, order, cancel_error)
+
+    def _stop_fill(self, instrument: Instrument, txid: str,
+                   order: Mapping[str, Any], filled: Decimal) -> Optional[Fill]:
+        if filled <= 0:
+            return None
+        price = _dec_opt(order.get("average"))
+        if price is None or price <= 0:
+            cost = _dec_opt(order.get("cost"))
+            if cost is not None and filled > 0:
+                price = cost / filled
+        if price is None or price <= 0:
+            return None
+        base = base_asset(instrument.symbol)
+        raw_symbol = str(order.get("symbol") or "")
+        quote = raw_symbol.split("/", 1)[1].split(":", 1)[0] if "/" in raw_symbol else ""
+        quote = quote.upper() or self.base_currency
+        fee, _note = self._fees_in_quote(
+            self._fee_entries(order), base, quote, price)
+        return Fill(
+            order_id=txid, instrument=instrument, side=Side.SELL,
+            qty=filled, price=price, fees=fee,
+            at=self._timestamp(order) or self._now(), mode=self.mode,
+        )
+
+    def describe_native_stop(self, txid: str, instrument: Instrument) -> StopCancelResult:
+        """Read a stop without cancelling it.
+
+        Used when the id is no longer on the open-order book. A fill must be
+        booked before any new sell; an unreadable order stays unknown so the
+        txid is not forgotten.
+        """
+        if self._key_freeze():
+            return StopCancelResult(
+                "blocked", reason="key_freeze: not reading the stop to modify it",
+            )
+        symbol = self.resolve_symbol(instrument)
+        if symbol is None:
+            return StopCancelResult(
+                "unknown", reason=f"{instrument.symbol}: no market for {txid}",
+            )
+        try:
+            order = self._ex.fetch_order(txid, symbol)
+        except Exception as exc:
+            return StopCancelResult(
+                "unknown", reason=f"could not read stop {txid}: {exc!r}",
+            )
+        return self._stop_order_result(txid, instrument, order, cancel_error=None)
+
+    def _stop_order_result(
+        self, txid: str, instrument: Instrument, order: Any,
+        cancel_error: Optional[BaseException],
+    ) -> StopCancelResult:
+        if not isinstance(order, dict):
+            return StopCancelResult("unknown", reason=f"stop {txid} read was not an order")
         requested = _dec_opt(order.get("amount")) or Decimal("0")
         status = self._map_status(order, requested)
         filled = _dec_opt(order.get("filled")) or Decimal("0")
@@ -1436,25 +1491,8 @@ class KrakenAdapter:
             return StopCancelResult("cancelled", reason="cancelled")
         return StopCancelResult(
             "still_open",
-            reason=f"stop {txid} still open after cancel"
+            reason=f"stop {txid} still open"
             + (f" ({cancel_error!r})" if cancel_error else ""),
-        )
-
-    def _stop_fill(self, instrument: Instrument, txid: str,
-                   order: Mapping[str, Any], filled: Decimal) -> Optional[Fill]:
-        if filled <= 0:
-            return None
-        price = _dec_opt(order.get("average"))
-        if price is None or price <= 0:
-            cost = _dec_opt(order.get("cost"))
-            if cost is not None and filled > 0:
-                price = cost / filled
-        if price is None or price <= 0:
-            return None
-        return Fill(
-            order_id=txid, instrument=instrument, side=Side.SELL,
-            qty=filled, price=price, fees=Decimal("0"),
-            at=self._timestamp(order) or self._now(), mode=self.mode,
         )
 
     # --------------------------------------------------------------- cancelling

@@ -700,6 +700,28 @@ class PaperAdapter:
         with self._lock:
             return txid in self._stops
 
+    def describe_native_stop(self, txid: str, instrument: Instrument) -> StopCancelResult:
+        """Read a paper stop without cancelling it.
+
+        A trigger that already printed is a fill. An id this book does not
+        hold is unknown, not a licence to sell again.
+        """
+        with self._lock:
+            resting = self._stops.get(txid)
+            if resting is None:
+                return StopCancelResult("unknown", reason=f"no paper stop {txid}")
+            quote = self._live_quote(resting.instrument)
+            triggered = quote is not None and quote.price <= resting.stop_price
+            if not triggered:
+                return StopCancelResult("still_open", reason="resting")
+            self._stops.pop(txid, None)
+            fill = Fill(
+                order_id=txid, instrument=resting.instrument, side=Side.SELL,
+                qty=resting.qty, price=resting.stop_price, fees=Decimal("0"),
+                at=self._now(), mode=Mode.PAPER,
+            )
+            return StopCancelResult("filled", fill=fill, reason="paper stop triggered")
+
     def cancel_native_stop(self, txid: str, instrument: Instrument) -> StopCancelResult:
         with self._lock:
             resting = self._stops.get(txid)

@@ -1644,6 +1644,13 @@ class _ClassRunner:
                     if await self._maybe_replace_stop(position, ctx):
                         failed = True
                     continue
+                # Not on the open book. That can be a fill, a cancel, or a
+                # read we cannot trust. Reconcile the txid before any new sell.
+                reconciled = await self._reconcile_absent_stop(position)
+                if reconciled != "place":
+                    if reconciled == "filled":
+                        protected_required = False
+                    continue
             if not self._stop_required(position):
                 continue
             price = self._protective_price(position, ctx)
@@ -1692,9 +1699,50 @@ class _ClassRunner:
         if not position.stop_txid:
             return
         visible = await self._stop_is_open(position)
-        if visible is False:
-            await self._write_stop(position, None, position.stop_price,
-                                   position.stop_qty, "missing")
+        if visible is not False:
+            return
+        # Keep the txid. An open-order miss is not proof the stop is gone,
+        # and key freeze must not forget an order it is not allowed to replace.
+        await self._write_stop(position, position.stop_txid, position.stop_price,
+                               position.stop_qty, "not_open")
+
+    async def _reconcile_absent_stop(self, position: Position) -> str:
+        """What to do with a stop that is not on the open-order book.
+
+        ``filled`` — the fill was booked. ``keep`` — outcome unknown or still
+        working; the txid stays. ``place`` — the venue confirmed the order is
+        gone with no fill, so a new stop may be rested.
+        """
+        described = await self._describe_stop(position)
+        outcome = None if described is None else described.outcome
+        if outcome == "filled" and described is not None and described.fill is not None:
+            await self._apply_external_fill(position, described.fill)
+            return "filled"
+        if outcome == "cancelled":
+            try:
+                await self._write_stop(position, None, None, None, "cancelled")
+            except Exception as exc:
+                self._error("native_stop",
+                            f"could not clear cancelled stop {position.stop_txid}", exc)
+                return "keep"
+            return "place"
+        self._error(
+            "native_stop",
+            f"stop {position.stop_txid} on {position.instrument.symbol} is "
+            f"not open and its outcome is {outcome or 'unknown'}; keeping the txid",
+            None)
+        return "keep"
+
+    async def _describe_stop(self, position: Position):
+        fn = getattr(self.adapter, "describe_native_stop", None)
+        if fn is None or not position.stop_txid:
+            return None
+        try:
+            return await _offload(fn, position.stop_txid, position.instrument)
+        except Exception as exc:
+            self._error("native_stop",
+                        f"could not read stop {position.stop_txid}", exc)
+            return None
 
     async def _stop_is_open(self, position: Position) -> Optional[bool]:
         fn = getattr(self.adapter, "native_stop_open", None)
@@ -1768,6 +1816,35 @@ class _ClassRunner:
                 if result.txid:
                     await self._cancel_stop(result.txid, position)
                 await self._apply_external_fill(position, cancel.fill)
+                return False
+            if cancel is None or cancel.outcome != "cancelled":
+                # The new stop may be live and the old one may be too. Do not
+                # forget the old txid. Roll the new order back; if that also
+                # fails, remember its id on the status without replacing the
+                # stored txid.
+                rolled = None
+                if result.txid:
+                    rolled = await self._cancel_stop(result.txid, position)
+                if rolled is not None and rolled.outcome == "filled" and rolled.fill is not None:
+                    await self._apply_external_fill(position, rolled.fill)
+                    return False
+                remembered = (rolled is not None and rolled.outcome == "cancelled")
+                if not remembered and result.txid:
+                    try:
+                        await self._write_stop(
+                            position, old_txid, position.stop_price,
+                            position.stop_qty, f"overlap:{result.txid}")
+                    except Exception as exc:
+                        self._error("native_stop",
+                                    "could not remember the unretired replacement stop",
+                                    exc)
+                self._error(
+                    "native_stop",
+                    f"{position.instrument.symbol}: previous stop {old_txid} "
+                    f"was not confirmed cancelled "
+                    f"({None if cancel is None else cancel.outcome}); "
+                    "the stored txid is unchanged",
+                    None, {"txid": old_txid, "replacement": result.txid})
                 return False
             await self._write_stop(position, result.txid, result.stop_price,
                                    result.qty, "open")

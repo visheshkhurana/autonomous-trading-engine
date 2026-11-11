@@ -75,6 +75,8 @@ class StopBook:
         self.timeouts: list[float] = []
         self.filled_on_cancel = False
         self.fail_next = False
+        self.sticky_ids: set[str] = set()
+        self.filled_reports: dict[str, Fill] = {}
         # Sum of qtys if a new stop is placed while another is still open.
         self.concurrent: list[D] = []
 
@@ -125,9 +127,20 @@ class StopBook:
     def native_stop_open(self, txid, instrument):
         return txid in self.stops
 
+    def describe_native_stop(self, txid, instrument):
+        from core.safety import StopCancelResult
+        if txid in self.stops:
+            return StopCancelResult("still_open", reason="resting")
+        fill = self.filled_reports.get(txid)
+        if fill is not None:
+            return StopCancelResult("filled", fill=fill, reason="filled away")
+        return StopCancelResult("unknown", reason="not on the book")
+
     def cancel_native_stop(self, txid, instrument):
         from core.safety import StopCancelResult
         self.log.append(("cancel", txid))
+        if txid in self.sticky_ids:
+            return StopCancelResult("unknown", reason="cancel unconfirmed")
         qty, price = self.stops.pop(txid, (None, None))
         if qty is None:
             return StopCancelResult("unknown", reason="gone")
@@ -782,6 +795,97 @@ def test_kraken_sell_and_stop_cannot_spend_the_manual_reserve():
     clipped = adapter.place_native_stop(BTC, ledger / D("0.99"), D("90000"))
     assert clipped.ok is True
     assert D(str(ex.create_calls[-1][3])) == ledger
+
+
+def test_a_stop_that_filled_off_book_is_booked_before_any_new_sell(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        txid = next(iter(book.stops))
+        qty, price = book.stops.pop(txid)
+        book.filled_reports[txid] = Fill(
+            order_id=txid, instrument=BTC, side=Side.SELL, qty=qty, price=price,
+            fees=D("1.25"), at=WHEN, mode=Mode.PAPER,
+        )
+        strategy.intents = []
+        stops_before = [row for row in book.log if row[0] == "stop"]
+        _tick(engine)
+        assert [row for row in book.log if row[0] == "stop"] == stops_before
+        assert not any(row[0] == "place" and row[1] == "sell" for row in book.log)
+        assert store.positions(Mode.PAPER, AssetClass.CRYPTO) == []
+        assert any(f.order_id == txid and f.fees == D("1.25")
+                   for f in store.fills(Mode.PAPER))
+    finally:
+        store.close()
+
+
+def test_an_unreadable_missing_stop_is_not_replaced(tmp_path):
+    book = StopBook()
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    try:
+        _tick(engine)
+        txid = next(iter(book.stops))
+        book.stops.pop(txid)
+        strategy.intents = []
+        stops_before = len([row for row in book.log if row[0] == "stop"])
+        _tick(engine)
+        assert len([row for row in book.log if row[0] == "stop"]) == stops_before
+        position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        assert position.stop_txid == txid
+        assert position.qty == D("0.01")
+    finally:
+        store.close()
+
+
+def test_an_unconfirmed_overlap_cancel_keeps_the_old_stop_id(tmp_path, monkeypatch):
+    """If the old stop cannot be confirmed cancelled, its txid stays put
+    and the replacement is rolled back instead of becoming the only record."""
+    book = StopBook(free=D("1"))
+    strategy = NamingStrategy([_buy()], stop=D("48000"))
+    engine, store, _clock = _engine(tmp_path, book, strategy)
+    monkeypatch.setattr(eng, "overlap_stops_allowed", lambda **_kw: True)
+    try:
+        _tick(engine)
+        position = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        old = position.stop_txid
+        book.sticky_ids.add(old)
+        strategy.intents = []
+        strategy.stop = D("49000")
+        _tick(engine)
+        kept = store.positions(Mode.PAPER, AssetClass.CRYPTO)[0]
+        assert kept.stop_txid == old
+        assert old in book.stops
+        # The replacement was cancelled; it must not be the stored id.
+        assert not (kept.stop_status or "").startswith("overlap:")
+        assert any(row[0] == "cancel" and row[1] != old for row in book.log)
+    finally:
+        store.close()
+
+
+def test_kraken_stop_fill_keeps_the_venue_fee():
+    ex = FakeExchange(
+        {"BTC/USDT": spot("BTC/USDT")},
+        tickers={"BTC/USDT": {"last": 90000}},
+    )
+    ex.fetch_order = lambda order_id, symbol=None: {
+        "id": order_id, "status": "closed", "filled": "0.001", "amount": "0.001",
+        "average": "90000", "symbol": "BTC/USDT",
+        "fee": {"cost": "1.25", "currency": "USDT"},
+    }
+    clock = FakeClock()
+    adapter = KrakenAdapter(
+        ex, mode=Mode.LIVE, poll_interval_s=1.0,
+        monotonic=clock.monotonic, sleep=clock.sleep, now=lambda: WHEN,
+        key_freeze=lambda: False,
+    )
+    described = adapter.describe_native_stop("STOP-FEE", BTC)
+    assert described.outcome == "filled"
+    assert described.fill is not None
+    assert described.fill.fees == D("1.25")
+    assert described.fill.qty == D("0.001")
 
 
 def test_key_freeze_env_and_file(tmp_path):
