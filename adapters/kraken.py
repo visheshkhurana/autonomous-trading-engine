@@ -130,7 +130,7 @@ FIAT_PER_USD: Mapping[str, Decimal] = {
 _CASH_FLOW_TYPES = frozenset({"deposit", "withdrawal", "transfer"})
 # Only these quote assets are spot cash. Funding and futures trades are not,
 # even when Kraken denominates them in a stable.
-_SPOT_CASH_ASSETS = frozenset({"USDT", "USDC"})
+_SPOT_CASH_ASSETS = frozenset({"USDT", "USDC", "USD"})
 # Derivatives activity that does not move the spot balance. The cursor walks
 # past these. They are not flows and they do not latch.
 _IGNORED_DERIVATIVE_ROWS = frozenset({
@@ -171,12 +171,22 @@ def _ledger_labels(entry: Mapping[str, Any], info: Mapping[str, Any]) -> tuple[s
 
 
 def _is_ignored_derivative_activity(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
-    """Funding payments and futures trades. Not spot cash, and not a halt."""
-    return any(label in _IGNORED_DERIVATIVE_ROWS for label in _ledger_labels(entry, info))
+    """Funding payments and futures trades. Not spot cash, and not a halt.
+
+    Keyed on the ledger type and subtype only. Account, wallet, aclass, and
+    any other field are not consulted, so a deposit or withdrawal is never
+    ignored because some other field contains derivatives text.
+    """
+    typed = (
+        _ledger_label(entry.get("type")),
+        _ledger_label(info.get("type")),
+        _ledger_label(info.get("subtype")),
+    )
+    return any(label in _IGNORED_DERIVATIVE_ROWS for label in typed if label)
 
 
 def _is_spot_futures_transfer(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
-    """USDT/USDC moving between the spot wallet and futures."""
+    """USDT, USDC, or USD moving between the spot wallet and futures."""
     for label in _ledger_labels(entry, info):
         if "spottofutures" in label or "futurestospot" in label:
             return True
@@ -278,9 +288,11 @@ def classify_ledger_row(
     equity currency, or a futures-wallet row we cannot price. The cursor
     must stop on it. Spot trades are ``ignore``. Funding-rate changes and
     futures trades (``derivativesfundingratechange``,
-    ``derivativesfuturestrade``) are ``ignore`` as well: no flow and no
-    latch, so the cursor walks past them. A spot-to-futures or
-    futures-to-spot transfer of USDT or USDC is a ``flow``.
+    ``derivativesfuturestrade``) are ``ignore`` when the ledger type or
+    subtype is one of those names: no flow and no latch, so the cursor
+    walks past them. Another field containing that text does not ignore a
+    deposit or withdrawal. A spot-to-futures or futures-to-spot transfer
+    of USDT, USDC, or USD is a ``flow``.
     """
     if not isinstance(entry, Mapping):
         return "reject", None
@@ -324,12 +336,16 @@ def classify_ledger_row(
 def parse_spot_cash_flow(entry: Mapping[str, Any]) -> Optional[ExternalCashFlow]:
     """One ccxt ledger row as a spot cash flow, or None when it is not applied.
 
-    Kept: deposit, withdrawal, transfer, in a face-value stable. Dropped:
-    trades, and any label containing ``derivatives`` (manual Kraken Futures,
-    outside this book), not only those that start with that word. A pending
-    or cancelled row is not a flow yet. A cash row that cannot be priced is
-    not returned here; ``classify_ledger_row`` reports it as ``reject`` so
-    the cursor does not walk past it.
+    Kept: a deposit, withdrawal, or transfer in a face-value stable; a
+    futures-wallet move in one of those stables; and a spot-to-futures or
+    futures-to-spot transfer of USDT, USDC, or USD. A deposit or withdrawal
+    stays a flow when another field contains derivatives text. Dropped:
+    trades, plus funding-rate changes and futures trades
+    (``derivativesfundingratechange``, ``derivativesfuturestrade``) when
+    the ledger type or subtype is that name. A pending or cancelled row is
+    not a flow yet. A cash row that cannot be priced is not returned here;
+    ``classify_ledger_row`` reports it as ``reject`` so the cursor does not
+    walk past it.
     """
     kind, flow = classify_ledger_row(entry)
     if kind == "flow":
