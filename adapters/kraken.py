@@ -128,6 +128,15 @@ FIAT_PER_USD: Mapping[str, Decimal] = {
 # applied as if the coin count were USDT; the high-water mark is denominated
 # in the quote. Derivatives ledger types are manual futures, outside the book.
 _CASH_FLOW_TYPES = frozenset({"deposit", "withdrawal", "transfer"})
+# Only these quote assets are spot cash. Funding and futures trades are not,
+# even when Kraken denominates them in a stable.
+_SPOT_CASH_ASSETS = frozenset({"USDT", "USDC"})
+# Derivatives activity that does not move the spot balance. The cursor walks
+# past these. They are not flows and they do not latch.
+_IGNORED_DERIVATIVE_ROWS = frozenset({
+    "derivativesfundingratechange",
+    "derivativesfuturestrade",
+})
 _LEDGER_PAGE = 50
 _LEDGER_PAGE_CAP = 40
 _SKIPPED_LEDGER_STATUS = frozenset({
@@ -159,6 +168,19 @@ def _ledger_labels(entry: Mapping[str, Any], info: Mapping[str, Any]) -> tuple[s
         info.get("aclass"),
     )
     return tuple(_ledger_label(label) for label in raw if label)
+
+
+def _is_ignored_derivative_activity(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
+    """Funding payments and futures trades. Not spot cash, and not a halt."""
+    return any(label in _IGNORED_DERIVATIVE_ROWS for label in _ledger_labels(entry, info))
+
+
+def _is_spot_futures_transfer(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
+    """USDT/USDC moving between the spot wallet and futures."""
+    for label in _ledger_labels(entry, info):
+        if "spottofutures" in label or "futurestospot" in label:
+            return True
+    return False
 
 
 def _is_futures_or_derivatives(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
@@ -253,18 +275,30 @@ def classify_ledger_row(
     """``ignore``, ``flow``, or ``reject``.
 
     ``reject`` is a deposit, withdrawal, or transfer we cannot value in the
-    equity currency, or a futures/derivatives row we cannot price. The cursor
-    must stop on it. Spot trades are ``ignore``. A futures-wallet or
-    derivatives USDT move is a ``flow``: it shifts the mark instead of being
-    stepped past.
+    equity currency, or a futures-wallet row we cannot price. The cursor
+    must stop on it. Spot trades are ``ignore``. Funding-rate changes and
+    futures trades (``derivativesfundingratechange``,
+    ``derivativesfuturestrade``) are ``ignore`` as well: no flow and no
+    latch, so the cursor walks past them. A spot-to-futures or
+    futures-to-spot transfer of USDT or USDC is a ``flow``.
     """
     if not isinstance(entry, Mapping):
         return "reject", None
     info = entry.get("info")
     if not isinstance(info, Mapping):
         info = {}
+    if _is_ignored_derivative_activity(entry, info):
+        return "ignore", None
     kind = _ledger_type(entry, info)
     status = str(entry.get("status") or info.get("status") or "ok").lower()
+    if _is_spot_futures_transfer(entry, info):
+        asset = str(entry.get("currency") or info.get("asset") or "").upper()
+        if asset not in _SPOT_CASH_ASSETS:
+            return "ignore", None
+        flow = _stable_flow(entry, info, "transfer")
+        if flow is None:
+            return "reject", None
+        return "flow", flow
     if _is_futures_or_derivatives(entry, info):
         if status in _SKIPPED_LEDGER_STATUS:
             return "ignore", None

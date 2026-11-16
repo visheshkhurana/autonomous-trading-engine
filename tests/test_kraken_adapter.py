@@ -289,6 +289,97 @@ def test_futures_usdt_moves_shift_the_mark_for_both_label_shapes():
         ), refid
         assert decision.entries_allowed is True
 
+
+def _advance_over(rows):
+    """Baseline, then one page of ``rows``, against a 10000 crypto book."""
+    from core.risk import RiskCircuit
+    from tests.test_risk import NOW as RISK_NOW
+    from tests.test_risk import FakeStore, state_at
+
+    class _Pages(FakeExchange):
+        def fetch_ledger(self, code=None, since=None, limit=None, params=None):
+            if since is None:
+                return [_ledger_row("trade-1", "trade", "-1", 1_000_000, info_amount="-1")]
+            return list(rows)
+
+    store = FakeStore(state_at("10000", asset_class=AssetClass.CRYPTO))
+    wired = RiskCircuit(
+        store, Mode.LIVE, clock=lambda: RISK_NOW, cash_flows=adapter(_Pages()),
+    )
+    wired.advance(AssetClass.CRYPTO, D("10000"))
+    return store, wired
+
+
+def test_hourly_funding_rows_leave_the_mark_unchanged():
+    stamp = int(dt.datetime(2026, 8, 27, 6, 0, tzinfo=UTC).timestamp() * 1000)
+    hour = 3_600_000
+    rows = [
+        _ledger_row(
+            "fund-1", "derivativesfundingratechange", "1.25", stamp,
+            direction="in", asset="USDT", info_amount="1.25",
+            info_type="derivativesfundingratechange",
+        ),
+        _ledger_row(
+            "fund-2", "derivativesfundingratechange", "-0.40", stamp + hour,
+            direction="out", asset="USDC", info_amount="-0.40",
+            info_type="derivativesfundingratechange",
+        ),
+    ]
+    store, wired = _advance_over(rows)
+    decision = wired.advance(AssetClass.CRYPTO, D("10000"))
+    written = store.writes[-1]
+    assert written.high_water == D("10000")
+    assert written.day_open_equity == D("10000")
+    assert written.unpriced_cash_flow != "1"
+    assert written.flow_watermark_ms == str(stamp + hour)
+    assert decision.entries_allowed is True
+
+
+def test_futures_trades_do_not_latch():
+    stamp = int(dt.datetime(2026, 8, 27, 6, 0, tzinfo=UTC).timestamp() * 1000)
+    zero = _ledger_row(
+        "ft-zero", "derivativesfuturestrade", "0", stamp,
+        direction="out", asset="USDT", info_amount="0",
+        info_type="derivativesfuturestrade",
+    )
+    coin = _ledger_row(
+        "ft-btc", "derivativesfuturestrade", "0.01", stamp + 1,
+        direction="out", asset="BTC", info_amount="-0.01",
+        info_type="derivativesfuturestrade",
+    )
+    store, wired = _advance_over([zero, coin])
+    decision = wired.advance(AssetClass.CRYPTO, D("10000"))
+    written = store.writes[-1]
+    assert written.high_water == D("10000")
+    assert written.day_open_equity == D("10000")
+    assert written.unpriced_cash_flow != "1"
+    assert written.ledger_blind != "1"
+    assert decision.entries_allowed is True
+    assert "unpriced_cash_flow" not in decision.reason
+
+
+def test_a_spot_to_futures_transfer_is_booked_as_a_flow():
+    stamp = int(dt.datetime(2026, 8, 27, 6, 0, tzinfo=UTC).timestamp() * 1000)
+    row = _ledger_row(
+        "s2f", "spot-to-futures", "-100", stamp,
+        direction="out", asset="USDT", info_amount="-100",
+        info_type="spot-to-futures",
+    )
+    store, wired = _advance_over([row])
+    decision = wired.advance(AssetClass.CRYPTO, D("9900"))
+    written = store.writes[-1]
+    assert written.high_water == D("9900")
+    assert written.day_open_equity == D("9900")
+    audit = json.loads(written.hwm_rebase_json)
+    assert any(
+        item.get("reason") == "external_cash_flow"
+        and item.get("refid") == "s2f"
+        and item.get("amount") == "-100"
+        for item in audit
+    )
+    assert decision.entries_allowed is True
+
+
 def test_a_btc_deposit_holds_the_watermark_and_blocks_entries():
     """A non-stable deposit must not be skipped and then booked as a new high."""
     from core.risk import RiskCircuit
