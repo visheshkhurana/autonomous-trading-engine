@@ -458,6 +458,68 @@ def test_a_usd_futures_to_spot_transfer_is_booked_as_a_flow():
     assert decision.entries_allowed is True
 
 
+def test_cash_rows_with_a_derivatives_subtype_are_flows():
+    """Subtype never ignores a deposit, withdrawal, or transfer."""
+    from adapters.kraken import classify_ledger_row, parse_spot_cash_flow
+
+    stamp = int(dt.datetime(2026, 8, 27, 6, 0, tzinfo=UTC).timestamp() * 1000)
+    subtypes = ("derivativesfundingratechange", "derivativesfuturestrade")
+    cases = (
+        ("deposit", "500", "in", D("500")),
+        ("withdrawal", "-40", "out", D("-40")),
+        ("transfer", "25", "in", D("25")),
+    )
+    for subtype in subtypes:
+        for kind_name, amount, direction, expected in cases:
+            row = _ledger_row(
+                f"{kind_name}-{subtype}", kind_name, amount, stamp,
+                direction=direction, asset="USDT", info_amount=amount,
+                info_type=kind_name,
+            )
+            row["info"]["subtype"] = subtype
+            classified, flow = classify_ledger_row(row)
+            assert classified == "flow", (kind_name, subtype, classified)
+            assert flow is not None
+            assert flow.amount == expected, (kind_name, subtype, flow.amount)
+            assert flow.asset == "USDT"
+            assert parse_spot_cash_flow(row) == flow
+
+
+def test_derivatives_subtype_on_a_usdt_deposit_does_not_ratchet_the_mark():
+    """Reviewer probe: 500 USDT deposit, subtype derivativesfundingratechange.
+
+    Baseline 10000. Ignoring the row lets max() adopt equity 10500 as a new
+    high and leaves the day open at 10000. The row is a flow, so both
+    baselines move with the cash and the day open is not left behind.
+    """
+    from adapters.kraken import classify_ledger_row
+
+    stamp = int(dt.datetime(2026, 8, 27, 6, 0, tzinfo=UTC).timestamp() * 1000)
+    row = _ledger_row(
+        "dep-500", "deposit", "500", stamp,
+        direction="in", asset="USDT", info_amount="500", info_type="deposit",
+    )
+    row["info"]["subtype"] = "derivativesfundingratechange"
+    kind, flow = classify_ledger_row(row)
+    assert kind == "flow"
+    assert flow is not None and flow.amount == D("500") and flow.asset == "USDT"
+    store, wired = _advance_over([row])
+    decision = wired.advance(AssetClass.CRYPTO, D("10500"))
+    written = store.writes[-1]
+    audit = json.loads(written.hwm_rebase_json)
+    assert any(
+        item.get("reason") == "external_cash_flow"
+        and item.get("refid") == "dep-500"
+        and item.get("amount") == "500"
+        and item.get("asset") == "USDT"
+        for item in audit
+    )
+    assert written.day_open_equity == D("10500")
+    assert written.high_water == D("10500")
+    assert written.day_open_equity != D("10000")
+    assert decision.entries_allowed is True
+
+
 def test_parse_spot_cash_flow_docstring_matches_current_behaviour():
     from adapters.kraken import parse_spot_cash_flow
 
@@ -465,8 +527,10 @@ def test_parse_spot_cash_flow_docstring_matches_current_behaviour():
     assert "outside this book" not in text
     assert "any label containing" not in text
     assert "USDT, USDC, or USD" in text
-    assert "type or subtype" in text
-    assert "another field contains derivatives text" in text
+    assert "type or subtype" not in text
+    assert "whatever its subtype" in text
+    assert "Subtype alone" in text
+    assert "type or info type" in text
     assert "derivativesfundingratechange" in text
     assert "derivativesfuturestrade" in text
     assert "classify_ledger_row" in text

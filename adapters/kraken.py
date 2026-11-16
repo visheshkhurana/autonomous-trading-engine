@@ -173,16 +173,19 @@ def _ledger_labels(entry: Mapping[str, Any], info: Mapping[str, Any]) -> tuple[s
 def _is_ignored_derivative_activity(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
     """Funding payments and futures trades. Not spot cash, and not a halt.
 
-    Keyed on the ledger type and subtype only. Account, wallet, aclass, and
-    any other field are not consulted, so a deposit or withdrawal is never
-    ignored because some other field contains derivatives text.
+    Cash is checked first. If the ledger type or info type is a deposit,
+    withdrawal, or transfer, the row is never ignored, whatever its subtype.
+    A row is ignored only when that type or info type is exactly
+    ``derivativesfundingratechange`` or ``derivativesfuturestrade``.
+    Subtype alone never triggers the ignore.
     """
-    typed = (
+    labels = (
         _ledger_label(entry.get("type")),
         _ledger_label(info.get("type")),
-        _ledger_label(info.get("subtype")),
     )
-    return any(label in _IGNORED_DERIVATIVE_ROWS for label in typed if label)
+    if any(label in _CASH_FLOW_TYPES for label in labels if label):
+        return False
+    return any(label in _IGNORED_DERIVATIVE_ROWS for label in labels if label)
 
 
 def _is_spot_futures_transfer(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
@@ -288,11 +291,13 @@ def classify_ledger_row(
     equity currency, or a futures-wallet row we cannot price. The cursor
     must stop on it. Spot trades are ``ignore``. Funding-rate changes and
     futures trades (``derivativesfundingratechange``,
-    ``derivativesfuturestrade``) are ``ignore`` when the ledger type or
-    subtype is one of those names: no flow and no latch, so the cursor
-    walks past them. Another field containing that text does not ignore a
-    deposit or withdrawal. A spot-to-futures or futures-to-spot transfer
-    of USDT, USDC, or USD is a ``flow``.
+    ``derivativesfuturestrade``) are ``ignore`` only when the ledger type
+    or info type is exactly one of those names: no flow and no latch, so
+    the cursor walks past them. Subtype alone does not ignore a row. A
+    deposit, withdrawal, or transfer is never ignored as derivative
+    activity, whatever its subtype, and goes through cash classification.
+    A spot-to-futures or futures-to-spot transfer of USDT, USDC, or USD
+    is a ``flow``.
     """
     if not isinstance(entry, Mapping):
         return "reject", None
@@ -338,14 +343,15 @@ def parse_spot_cash_flow(entry: Mapping[str, Any]) -> Optional[ExternalCashFlow]
 
     Kept: a deposit, withdrawal, or transfer in a face-value stable; a
     futures-wallet move in one of those stables; and a spot-to-futures or
-    futures-to-spot transfer of USDT, USDC, or USD. A deposit or withdrawal
-    stays a flow when another field contains derivatives text. Dropped:
-    trades, plus funding-rate changes and futures trades
-    (``derivativesfundingratechange``, ``derivativesfuturestrade``) when
-    the ledger type or subtype is that name. A pending or cancelled row is
-    not a flow yet. A cash row that cannot be priced is not returned here;
-    ``classify_ledger_row`` reports it as ``reject`` so the cursor does not
-    walk past it.
+    futures-to-spot transfer of USDT, USDC, or USD. Cash is checked first:
+    a deposit, withdrawal, or transfer is never ignored as derivative
+    activity, whatever its subtype. Dropped: trades, plus funding-rate
+    changes and futures trades (``derivativesfundingratechange``,
+    ``derivativesfuturestrade``) only when the ledger type or info type is
+    exactly that name. Subtype alone does not drop the row. A pending or
+    cancelled row is not a flow yet. A cash row that cannot be priced is
+    not returned here; ``classify_ledger_row`` reports it as ``reject`` so
+    the cursor does not walk past it.
     """
     kind, flow = classify_ledger_row(entry)
     if kind == "flow":
