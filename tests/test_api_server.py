@@ -1406,3 +1406,72 @@ def test_the_real_store_would_reject_a_day_key_passed_as_a_window() -> None:
     store.realized_pnl(Mode.PAPER, AssetClass.EQUITY,
                        day_start_instant(profile_for(AssetClass.EQUITY), NOW).isoformat())
     store.close()
+
+
+ACKED_FLATTEN = "5796ef7697ed4aeb8fb6b8e45b382818"
+
+
+def test_a_paused_class_closes_top_level_entries() -> None:
+    """classes.crypto.control.paused must not leave the dashboard open."""
+    control = MemoryControlStore()
+    control.rows["crypto"] = {
+        "paused": "1",
+        "paused_at": NOW.isoformat(),
+        "paused_reason": "Vision CONDITION_BREACH",
+    }
+    handle = build_handle(control=control, clock=lambda: NOW)
+    body = client(handle).get("/api/state", headers=AUTH).json()
+    assert body["classes"]["crypto"]["control"]["paused"] is True
+    assert body["classes"]["crypto"]["risk"]["entries_allowed"] is True
+    assert body["entries_allowed"] is False
+    assert body["engine"]["entries_allowed"] is False
+    assert body["entries_block_reason"] == "paused"
+    assert "paused" in body["entry_blocks"]
+
+
+def test_pause_resume_risk_write_and_reopen_keep_an_acked_flatten(tmp_path: Any) -> None:
+    path = str(tmp_path / "book.db")
+    control = SqliteControlStore(path)
+    ledger = SQLitePositionStore(path)
+    control.write("crypto", {
+        "paused": "1",
+        "paused_at": NOW.isoformat(),
+        "flatten_request_id": ACKED_FLATTEN,
+        "flatten_requested_at": "2026-09-11T18:35:23.677666+00:00",
+        "flatten_reason": "Rhodey must_flatten compliance",
+        "flatten_acked_id": ACKED_FLATTEN,
+        "flatten_acked_at": "2026-09-11T18:35:42.036895+00:00",
+    })
+    handle = build_handle(
+        control=control, ledger=ledger,
+        asset_classes=(AssetClass.CRYPTO,),
+        clock=lambda: NOW,
+    )
+    api = client(handle)
+    block = api.get("/api/state", headers=AUTH).json()["classes"]["crypto"]["control"]
+    assert block["flatten_pending"] is False
+    assert block["flatten_acked_id"] == ACKED_FLATTEN
+    assert api.post(
+        "/api/control/pause",
+        json={"reason": "still halted", "asset_class": "crypto"},
+        headers=AUTH,
+    ).status_code == 200
+    assert api.post(
+        "/api/control/resume",
+        json={"reason": "ack stands", "asset_class": "crypto"},
+        headers=AUTH,
+    ).status_code == 200
+    RiskCircuit(ledger, Mode.PAPER, clock=lambda: NOW).advance(
+        AssetClass.CRYPTO, Decimal("10000"))
+    ledger.close()
+    control.close()
+    reopened_ledger = SQLitePositionStore(path)
+    reopened = SqliteControlStore(path)
+    try:
+        row = ControlState.from_row(reopened.read("crypto") or {})
+    finally:
+        reopened_ledger.close()
+        reopened.close()
+    assert row.flatten_request_id == ACKED_FLATTEN
+    assert row.flatten_acked_id == ACKED_FLATTEN
+    assert row.flatten_pending is False

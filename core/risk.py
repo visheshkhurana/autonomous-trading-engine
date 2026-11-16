@@ -35,10 +35,10 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Callable, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from .profiles import AssetClassProfile, profile_for
 from .protocols import PositionStoreProto
@@ -261,6 +261,12 @@ class RiskState:
     # is the basis after RISK_EXCLUDE_RESERVED_BASE has been applied once.
     equity_basis: str = "full"
     hwm_rebase_json: str = ""
+    # Idempotent cursor for external cash flows. Empty on rows written before
+    # the cursor existed. ``processed_flow_refids`` is a JSON list of ledger
+    # ids already applied; ``flow_watermark_ms`` is the newest ledger time the
+    # source has fully checkpointed, in milliseconds.
+    processed_flow_refids: str = ""
+    flow_watermark_ms: str = ""
 
     def __post_init__(self) -> None:
         for label, value in (("high_water", self.high_water),
@@ -274,6 +280,19 @@ class RiskState:
             raise ValueError("day_key must be set; it is the daily-loss boundary")
         if self.updated_at.tzinfo is None or self.updated_at.utcoffset() is None:
             raise ValueError("updated_at must be timezone-aware")
+        if self.processed_flow_refids:
+            parsed = json.loads(self.processed_flow_refids)
+            if (not isinstance(parsed, list)
+                    or any(not isinstance(item, str) or not item.strip()
+                           for item in parsed)):
+                raise ValueError(
+                    "processed_flow_refids must be a JSON list of non-empty strings"
+                )
+        if self.flow_watermark_ms and not str(self.flow_watermark_ms).isdigit():
+            raise ValueError(
+                f"flow_watermark_ms must be empty or an integer millisecond "
+                f"timestamp, got {self.flow_watermark_ms!r}"
+            )
 
     def as_row(self) -> dict[str, str]:
         """The persisted form. Every value is a string: Decimals are stringified
@@ -288,6 +307,8 @@ class RiskState:
             "updated_at": self.updated_at.isoformat(),
             "equity_basis": self.equity_basis or "full",
             "hwm_rebase_json": self.hwm_rebase_json or "",
+            "processed_flow_refids": self.processed_flow_refids or "",
+            "flow_watermark_ms": self.flow_watermark_ms or "",
         }
 
     @classmethod
@@ -303,6 +324,8 @@ class RiskState:
             updated_at=dt.datetime.fromisoformat(str(row["updated_at"])),
             equity_basis=str(row.get("equity_basis") or "full"),
             hwm_rebase_json=str(row.get("hwm_rebase_json") or ""),
+            processed_flow_refids=str(row.get("processed_flow_refids") or ""),
+            flow_watermark_ms=str(row.get("flow_watermark_ms") or ""),
         )
 
 
@@ -347,6 +370,114 @@ def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
+@dataclass(frozen=True)
+class ExternalCashFlow:
+    """One spot deposit, withdrawal, or transfer, in account-equity units.
+
+    ``amount`` is signed: a deposit is positive, a withdrawal is negative.
+    The high-water mark and the day's open move by this amount. The flow is
+    not P&L.
+    """
+
+    refid: str
+    asset: str
+    amount: Decimal
+    at: dt.datetime
+
+    def __post_init__(self) -> None:
+        if not str(self.refid).strip():
+            raise ValueError("external cash flow refid is required")
+        if not str(self.asset).strip():
+            raise ValueError("external cash flow asset is required")
+        if not isinstance(self.amount, Decimal) or not self.amount.is_finite():
+            raise ValueError(f"external cash flow amount must be a finite Decimal, got {self.amount!r}")
+        if self.at.tzinfo is None or self.at.utcoffset() is None:
+            raise ValueError("external cash flow timestamp must be timezone-aware")
+
+
+@runtime_checkable
+class CashFlowSource(Protocol):
+    """Spot ledger reader. Raise when the ledger cannot be read.
+
+    An empty flow list means there is nothing new. It must not be used to
+    report a failed read: ``advance`` treats a raise as fail-closed and
+    leaves the high-water mark on its previous path.
+    """
+
+    def fetch_spot_cash_flows(
+        self, *, since_ms: Optional[int],
+    ) -> tuple[Sequence[ExternalCashFlow], Optional[int]]: ...
+
+
+def _parse_refids(raw: str) -> list[str]:
+    if not raw:
+        return []
+    parsed = json.loads(raw)
+    if not isinstance(parsed, list):
+        raise ValueError("processed_flow_refids must be a JSON list")
+    return [str(item) for item in parsed]
+
+
+def fold_external_cash_flows(
+    high_water: Decimal,
+    day_open: Decimal,
+    rebase_json: str,
+    processed_json: str,
+    flows: Sequence[ExternalCashFlow],
+) -> tuple[Decimal, Decimal, str, str, Optional[str]]:
+    """Shift both baselines by each unseen flow. Each refid applies once.
+
+    A flow that would make either baseline non-positive is skipped and named
+    in the detail string. It is not recorded as processed, and it does not
+    change the baselines. Returns
+    ``(high_water, day_open, rebase_json, processed_json, detail)``.
+    """
+    processed = _parse_refids(processed_json)
+    seen = set(processed)
+    details: list[str] = []
+    ordered = sorted(flows, key=lambda flow: (flow.at, flow.refid))
+    for flow in ordered:
+        refid = flow.refid.strip()
+        if refid in seen:
+            continue
+        new_hw = high_water + flow.amount
+        new_open = day_open + flow.amount
+        if new_hw <= ZERO or new_open <= ZERO:
+            details.append(
+                f"external cash flow {refid} not applied: baseline would be "
+                f"non-positive (high_water {new_hw}, day_open {new_open}); "
+                "high-water mark not adjusted for this flow"
+            )
+            continue
+        rebase_json = _append_hwm_audit(rebase_json, {
+            "at": flow.at.astimezone(dt.timezone.utc).isoformat(),
+            "refid": refid,
+            "asset": flow.asset,
+            "amount": str(flow.amount),
+            "old_high_water": str(high_water),
+            "new_high_water": str(new_hw),
+            "old_day_open": str(day_open),
+            "new_day_open": str(new_open),
+            "reason": "external_cash_flow",
+        })
+        high_water = new_hw
+        day_open = new_open
+        seen.add(refid)
+        processed.append(refid)
+    detail = "; ".join(details) or None
+    return high_water, day_open, rebase_json, json.dumps(processed), detail
+
+
+def _ledger_failure_detail(exc: BaseException) -> str:
+    message = str(exc).replace("\n", " ").strip()
+    if len(message) > 200:
+        message = message[:200] + "..."
+    return (
+        f"external cash-flow ledger unreadable: {type(exc).__name__}: {message}; "
+        "high-water mark not adjusted"
+    )
+
+
 class RiskCircuit:
     """Implements RiskCircuitProto.
 
@@ -361,11 +492,16 @@ class RiskCircuit:
         mode: Mode,
         limits: Optional[Mapping[AssetClass, RiskLimits]] = None,
         clock: Callable[[], dt.datetime] = _utc_now,
+        cash_flows: Optional[CashFlowSource] = None,
     ) -> None:
         self._store = store
         self._mode = mode
         self._limits: Mapping[AssetClass, RiskLimits] = dict(limits or DEFAULT_LIMITS)
         self._clock = clock
+        # None keeps the historical behaviour: equity changes are all P&L.
+        # A live Kraken book passes its spot ledger. A failed read must not
+        # reach the writer as a lower high-water mark.
+        self._cash_flows = cash_flows
 
     @property
     def mode(self) -> Mode:
@@ -420,6 +556,14 @@ class RiskCircuit:
         equity just passed and appends an audit row. Ticks that stay on the
         same basis still only raise the mark. The default ``full`` does not
         rebase by itself.
+
+        When a cash-flow source is wired, spot deposits, withdrawals and
+        transfers shift ``high_water`` and ``day_open_equity`` by the signed
+        flow before that max(). The equity number already includes the cash,
+        so the shift keeps the cash out of P&L. Each ledger refid is stored
+        on the risk row and applied once, including across a restart. A
+        ledger read that raises leaves the previous mark alone and appends
+        the failure to the decision reason.
         """
         now = self._now()
         limits = self.limits_for(asset_class)
@@ -450,11 +594,7 @@ class RiskCircuit:
 
         day_key = profile.day_key(now)
         basis = equity_basis if equity_basis in {_BASIS_FULL, _BASIS_ENGINE} else _BASIS_FULL
-        rebase_json = ""
-        if state is None:
-            high_water = equity
-            day_open = equity
-        elif state.day_key > day_key:
+        if state is not None and state.day_key > day_key:
             # The stored day is AHEAD of our clock. Either the clock stepped
             # backwards or this row was written by a host that disagrees about
             # the boundary; either way the daily boundary is not established,
@@ -467,6 +607,22 @@ class RiskCircuit:
                 detail=(f"stored day_key {state.day_key} is ahead of {day_key}; "
                         "the daily-loss boundary cannot be established"),
             )
+
+        processed_json = "[]" if state is None else (state.processed_flow_refids or "[]")
+        watermark = "" if state is None else (state.flow_watermark_ms or "")
+        flow_rebase = "" if state is None else (state.hwm_rebase_json or "")
+        adjusted_hw = None if state is None else state.high_water
+        adjusted_open = None if state is None else state.day_open_equity
+        flow_detail = self._fold_cash_flows(
+            state, processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open,
+        )
+        processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open, flow_detail = flow_detail
+
+        rebase_json = ""
+        if state is None:
+            high_water = equity
+            day_open = equity
+            rebase_json = flow_rebase
         elif state.equity_basis != basis:
             # Off→on and on→off both rebase. The equity number changed
             # because the reserve was added or removed, not because the
@@ -475,7 +631,7 @@ class RiskCircuit:
             # Thresholds are untouched.
             high_water = equity
             day_open = equity
-            rebase_json = _append_hwm_audit(state.hwm_rebase_json, {
+            rebase_json = _append_hwm_audit(flow_rebase, {
                 "at": now.isoformat(),
                 "from_basis": state.equity_basis or _BASIS_FULL,
                 "to_basis": basis,
@@ -491,11 +647,18 @@ class RiskCircuit:
                 state.equity_basis, basis, state.high_water, high_water,
             )
         else:
-            # max(), never assignment: the high-water mark only ever goes up.
-            high_water = state.high_water if state.high_water > equity else equity
+            # max(), never assignment, after cash flows have already shifted
+            # the stored mark. A withdrawal lowers the mark by the flow, then
+            # this comparison only raises it for a genuine new high. A failed
+            # ledger read leaves ``adjusted_hw`` at the stored mark, so this
+            # branch cannot lower it.
+            assert adjusted_hw is not None and adjusted_open is not None
+            high_water = adjusted_hw if adjusted_hw > equity else equity
             # state.day_key <= day_key here, so this only ever rolls forward.
-            day_open = equity if state.day_key != day_key else state.day_open_equity
-            rebase_json = state.hwm_rebase_json
+            # An intraday flow has already moved adjusted_open. A new day
+            # opens at the equity just observed, which already includes it.
+            day_open = equity if state.day_key != day_key else adjusted_open
+            rebase_json = flow_rebase
 
         new_state = RiskState(
             mode=self._mode,
@@ -506,11 +669,73 @@ class RiskCircuit:
             updated_at=now,
             equity_basis=basis,
             hwm_rebase_json=rebase_json,
+            processed_flow_refids=processed_json,
+            flow_watermark_ms=watermark,
         )
         # Deliberately unguarded: a failed write must reach the order path, not
         # be smoothed into a decision that looks persisted but is not.
         self._store.write_risk_state(self._mode, asset_class, new_state.as_row())
-        return _judge(profile, limits, new_state, equity, now)
+        decision = _judge(profile, limits, new_state, equity, now)
+        if flow_detail:
+            decision = replace(decision, reason=f"{decision.reason} | {flow_detail}")
+        return decision
+
+    def _fold_cash_flows(
+        self,
+        state: Optional[RiskState],
+        processed_json: str,
+        watermark: str,
+        flow_rebase: str,
+        adjusted_hw: Optional[Decimal],
+        adjusted_open: Optional[Decimal],
+    ) -> tuple[str, str, str, Optional[Decimal], Optional[Decimal], Optional[str]]:
+        """Apply the ledger page, or keep the stored baselines on a bad read.
+
+        The first time a book has no watermark, the source is asked with
+        ``since_ms=None``. The Kraken source returns no flows for that call
+        and a watermark at the newest ledger time, so history already inside
+        the stored mark is not booked again. Flows the source does return
+        against an existing baseline are applied. Flows returned before any
+        baseline exists are recorded as seen and not added on top of the
+        equity that is about to become the baseline.
+        """
+        if self._cash_flows is None:
+            return processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open, None
+        since = int(watermark) if watermark else None
+        try:
+            flows, new_wm = self._cash_flows.fetch_spot_cash_flows(since_ms=since)
+        except Exception as exc:  # noqa: BLE001 - surfaced, baselines untouched
+            LOG.error("risk cash-flow ledger read failed: %s", type(exc).__name__)
+            return (
+                processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open,
+                _ledger_failure_detail(exc),
+            )
+        if not isinstance(flows, (list, tuple)):
+            return (
+                processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open,
+                "external cash-flow ledger unreadable: malformed page; "
+                "high-water mark not adjusted",
+            )
+        detail = None
+        if state is not None and adjusted_hw is not None and adjusted_open is not None:
+            adjusted_hw, adjusted_open, flow_rebase, processed_json, detail = (
+                fold_external_cash_flows(
+                    adjusted_hw, adjusted_open, flow_rebase, processed_json, flows,
+                )
+            )
+        else:
+            extra = [flow.refid.strip() for flow in flows if flow.refid.strip()]
+            if extra:
+                have = _parse_refids(processed_json)
+                seen = set(have)
+                for refid in extra:
+                    if refid not in seen:
+                        have.append(refid)
+                        seen.add(refid)
+                processed_json = json.dumps(have)
+        if new_wm is not None:
+            watermark = str(int(new_wm))
+        return processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open, detail
 
     # -------------------------------------------------------------- internals
 

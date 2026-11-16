@@ -1844,6 +1844,7 @@ def _safety_public(handle: EngineHandle, settings: ApiSettings,
         engine_row, max_window=max_window)
     frozen = key_freeze_active(source)
     halt_reason = None if engine_row is None else (engine_row.get("entry_halt_reason") or None)
+    paused = _operator_pause_block(handle)
     reason = entry_block_reason(
         key_freeze=frozen,
         blackout=any(w.contains(now) for w in windows),
@@ -1852,6 +1853,8 @@ def _safety_public(handle: EngineHandle, settings: ApiSettings,
         stop_halt=bool(halt_reason),
         halt_reason=halt_reason,
     )
+    if reason is None and paused is not None:
+        reason = paused
     upcoming = next_window(now, windows)
     row_error = None if engine_row is None else engine_row.get("blackout_config_error")
     mismatch = None
@@ -1864,14 +1867,14 @@ def _safety_public(handle: EngineHandle, settings: ApiSettings,
     return {
         "entries_allowed": reason is None,
         "entries_block_reason": reason,
-        "entry_blocks": entry_block_reasons(
+        "entry_blocks": _with_pause_block(entry_block_reasons(
             key_freeze=frozen,
             blackout=any(w.contains(now) for w in windows),
             heartbeat_age=age,
             entry_max_age_s=settings.engine_stale_after_s,
             stop_halt=bool(halt_reason),
             halt_reason=halt_reason,
-        ),
+        ), paused),
         "ledger_mismatch": mismatch,
         "heartbeat_age_s": None if age is None else round(age, 3),
         "blackout_active": any(w.contains(now) for w in windows),
@@ -1880,6 +1883,42 @@ def _safety_public(handle: EngineHandle, settings: ApiSettings,
         "blackout_config_error": _join_errors(config_error, row_error, max_error),
         "key_freeze": frozen,
     }
+
+
+def _operator_pause_block(handle: EngineHandle) -> Optional[str]:
+    """``paused`` when any configured class is paused.
+
+    The order path already refuses new entries for that class. This is the
+    top-level flag the dashboard reads: a paused class with a healthy risk
+    ladder used to leave ``entries_allowed`` true and ``entry_blocks`` empty.
+    An unreadable class row fails closed and still carries the word paused,
+    so a pause that cannot be confirmed does not look like an open book.
+    """
+    control = handle.control
+    if control is None:
+        return None
+    for asset_class in handle.asset_classes:
+        try:
+            row = control.read(asset_class.value)
+        except Exception:
+            return "paused"
+        if row is None:
+            continue
+        try:
+            state = ControlState.from_row(row)
+        except ValueError:
+            return "paused"
+        if state.paused:
+            return "paused"
+    return None
+
+
+def _with_pause_block(blocks: list[str], paused: Optional[str]) -> list[str]:
+    if paused is None:
+        return blocks
+    if paused not in blocks:
+        blocks.append(paused)
+    return blocks
 
 
 def _join_errors(*parts: Optional[str]) -> Optional[str]:

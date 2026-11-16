@@ -1724,8 +1724,6 @@ def build_stack(config: Optional[RunnerConfig] = None,
 
     for asset_class in cfg.asset_classes:
         mode = resolved[asset_class]
-        circuits[asset_class] = RiskCircuit(
-            store, mode, limits=DEFAULT_LIMITS, clock=clock)
 
         quotes = InMemoryQuoteSource()
         quote_sources[asset_class] = quotes
@@ -1769,6 +1767,18 @@ def build_stack(config: Optional[RunnerConfig] = None,
 
         if live_adapter is not None:
             live_adapter_names[asset_class] = type(live_adapter).__name__
+
+        # Spot deposits and withdrawals are cash, not P&L. Only a live Kraken
+        # book has that ledger. Paper, and a live OKX book, keep the previous
+        # mark. The source is read from advance(); a failed read does not
+        # lower the high-water mark.
+        cash_flows = None
+        if (asset_class is AssetClass.CRYPTO and mode is Mode.LIVE
+                and isinstance(live_adapter, KrakenAdapter)):
+            cash_flows = live_adapter
+        circuits[asset_class] = RiskCircuit(
+            store, mode, limits=DEFAULT_LIMITS, clock=clock,
+            cash_flows=cash_flows)
 
         wirings.append(ClassWiring(
             asset_class=asset_class,

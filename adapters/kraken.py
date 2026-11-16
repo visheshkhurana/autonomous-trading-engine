@@ -46,7 +46,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from uuid import uuid4
 
-from core.risk import equity_for_drawdown
+from core.risk import ExternalCashFlow, equity_for_drawdown
 from core.safety import (
     STOP_FEE_CLIP_LIMIT, ManualReservedError, StopCancelResult, StopPlaceResult,
     base_asset, engine_spendable, env_bool, key_freeze_active, non_reserved_free,
@@ -65,6 +65,7 @@ __all__ = [
     "OrderStateUnknown", "UnknownOrder", "CostBasisUnavailable",
     "FundsMovementForbidden", "is_funds_movement", "clip_spot_sell_qty",
     "QUOTE_FALLBACK", "STABLE_FACE_VALUE", "FIAT_PER_USD",
+    "parse_spot_cash_flow",
 ]
 
 # The production Kraken key has historically carried withdraw permission. This
@@ -122,6 +123,137 @@ FIAT_PER_USD: Mapping[str, Decimal] = {
     "AED": Decimal("3.6725"),   # UAE dirham, unchanged since 1997
     "SAR": Decimal("3.75"),     # Saudi riyal
 }
+
+# Spot cash that moves the account equity one-for-one. A BTC deposit is not
+# applied as if the coin count were USDT; the high-water mark is denominated
+# in the quote. Derivatives ledger types are manual futures, outside the book.
+_CASH_FLOW_TYPES = frozenset({"deposit", "withdrawal", "transfer"})
+_LEDGER_PAGE = 50
+_LEDGER_PAGE_CAP = 40
+_SKIPPED_LEDGER_STATUS = frozenset({
+    "pending", "canceled", "cancelled", "failed", "rejected",
+})
+
+
+def _ledger_label(value: Any) -> str:
+    return str(value or "").lower().replace("-", "").replace("_", "").replace(" ", "")
+
+
+def _is_derivatives_ledger(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
+    labels = (
+        entry.get("type"),
+        entry.get("account"),
+        info.get("type"),
+        info.get("subtype"),
+        info.get("wallet"),
+        info.get("aclass"),
+    )
+    return any(_ledger_label(label).startswith("derivatives") for label in labels)
+
+
+def _ledger_type(entry: Mapping[str, Any], info: Mapping[str, Any]) -> str:
+    raw = _ledger_label(info.get("type") or entry.get("type"))
+    return raw
+
+
+def _ledger_timestamp(entry: Mapping[str, Any]) -> Optional[dt.datetime]:
+    raw = entry.get("timestamp")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return dt.datetime.fromtimestamp(int(raw) / 1000, tz=UTC)
+        except (TypeError, ValueError, OSError):
+            return None
+    text = entry.get("datetime")
+    if not text:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _signed_flow_amount(entry: Mapping[str, Any], info: Mapping[str, Any],
+                        kind: str) -> Optional[Decimal]:
+    """Signed equity units. Info amount is preferred when Kraken signed it."""
+    raw_info = info.get("amount")
+    direction = str(entry.get("direction") or "").lower()
+    if raw_info is not None and str(raw_info).strip() != "":
+        try:
+            signed = Decimal(str(raw_info))
+        except InvalidOperation:
+            return None
+        text = str(raw_info).strip()
+        if text.startswith("-") or text.startswith("+"):
+            return signed
+        # Unsigned info: the ledger type and direction carry the sign.
+        magnitude = abs(signed)
+    else:
+        raw = entry.get("amount")
+        if raw is None:
+            return None
+        try:
+            magnitude = abs(Decimal(str(raw)))
+        except InvalidOperation:
+            return None
+    if kind == "withdrawal" or direction == "out":
+        return -magnitude
+    if kind == "deposit" or direction == "in":
+        return magnitude
+    return None
+
+
+def parse_spot_cash_flow(entry: Mapping[str, Any]) -> Optional[ExternalCashFlow]:
+    """One ccxt ledger row as a spot cash flow, or None when it is not one.
+
+    Kept: deposit, withdrawal, transfer, in a face-value stable. Dropped:
+    trades, and any ledger type, subtype, wallet or account whose name starts
+    with ``derivatives`` (manual Kraken Futures, outside this book). A
+    pending or cancelled row is not a flow yet.
+    """
+    if not isinstance(entry, Mapping):
+        return None
+    info = entry.get("info")
+    if not isinstance(info, Mapping):
+        info = {}
+    if _is_derivatives_ledger(entry, info):
+        return None
+    kind = _ledger_type(entry, info)
+    if kind not in _CASH_FLOW_TYPES:
+        return None
+    status = str(entry.get("status") or info.get("status") or "ok").lower()
+    if status in _SKIPPED_LEDGER_STATUS:
+        return None
+    asset = str(entry.get("currency") or info.get("asset") or "").upper()
+    if asset not in STABLE_FACE_VALUE:
+        return None
+    amount = _signed_flow_amount(entry, info, kind)
+    if amount is None or amount == 0:
+        return None
+    at = _ledger_timestamp(entry)
+    if at is None:
+        return None
+    refid = str(
+        info.get("refid") or entry.get("id") or entry.get("referenceId") or ""
+    ).strip()
+    if not refid:
+        return None
+    return ExternalCashFlow(refid=refid, asset=asset, amount=amount, at=at)
+
+
+def _ledger_time_ms(entry: Mapping[str, Any]) -> Optional[int]:
+    raw = entry.get("timestamp")
+    if raw is None or str(raw).strip() == "":
+        at = _ledger_timestamp(entry)
+        if at is None:
+            return None
+        return int(at.timestamp() * 1000)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 
@@ -1904,6 +2036,84 @@ class KrakenAdapter:
             + (f" ({cancel_error!r})" if cancel_error else ""),
         )
 
+    # --------------------------------------------------------------- spot ledger
+
+    def fetch_spot_cash_flows(
+        self, *, since_ms: Optional[int],
+    ) -> tuple[list[ExternalCashFlow], Optional[int]]:
+        """Spot deposit/withdrawal/transfer rows, plus a millisecond watermark.
+
+        ``since_ms is None`` checkpoints the cursor at the newest ledger time
+        and returns no flows. History already inside the high-water mark is
+        not applied; the operator backfill command is what adjusts the two
+        withdrawals that landed before this cursor existed. Later calls return
+        only flows at or after the watermark. A raise leaves the caller on
+        the previous mark.
+        """
+        if since_ms is None:
+            rows = self._ledger_page(None, 0)
+            newest = _newest_ms(rows)
+            if newest is None:
+                newest = int(self._now().timestamp() * 1000)
+            else:
+                # Exclusive of the checkpoint page. The next read uses an
+                # inclusive since, and these rows are already inside equity.
+                newest = newest + 1
+            return [], newest
+        return self._flows_since(since_ms)
+
+    def _ledger_page(self, since_ms: Optional[int], offset: int) -> list[Any]:
+        params: dict[str, Any] = {}
+        if offset:
+            params["ofs"] = offset
+        raw = self._ex.fetch_ledger(None, since_ms, _LEDGER_PAGE, params)
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise TypeError(
+                f"fetch_ledger returned {type(raw).__name__}, expected a list"
+            )
+        return raw
+
+    def _flows_since(
+        self, since_ms: int,
+    ) -> tuple[list[ExternalCashFlow], Optional[int]]:
+        found: list[ExternalCashFlow] = []
+        seen: set[str] = set()
+        newest: Optional[int] = since_ms
+        offset = 0
+        covered = False
+        for _ in range(_LEDGER_PAGE_CAP):
+            rows = self._ledger_page(since_ms, offset)
+            if not rows:
+                covered = True
+                break
+            times = [ms for ms in (_ledger_time_ms(row) for row in rows) if ms is not None]
+            if times:
+                page_newest = max(times)
+                newest = page_newest if newest is None else max(newest, page_newest)
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                flow = parse_spot_cash_flow(row)
+                if flow is None or flow.refid in seen:
+                    continue
+                seen.add(flow.refid)
+                found.append(flow)
+            if len(rows) < _LEDGER_PAGE:
+                covered = True
+                break
+            oldest = min(times) if times else None
+            if oldest is not None and oldest <= since_ms:
+                covered = True
+                break
+            offset += len(rows)
+        if not covered:
+            # The window was not walked back to the cursor. Do not move the
+            # watermark across a gap that may still hold a cash flow.
+            return found, since_ms
+        return found, newest
+
     # --------------------------------------------------------------- cancelling
 
     def cancel(self, order_id: str) -> bool:
@@ -1948,3 +2158,11 @@ class KrakenAdapter:
             ) from exc
         requested = _dec_opt(order.get("amount")) or Decimal("0")
         return self._map_status(order, requested)
+
+
+def _newest_ms(rows: Sequence[Any]) -> Optional[int]:
+    times = [_ledger_time_ms(row) for row in rows if isinstance(row, Mapping)]
+    present = [ms for ms in times if ms is not None]
+    if not present:
+        return None
+    return max(present)

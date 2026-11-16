@@ -164,3 +164,92 @@ def test_clip_spot_sell_qty_is_min_of_book_and_free():
     book, free = D("0.02077"), D("0.02064538")
     assert clip_spot_sell_qty(book, free) == free
     assert clip_spot_sell_qty(D("0"), free) == D("0")
+
+
+def _ledger_row(refid, kind, amount, timestamp, *, direction=None, asset="USDT",
+                info_amount=None, info_type=None):
+    return {
+        "id": refid,
+        "timestamp": timestamp,
+        "datetime": dt.datetime.fromtimestamp(timestamp / 1000, tz=UTC).isoformat(),
+        "type": kind,
+        "direction": direction or ("out" if kind == "withdrawal" else "in"),
+        "currency": asset,
+        "amount": abs(float(amount)),
+        "status": "ok",
+        "info": {
+            "refid": refid,
+            "type": info_type or kind,
+            "asset": asset,
+            "amount": info_amount if info_amount is not None else str(amount),
+        },
+    }
+
+
+class _LedgerExchange(FakeExchange):
+    def __init__(self, history, later):
+        super().__init__()
+        self.history = list(history)
+        self.later = list(later)
+        self.calls = []
+
+    def fetch_ledger(self, code=None, since=None, limit=None, params=None):
+        self.calls.append({"since": since, "limit": limit, "params": params or {}})
+        if since is None:
+            return list(self.history)
+        return [row for row in self.history + self.later
+                if int(row["timestamp"]) >= int(since)]
+
+
+def test_parse_spot_cash_flow_keeps_spot_stables_and_drops_derivatives():
+    from adapters.kraken import parse_spot_cash_flow
+    stamp = 1_763_140_000_000
+    withdrawal = parse_spot_cash_flow(_ledger_row(
+        "FTGEVAr-syDy6EaOEIqh66t8bwUHlx", "withdrawal", "-10", stamp,
+        info_amount="-10.0000",
+    ))
+    assert withdrawal is not None
+    assert withdrawal.amount == D("-10.0000")
+    assert withdrawal.asset == "USDT"
+    deposit = parse_spot_cash_flow(_ledger_row(
+        "dep-1", "deposit", "1000", stamp + 1, info_amount="1000.00",
+    ))
+    assert deposit is not None and deposit.amount == D("1000.00")
+    transfer = parse_spot_cash_flow(_ledger_row(
+        "xfer-1", "transfer", "5", stamp + 2, direction="out", info_amount="5",
+    ))
+    assert transfer is not None and transfer.amount == D("-5")
+    assert parse_spot_cash_flow(_ledger_row(
+        "DERIV-1", "derivativeswithdrawal", "-50", stamp,
+        info_type="derivativeswithdrawal", info_amount="-50",
+    )) is None
+    assert parse_spot_cash_flow(_ledger_row(
+        "trade-1", "trade", "-3", stamp, info_amount="-3",
+    )) is None
+    assert parse_spot_cash_flow(_ledger_row(
+        "btc-in", "deposit", "0.01", stamp, asset="BTC", info_amount="0.01",
+    )) is None
+
+
+def test_fetch_spot_cash_flows_checkpoints_history_then_returns_new_flows():
+    old = 1_700_000_000_000
+    newest = old + 86_400_000
+    later = newest + 60_000
+    history = [
+        _ledger_row("FTGEVAr-syDy6EaOEIqh66t8bwUHlx", "withdrawal", "-10", old,
+                    info_amount="-10"),
+        _ledger_row("DERIV-1", "derivativeswithdrawal", "-50", old + 1,
+                    info_type="derivativeswithdrawal", info_amount="-50"),
+        _ledger_row("trade-1", "trade", "-3", newest, info_amount="-3"),
+    ]
+    arrived = [_ledger_row("dep-new", "deposit", "25", later, info_amount="25")]
+    exchange = _LedgerExchange(history, arrived)
+    book = adapter(exchange)
+    flows, watermark = book.fetch_spot_cash_flows(since_ms=None)
+    assert flows == []
+    assert watermark == newest + 1
+    newer, again = book.fetch_spot_cash_flows(since_ms=watermark)
+    assert [item.refid for item in newer] == ["dep-new"]
+    assert newer[0].amount == D("25")
+    assert again == later
+    assert all(item.refid != "DERIV-1" for item in newer)
