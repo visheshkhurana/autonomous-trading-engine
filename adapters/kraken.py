@@ -46,7 +46,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from uuid import uuid4
 
-from core.risk import ExternalCashFlow, equity_for_drawdown
+from core.risk import ExternalCashFlow, UnpricedCashFlow, equity_for_drawdown
 from core.safety import (
     STOP_FEE_CLIP_LIMIT, ManualReservedError, StopCancelResult, StopPlaceResult,
     base_asset, engine_spendable, env_bool, key_freeze_active, non_reserved_free,
@@ -149,15 +149,6 @@ _NON_CASH_LEDGER_TYPES = frozenset({
 })
 
 
-class UnpricedCashFlow(RuntimeError):
-    """A cash movement the high-water mark must not step past.
-
-    Raised instead of skipping the row. The caller holds the watermark and
-    closes entries. The message starts with ``unpriced_cash_flow`` so the
-    halt is visible on the decision.
-    """
-
-
 def _ledger_labels(entry: Mapping[str, Any], info: Mapping[str, Any]) -> tuple[str, ...]:
     raw = (
         entry.get("type"),
@@ -170,9 +161,36 @@ def _ledger_labels(entry: Mapping[str, Any], info: Mapping[str, Any]) -> tuple[s
     return tuple(_ledger_label(label) for label in raw if label)
 
 
-def _is_derivatives_ledger(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
-    """True when any ledger label contains ``derivatives``, not only as a prefix."""
+def _is_futures_or_derivatives(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
+    """Futures-wallet cash and any derivatives label.
+
+    ``wallet`` or ``account`` equal to ``futures``, or a subtype (or any
+    other label) containing ``derivatives``. These are USDT movements of
+    the spot book, not rows to skip.
+    """
+    wallet = _ledger_label(info.get("wallet"))
+    account = _ledger_label(entry.get("account") or info.get("account"))
+    if wallet == "futures" or account == "futures":
+        return True
     return any("derivatives" in label for label in _ledger_labels(entry, info))
+
+
+def _row_refid(entry: Mapping[str, Any], info: Mapping[str, Any]) -> str:
+    return str(
+        info.get("refid") or entry.get("id") or entry.get("referenceId") or ""
+    ).strip()
+
+
+def _stable_flow(
+    entry: Mapping[str, Any], info: Mapping[str, Any], kind: str,
+) -> Optional[ExternalCashFlow]:
+    asset = str(entry.get("currency") or info.get("asset") or "").upper()
+    amount = _signed_flow_amount(entry, info, kind)
+    at = _ledger_timestamp(entry)
+    refid = _row_refid(entry, info)
+    if asset not in STABLE_FACE_VALUE or amount is None or amount == 0 or at is None or not refid:
+        return None
+    return ExternalCashFlow(refid=refid, asset=asset, amount=amount, at=at)
 
 
 def _ledger_type(entry: Mapping[str, Any], info: Mapping[str, Any]) -> str:
@@ -235,17 +253,25 @@ def classify_ledger_row(
     """``ignore``, ``flow``, or ``reject``.
 
     ``reject`` is a deposit, withdrawal, or transfer we cannot value in the
-    equity currency, or a row that is not a ledger object at all. The cursor
-    must stop on it. Trades and derivatives positions are ``ignore``.
+    equity currency, or a futures/derivatives row we cannot price. The cursor
+    must stop on it. Spot trades are ``ignore``. A futures-wallet or
+    derivatives USDT move is a ``flow``: it shifts the mark instead of being
+    stepped past.
     """
     if not isinstance(entry, Mapping):
         return "reject", None
     info = entry.get("info")
     if not isinstance(info, Mapping):
         info = {}
-    if _is_derivatives_ledger(entry, info):
-        return "ignore", None
     kind = _ledger_type(entry, info)
+    status = str(entry.get("status") or info.get("status") or "ok").lower()
+    if _is_futures_or_derivatives(entry, info):
+        if status in _SKIPPED_LEDGER_STATUS:
+            return "ignore", None
+        flow = _stable_flow(entry, info, kind or "transfer")
+        if flow is None:
+            return "reject", None
+        return "flow", flow
     if kind in _NON_CASH_LEDGER_TYPES:
         return "ignore", None
     if kind not in _CASH_FLOW_TYPES:
@@ -253,18 +279,12 @@ def classify_ledger_row(
         if not kind:
             return "reject", None
         return "ignore", None
-    status = str(entry.get("status") or info.get("status") or "ok").lower()
     if status in _SKIPPED_LEDGER_STATUS:
         return "ignore", None
-    asset = str(entry.get("currency") or info.get("asset") or "").upper()
-    amount = _signed_flow_amount(entry, info, kind)
-    at = _ledger_timestamp(entry)
-    refid = str(
-        info.get("refid") or entry.get("id") or entry.get("referenceId") or ""
-    ).strip()
-    if asset not in STABLE_FACE_VALUE or amount is None or amount == 0 or at is None or not refid:
+    flow = _stable_flow(entry, info, kind)
+    if flow is None:
         return "reject", None
-    return "flow", ExternalCashFlow(refid=refid, asset=asset, amount=amount, at=at)
+    return "flow", flow
 
 
 def parse_spot_cash_flow(entry: Mapping[str, Any]) -> Optional[ExternalCashFlow]:
@@ -283,14 +303,23 @@ def parse_spot_cash_flow(entry: Mapping[str, Any]) -> Optional[ExternalCashFlow]
     return None
 
 
-def _reject_unpriced(rows: Sequence[Any]) -> None:
+def _reject_unpriced(rows: Sequence[Any], acknowledged: Sequence[str]) -> None:
+    skip = {refid for refid in acknowledged if refid}
     for row in rows:
         kind, _flow = classify_ledger_row(row)
-        if kind == "reject":
-            shown = repr(row)
-            if len(shown) > 180:
-                shown = shown[:180] + "..."
-            raise UnpricedCashFlow(f"unpriced_cash_flow: {shown}")
+        if kind != "reject":
+            continue
+        info = row.get("info") if isinstance(row, Mapping) and isinstance(row.get("info"), Mapping) else {}
+        refid = _row_refid(row, info) if isinstance(row, Mapping) else ""
+        if refid and refid in skip:
+            continue
+        shown = repr(row)
+        if len(shown) > 180:
+            shown = shown[:180] + "..."
+        raise UnpricedCashFlow(
+            f"unpriced_cash_flow: {shown}",
+            refid=refid or "unpriced-unidentified",
+        )
 
 
 def _ledger_time_ms(entry: Mapping[str, Any]) -> Optional[int]:
@@ -2090,6 +2119,7 @@ class KrakenAdapter:
 
     def fetch_spot_cash_flows(
         self, *, since_ms: Optional[int],
+        acknowledged_refids: Sequence[str] = (),
     ) -> tuple[list[ExternalCashFlow], Optional[int]]:
         """Spot deposit/withdrawal/transfer rows, plus a millisecond watermark.
 
@@ -2102,7 +2132,7 @@ class KrakenAdapter:
         """
         if since_ms is None:
             rows = self._ledger_page(None, 0)
-            _reject_unpriced(rows)
+            _reject_unpriced(rows, acknowledged_refids)
             newest = _newest_ms(rows)
             if newest is None:
                 newest = int(self._now().timestamp() * 1000)
@@ -2111,7 +2141,7 @@ class KrakenAdapter:
                 # inclusive since, and these rows are already inside equity.
                 newest = newest + 1
             return [], newest
-        return self._flows_since(since_ms)
+        return self._flows_since(since_ms, acknowledged_refids)
 
     def _ledger_page(self, since_ms: Optional[int], offset: int) -> list[Any]:
         params: dict[str, Any] = {}
@@ -2127,7 +2157,7 @@ class KrakenAdapter:
         return raw
 
     def _flows_since(
-        self, since_ms: int,
+        self, since_ms: int, acknowledged_refids: Sequence[str] = (),
     ) -> tuple[list[ExternalCashFlow], Optional[int]]:
         found: list[ExternalCashFlow] = []
         seen: set[str] = set()
@@ -2143,7 +2173,7 @@ class KrakenAdapter:
             if times:
                 page_newest = max(times)
                 newest = page_newest if newest is None else max(newest, page_newest)
-            _reject_unpriced(rows)
+            _reject_unpriced(rows, acknowledged_refids)
             for row in rows:
                 if not isinstance(row, Mapping):
                     continue

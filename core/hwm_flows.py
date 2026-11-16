@@ -45,7 +45,8 @@ from typing import Optional, Sequence
 
 from core.profiles import profile_for
 from core.risk import (
-    ExternalCashFlow, RiskState, fold_external_cash_flows, start_of_day_key,
+    ExternalCashFlow, RiskState, _append_hwm_audit, _merge_refid, _parse_refids,
+    fold_external_cash_flows, start_of_day_key,
 )
 from core.safety import ENTRY_HEARTBEAT_MAX_AGE_S
 from core.store import SQLitePositionStore
@@ -131,6 +132,69 @@ def apply_external_flows(
         "day_open_equity": str(day_open),
         "detail": detail,
         "audit": json.loads(rebase) if rebase else [],
+    }
+
+
+def resolve_unpriced_refid(
+    store: SQLitePositionStore,
+    mode: Mode,
+    asset_class: AssetClass,
+    refid: str,
+    *,
+    now: Optional[dt.datetime] = None,
+) -> dict[str, object]:
+    """Clear one latched unpriced refid and append an audit row.
+
+    The high-water mark is not moved here. The next engine tick may ratchet
+    only after every latched refid has been resolved. Refuses an unknown refid
+    so a typo cannot drop the halt.
+    """
+    stamp = now or dt.datetime.now(UTC)
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    name = refid.strip()
+    if not name:
+        raise ValueError("refid is required")
+    row = store.read_risk_state(mode, asset_class)
+    if row is None:
+        raise RuntimeError(
+            f"no risk_state for {mode.value}/{asset_class.value}"
+        )
+    state = RiskState.from_row(row)
+    latched = _parse_refids(state.unpriced_refids)
+    if name not in latched:
+        raise RuntimeError(f"{name} is not a latched unpriced cash flow")
+    remaining = [item for item in latched if item != name]
+    audit = _append_hwm_audit(state.hwm_rebase_json, {
+        "at": stamp.astimezone(UTC).isoformat(),
+        "refid": name,
+        "reason": "unpriced_cash_flow_resolved",
+        "old_high_water": str(state.high_water),
+        "new_high_water": str(state.high_water),
+        "old_day_open": str(state.day_open_equity),
+        "new_day_open": str(state.day_open_equity),
+    })
+    updated = RiskState(
+        mode=state.mode,
+        asset_class=state.asset_class,
+        high_water=state.high_water,
+        day_key=state.day_key,
+        day_open_equity=state.day_open_equity,
+        updated_at=stamp,
+        equity_basis=state.equity_basis,
+        hwm_rebase_json=audit,
+        processed_flow_refids=_merge_refid(state.processed_flow_refids, name),
+        flow_watermark_ms=state.flow_watermark_ms,
+        ledger_blind=state.ledger_blind,
+        unpriced_cash_flow="1" if remaining else "0",
+        unpriced_refids=json.dumps(remaining),
+    )
+    store.write_risk_state(mode, asset_class, updated.as_row())
+    return {
+        "resolved": name,
+        "remaining": remaining,
+        "unpriced_cash_flow": updated.unpriced_cash_flow,
+        "audit": json.loads(audit) if audit else [],
     }
 
 
@@ -235,12 +299,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--asset", help="asset code for --refid, for example USDT")
     parser.add_argument("--amount", help="signed equity amount for --refid; withdrawals are negative")
     parser.add_argument("--at", help="timezone-aware timestamp for --refid")
+    parser.add_argument(
+        "--resolve-unpriced",
+        help="clear one latched unpriced refid and write an audit row",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    explicit = bool(args.refid or args.asset or args.amount or args.at)
+    if args.apply_known_2026_11_14 and explicit:
+        parser.error(
+            "--apply-known-2026-11-14 and --refid are mutually exclusive"
+        )
+    if args.resolve_unpriced and (args.apply_known_2026_11_14 or explicit):
+        parser.error("--resolve-unpriced is mutually exclusive with applying flows")
 
     flows: list[ExternalCashFlow] = []
     if args.apply_known_2026_11_14:
         flows.extend(KNOWN_2026_11_14_WITHDRAWALS)
-    if args.refid or args.asset or args.amount or args.at:
+    elif explicit:
         if not all((args.refid, args.asset, args.amount, args.at)):
             parser.error("--refid, --asset, --amount and --at are required together")
         try:
@@ -253,8 +329,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             amount=amount,
             at=_parse_at(args.at),
         ))
+    if args.resolve_unpriced:
+        refusal = refuse_if_engine_live(args.db, dt.datetime.now(UTC))
+        if refusal is not None:
+            print(f"not applied: {refusal}", file=sys.stderr)
+            return 1
+        store = SQLitePositionStore(args.db)
+        try:
+            summary = resolve_unpriced_refid(
+                store, Mode(args.mode), AssetClass(args.asset_class),
+                args.resolve_unpriced,
+            )
+        except Exception as exc:
+            print(f"not applied: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            store.close()
+        print(json.dumps(summary, default=str, indent=2))
+        return 0
+
     if not flows:
-        parser.error("pass --apply-known-2026-11-14 or an explicit --refid flow")
+        parser.error(
+            "pass --apply-known-2026-11-14, an explicit --refid flow, "
+            "or --resolve-unpriced"
+        )
 
     refusal = refuse_if_engine_live(args.db, dt.datetime.now(UTC))
     if refusal is not None:

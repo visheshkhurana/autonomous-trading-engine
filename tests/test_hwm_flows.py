@@ -12,13 +12,14 @@ import json
 from decimal import Decimal
 from typing import Optional, Sequence
 
-from core.hwm_flows import apply_external_flows, main
+from core.hwm_flows import apply_external_flows, main, resolve_unpriced_refid
 from core.risk import (
     DEFAULT_LIMITS,
     CircuitAction,
     ExternalCashFlow,
     RiskCircuit,
     RiskState,
+    UnpricedCashFlow,
 )
 from core.store import SQLitePositionStore
 from core.types import AssetClass, Mode
@@ -33,7 +34,7 @@ class ScriptedLedger:
         self.pages = list(pages)
         self.since: list[Optional[int]] = []
 
-    def fetch_spot_cash_flows(self, *, since_ms: Optional[int]):
+    def fetch_spot_cash_flows(self, *, since_ms: Optional[int], acknowledged_refids=()):
         self.since.append(since_ms)
         item = self.pages.pop(0)
         if isinstance(item, Exception):
@@ -235,6 +236,63 @@ def test_a_frozen_day_keeps_an_eleven_percent_loss_as_a_flatten():
     assert again.daily_loss_pct == D("0.11")
     assert again.must_flatten is True
     assert again.entries_allowed is False
+
+
+class _RejectThenEmpty:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def fetch_spot_cash_flows(self, *, since_ms, acknowledged_refids=()):
+        self.calls += 1
+        if self.calls == 1:
+            raise UnpricedCashFlow("btc deposit", refid="btc-in")
+        return [], 50
+
+
+def test_unpriced_halt_survives_an_empty_page():
+    """A later clean page must not drop the halt or adopt the deposit as a high."""
+    store = FakeStore(state_at("10000"))
+    wired = RiskCircuit(
+        store, Mode.LIVE, clock=lambda: NOW, cash_flows=_RejectThenEmpty(),
+    )
+    blocked = wired.advance(AssetClass.EQUITY, D("15000"))
+    assert blocked.entries_allowed is False
+    assert "unpriced_cash_flow" in blocked.reason
+    assert store.writes[-1].high_water == D("10000")
+    assert store.writes[-1].unpriced_cash_flow == "1"
+    assert json.loads(store.writes[-1].unpriced_refids) == ["btc-in"]
+    still = wired.advance(AssetClass.EQUITY, D("15000"))
+    assert still.entries_allowed is False
+    assert "unpriced_cash_flow" in still.reason
+    assert store.writes[-1].high_water == D("10000")
+    assert store.writes[-1].unpriced_cash_flow == "1"
+    resolved = resolve_unpriced_refid(
+        store, Mode.LIVE, AssetClass.EQUITY, "btc-in", now=NOW,
+    )
+    assert resolved["unpriced_cash_flow"] == "0"
+    assert any(
+        row.get("reason") == "unpriced_cash_flow_resolved" and row.get("refid") == "btc-in"
+        for row in resolved["audit"]
+    )
+    opened = wired.advance(AssetClass.EQUITY, D("15000"))
+    assert opened.entries_allowed is True
+    assert store.writes[-1].high_water == D("15000")
+
+
+def test_known_backfill_and_refid_are_mutually_exclusive(tmp_path):
+    try:
+        main([
+            "--db", str(tmp_path / "nope.db"),
+            "--apply-known-2026-11-14",
+            "--refid", "extra",
+            "--asset", "USDT",
+            "--amount", "-1",
+            "--at", "2026-11-14T18:05:50.123Z",
+        ])
+    except SystemExit as caught:
+        assert caught.code == 2
+    else:
+        raise AssertionError("combined flags must be rejected")
 
 
 def test_a_flow_that_would_wipe_the_baseline_is_remembered():

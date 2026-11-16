@@ -270,6 +270,12 @@ class RiskState:
     # ``1`` while a wired ledger cannot be reconciled. Entries stay closed
     # and the stored day is not treated as a fresh open.
     ledger_blind: str = ""
+    # Sticky halt for a cash row we could not price. Unlike ``ledger_blind``
+    # it survives the next successful ledger read. It clears only when an
+    # operator resolves every refid in ``unpriced_refids``. While it is set
+    # the high-water mark is not ratcheted up to equity.
+    unpriced_cash_flow: str = ""
+    unpriced_refids: str = ""
 
     def __post_init__(self) -> None:
         for label, value in (("high_water", self.high_water),
@@ -300,6 +306,18 @@ class RiskState:
             raise ValueError(
                 f"ledger_blind must be '', '0', or '1', got {self.ledger_blind!r}"
             )
+        if self.unpriced_cash_flow not in {"", "0", "1"}:
+            raise ValueError(
+                f"unpriced_cash_flow must be '', '0', or '1', got {self.unpriced_cash_flow!r}"
+            )
+        if self.unpriced_refids:
+            parsed_unpriced = json.loads(self.unpriced_refids)
+            if (not isinstance(parsed_unpriced, list)
+                    or any(not isinstance(item, str) or not item.strip()
+                           for item in parsed_unpriced)):
+                raise ValueError(
+                    "unpriced_refids must be a JSON list of non-empty strings"
+                )
 
     def as_row(self) -> dict[str, str]:
         """The persisted form. Every value is a string: Decimals are stringified
@@ -317,6 +335,8 @@ class RiskState:
             "processed_flow_refids": self.processed_flow_refids or "",
             "flow_watermark_ms": self.flow_watermark_ms or "",
             "ledger_blind": self.ledger_blind or "",
+            "unpriced_cash_flow": self.unpriced_cash_flow or "",
+            "unpriced_refids": self.unpriced_refids or "",
         }
 
     @classmethod
@@ -335,6 +355,8 @@ class RiskState:
             processed_flow_refids=str(row.get("processed_flow_refids") or ""),
             flow_watermark_ms=str(row.get("flow_watermark_ms") or ""),
             ledger_blind=str(row.get("ledger_blind") or ""),
+            unpriced_cash_flow=str(row.get("unpriced_cash_flow") or ""),
+            unpriced_refids=str(row.get("unpriced_refids") or ""),
         )
 
 
@@ -404,6 +426,21 @@ class ExternalCashFlow:
             raise ValueError("external cash flow timestamp must be timezone-aware")
 
 
+class UnpricedCashFlow(RuntimeError):
+    """A cash row the mark must not step past.
+
+    ``refid`` is persisted. The halt stays up through later clean ledger
+    pages until an operator resolves that refid. The message starts with
+    ``unpriced_cash_flow``.
+    """
+
+    def __init__(self, message: str, *, refid: str) -> None:
+        super().__init__(message if str(message).startswith("unpriced_cash_flow")
+                         else f"unpriced_cash_flow: {message}")
+        self.refid = refid.strip()
+        self.unpriced_cash_flow = True
+
+
 @runtime_checkable
 class CashFlowSource(Protocol):
     """Spot ledger reader. Raise when the ledger cannot be read.
@@ -411,10 +448,14 @@ class CashFlowSource(Protocol):
     An empty flow list means there is nothing new. It must not be used to
     report a failed read: ``advance`` treats a raise as fail-closed and
     leaves the high-water mark on its previous path.
+
+    ``acknowledged_refids`` are rows already latched or resolved. The reader
+    must not raise for those, or one rejected deposit blocks every later page.
     """
 
     def fetch_spot_cash_flows(
         self, *, since_ms: Optional[int],
+        acknowledged_refids: Sequence[str] = (),
     ) -> tuple[Sequence[ExternalCashFlow], Optional[int]]: ...
 
 
@@ -425,6 +466,22 @@ def _parse_refids(raw: str) -> list[str]:
     if not isinstance(parsed, list):
         raise ValueError("processed_flow_refids must be a JSON list")
     return [str(item) for item in parsed]
+
+
+def _merge_refid(raw: str, refid: str) -> str:
+    items = _parse_refids(raw)
+    if refid and refid not in items:
+        items.append(refid)
+    return json.dumps(items)
+
+
+def _unpriced_refid(exc: BaseException) -> Optional[str]:
+    """Refid of an unpriced cash row, or None when this is some other failure."""
+    marked = bool(getattr(exc, "unpriced_cash_flow", False))
+    if not marked and not str(exc).startswith("unpriced_cash_flow"):
+        return None
+    refid = str(getattr(exc, "refid", "") or "").strip()
+    return refid or "unpriced-unidentified"
 
 
 def start_of_day_key(profile: AssetClassProfile, day_key: str) -> dt.datetime:
@@ -674,12 +731,13 @@ class RiskCircuit:
         adjusted_hw = None if state is None else state.high_water
         adjusted_open = None if state is None else state.day_open_equity
         day_starts = None if state is None else start_of_day_key(profile, state.day_key)
+        unpriced_json = "" if state is None else (state.unpriced_refids or "[]")
         folded = self._fold_cash_flows(
             state, processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open,
-            day_starts,
+            day_starts, unpriced_json,
         )
         (processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open,
-         flow_detail, ledger_blind) = folded
+         flow_detail, ledger_blind, unpriced_json, unpriced_latched) = folded
 
         rebase_json = ""
         stored_day = day_key
@@ -687,15 +745,17 @@ class RiskCircuit:
             high_water = equity
             day_open = equity
             rebase_json = flow_rebase
-        elif ledger_blind:
-            # The equity may already contain a deposit the ledger has not
-            # named. Raising the mark here, or opening the new day at that
-            # equity, makes the same cash count again when the read returns.
-            high_water = state.high_water
-            day_open = state.day_open_equity
+        elif ledger_blind or unpriced_latched:
+            # A blind read, or a latched unpriced row, must not adopt equity.
+            # Priced flows already shifted ``adjusted_*`` before a latch that
+            # survived into a later clean page; a failed read leaves them
+            # equal to the stored baselines. max() is the ratchet that turned
+            # one skipped deposit into a new high.
+            high_water = adjusted_hw if adjusted_hw is not None else state.high_water
+            day_open = adjusted_open if adjusted_open is not None else state.day_open_equity
             stored_day = state.day_key
             basis = state.equity_basis or _BASIS_FULL
-            rebase_json = state.hwm_rebase_json
+            rebase_json = flow_rebase if not ledger_blind else state.hwm_rebase_json
         elif state.equity_basis != basis:
             # Off→on and on→off both rebase. The equity number changed
             # because the reserve was added or removed, not because the
@@ -736,8 +796,12 @@ class RiskCircuit:
 
         if self._cash_flows is None:
             blind_flag = "" if state is None else (state.ledger_blind or "")
+            unpriced_flag = "" if state is None else (state.unpriced_cash_flow or "")
         else:
+            # A clean page clears a transient outage. It does not clear an
+            # unpriced refid. Only the operator command does that.
             blind_flag = "1" if ledger_blind else "0"
+            unpriced_flag = "1" if unpriced_latched else "0"
         new_state = RiskState(
             mode=self._mode,
             asset_class=asset_class,
@@ -750,6 +814,8 @@ class RiskCircuit:
             processed_flow_refids=processed_json,
             flow_watermark_ms=watermark,
             ledger_blind=blind_flag,
+            unpriced_cash_flow=unpriced_flag,
+            unpriced_refids=unpriced_json,
         )
         # Deliberately unguarded: a failed write must reach the order path, not
         # be smoothed into a decision that looks persisted but is not.
@@ -768,7 +834,8 @@ class RiskCircuit:
         adjusted_hw: Optional[Decimal],
         adjusted_open: Optional[Decimal],
         day_starts: Optional[dt.datetime],
-    ) -> tuple[str, str, str, Optional[Decimal], Optional[Decimal], Optional[str], bool]:
+        unpriced_json: str,
+    ) -> tuple[str, str, str, Optional[Decimal], Optional[Decimal], Optional[str], bool, str, bool]:
         """Apply the ledger page, or keep the stored baselines on a bad read.
 
         The first time a book has no watermark, the source is asked with
@@ -779,26 +846,36 @@ class RiskCircuit:
         baseline exists are recorded as seen and not added on top of the
         equity that is about to become the baseline.
 
-        The last element is True when the ledger could not be read. The
-        caller must not adopt the current equity as a new high in that case.
+        The last flags say the ledger could not be read, and whether an
+        unpriced refid is latched. A latched refid survives a later clean page.
+        The caller must not adopt the current equity as a new high in either case.
         """
+        already = state is not None and state.unpriced_cash_flow == "1"
         if self._cash_flows is None:
             return (processed_json, watermark, flow_rebase, adjusted_hw,
-                    adjusted_open, None, False)
+                    adjusted_open, None, False, unpriced_json, already)
         since = int(watermark) if watermark else None
+        acknowledged = _parse_refids(processed_json) + _parse_refids(unpriced_json)
         try:
-            flows, new_wm = self._cash_flows.fetch_spot_cash_flows(since_ms=since)
+            flows, new_wm = self._cash_flows.fetch_spot_cash_flows(
+                since_ms=since, acknowledged_refids=acknowledged,
+            )
         except Exception as exc:  # noqa: BLE001 - surfaced, baselines untouched
             LOG.error("risk cash-flow ledger read failed: %s", type(exc).__name__)
+            rejected = _unpriced_refid(exc)
+            latched = already
+            if rejected is not None:
+                unpriced_json = _merge_refid(unpriced_json, rejected)
+                latched = True
             return (
                 processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open,
-                _ledger_failure_detail(exc), True,
+                _ledger_failure_detail(exc), True, unpriced_json, latched,
             )
         if not isinstance(flows, (list, tuple)):
             return (
                 processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open,
                 "external cash-flow ledger unreadable: malformed page; "
-                "high-water mark not adjusted", True,
+                "high-water mark not adjusted", True, unpriced_json, already,
             )
         detail = None
         if state is not None and adjusted_hw is not None and adjusted_open is not None:
@@ -821,7 +898,7 @@ class RiskCircuit:
         if new_wm is not None:
             watermark = str(int(new_wm))
         return (processed_json, watermark, flow_rebase, adjusted_hw,
-                adjusted_open, detail, False)
+                adjusted_open, detail, False, unpriced_json, already)
 
     # -------------------------------------------------------------- internals
 
@@ -932,7 +1009,7 @@ def _judge(profile: AssetClassProfile, limits: RiskLimits,
         # persisted; advance() persists the same roll on the order path.
         # A ledger outage freezes day_key on purpose. Rolling that frozen key
         # onto current equity would report the overnight loss as zero.
-        blind = state.ledger_blind == "1"
+        blind = state.ledger_blind == "1" or state.unpriced_cash_flow == "1"
         rolled = state.day_key != today and equity > ZERO and not blind
         day_open = equity if rolled else state.day_open_equity
         origin = (
@@ -961,12 +1038,15 @@ def _judge(profile: AssetClassProfile, limits: RiskLimits,
     # risk on cash the cursor has not named. A real breach still wins, so
     # an 11% daily loss stays a flatten rather than a pause.
     ledger_closed = state is not None and state.ledger_blind == "1"
-    if ledger_closed and action in _ENTRY_ACTIONS:
+    unpriced_closed = state is not None and state.unpriced_cash_flow == "1"
+    if (ledger_closed or unpriced_closed) and action in _ENTRY_ACTIONS:
         action = CircuitAction.PAUSE
     reason = (
         f"{action.value}: drawdown {_as_pct(drawdown)} of high-water {high_water}, "
         f"daily loss {_as_pct(daily_loss)} ({origin}); driven by {driver}"
     )
+    if unpriced_closed:
+        reason = f"unpriced_cash_flow: {reason}"
     if ledger_closed:
         reason = f"ledger_blind: {reason}"
     multiplier = (

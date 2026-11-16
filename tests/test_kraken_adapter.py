@@ -8,6 +8,7 @@ the safety rules in adapters/kraken.py are deleted. They do not touch OkxAdapter
 from __future__ import annotations
 
 import datetime as dt
+import json
 from decimal import Decimal
 from typing import Optional
 
@@ -219,10 +220,11 @@ def test_parse_spot_cash_flow_keeps_spot_stables_and_drops_derivatives():
         "xfer-1", "transfer", "5", stamp + 2, direction="out", info_amount="5",
     ))
     assert transfer is not None and transfer.amount == D("-5")
-    assert parse_spot_cash_flow(_ledger_row(
+    deriv = parse_spot_cash_flow(_ledger_row(
         "DERIV-1", "derivativeswithdrawal", "-50", stamp,
         info_type="derivativeswithdrawal", info_amount="-50",
-    )) is None
+    ))
+    assert deriv is not None and deriv.amount == D("-50")
     assert parse_spot_cash_flow(_ledger_row(
         "trade-1", "trade", "-3", stamp, info_amount="-3",
     )) is None
@@ -233,8 +235,59 @@ def test_parse_spot_cash_flow_keeps_spot_stables_and_drops_derivatives():
     assert classify_ledger_row(_ledger_row(
         "d-mid", "transfer", "-1", stamp,
         info_type="spot-to-derivatives", info_amount="-1",
-    ))[0] == "ignore"
+    ))[0] == "flow"
 
+
+def test_futures_usdt_moves_shift_the_mark_for_both_label_shapes():
+    """A futures-wallet or derivatives USDT move is cash, not an ignored row."""
+    from core.risk import RiskCircuit
+    from tests.test_risk import NOW as RISK_NOW
+    from tests.test_risk import FakeStore, state_at
+
+    stamp = int(dt.datetime(2026, 8, 27, 6, 0, tzinfo=UTC).timestamp() * 1000)
+    shapes = [
+        _ledger_row(
+            "fut-wallet", "futures", "25", stamp,
+            direction="in", asset="USDT", info_amount="25",
+        ) | {"account": "futures", "info": {
+            "refid": "fut-wallet", "type": "futures", "wallet": "futures",
+            "asset": "USDT", "amount": "25",
+        }},
+        _ledger_row(
+            "fut-account", "futures", "25", stamp,
+            direction="in", asset="USDT", info_amount="25",
+        ) | {"account": "futures"},
+        _ledger_row(
+            "der-sub", "transfer", "25", stamp,
+            direction="in", asset="USDT", info_amount="25",
+        ),
+    ]
+    # The helper puts type on info. Force the derivatives subtype on the last row.
+    shapes[2]["info"]["subtype"] = "derivatives"
+    for row in shapes:
+        refid = row["id"]
+
+        class _Pages(FakeExchange):
+            def fetch_ledger(self, code=None, since=None, limit=None, params=None):
+                if since is None:
+                    return [_ledger_row("trade-1", "trade", "-1", 1_000_000, info_amount="-1")]
+                return [row]
+
+        store = FakeStore(state_at("10000", asset_class=AssetClass.CRYPTO))
+        wired = RiskCircuit(
+            store, Mode.LIVE, clock=lambda: RISK_NOW, cash_flows=adapter(_Pages()),
+        )
+        wired.advance(AssetClass.CRYPTO, D("10000"))
+        decision = wired.advance(AssetClass.CRYPTO, D("10025"))
+        written = store.writes[-1]
+        assert written.high_water == D("10025"), refid
+        assert written.day_open_equity == D("10025"), refid
+        audit = json.loads(written.hwm_rebase_json)
+        assert any(
+            item.get("reason") == "external_cash_flow" and item.get("refid") == refid
+            for item in audit
+        ), refid
+        assert decision.entries_allowed is True
 
 def test_a_btc_deposit_holds_the_watermark_and_blocks_entries():
     """A non-stable deposit must not be skipped and then booked as a new high."""

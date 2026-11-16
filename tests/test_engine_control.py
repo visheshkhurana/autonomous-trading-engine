@@ -199,7 +199,7 @@ def orders_placed(h: Harness) -> int:
 # ==========================================================================
 
 class _LedgerDown:
-    def fetch_spot_cash_flows(self, *, since_ms):
+    def fetch_spot_cash_flows(self, *, since_ms, acknowledged_refids=()):
         raise RuntimeError("flat outage")
 
 
