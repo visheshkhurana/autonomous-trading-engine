@@ -198,6 +198,85 @@ def orders_placed(h: Harness) -> int:
 # pause
 # ==========================================================================
 
+class _LedgerDown:
+    def fetch_spot_cash_flows(self, *, since_ms, acknowledged_refids=()):
+        raise RuntimeError("flat outage")
+
+
+def test_ledger_outage_blocks_entries_and_still_places_stops_and_exits(harness) -> None:
+    """A flat book with an unreadable ledger is not an open book.
+
+    Entries stop. A resting stop and a reducing exit still go out, because
+    the outage must not trap a position.
+    """
+    h = harness([AlwaysBuys(), AlwaysSells()], MemControl())
+    h.circuit._cash_flows = _LedgerDown()
+    decision = h.circuit.advance(AssetClass.CRYPTO, Decimal("5000000"))
+    assert decision.entries_allowed is False
+    assert decision.reason.startswith("ledger_blind")
+    h.open_long()
+    h.store.set_native_stop(
+        Mode.PAPER, "BTC/USDT", "seller",
+        txid=None, stop_price=Decimal("50000"), stop_qty=Decimal("1"),
+        status="wanted",
+    )
+    placed: list[object] = []
+    original = h.adapter.place_native_stop
+
+    def spy(*args, **kwargs):
+        placed.append(args)
+        return original(*args, **kwargs)
+
+    h.adapter.place_native_stop = spy
+    h.tick()
+    assert h.circuit.read(AssetClass.CRYPTO, Decimal("5000000")).entries_allowed is False
+    assert placed, "a ledger outage must not skip the native stop"
+    orders = list(h.store.orders(Mode.PAPER))
+    assert any(order.intent.side is Side.SELL for order in orders)
+    assert not any(order.intent.side is Side.BUY for order in orders)
+
+
+def test_paused_with_healthy_risk_submits_no_entry(harness) -> None:
+    """Pause is the entry gate even when the risk ladder would allow the order."""
+    control = MemControl()
+    control.pause("crypto", "vision halt")
+    h = harness([AlwaysBuys()], control)
+    h.tick()
+    decision = h.circuit.read(AssetClass.CRYPTO, Decimal("5000000"))
+    assert decision.entries_allowed is True
+    assert decision.action.value == "ok"
+    assert orders_placed(h) == 0
+    assert any("paused" in str(e.data.get("reason", ""))
+               for e in h.events(eng.EventKind.REJECTION))
+
+
+def test_pause_does_not_block_a_stop_or_an_exit(harness) -> None:
+    control = MemControl()
+    h = harness([AlwaysSells(), AlwaysBuys()], control)
+    h.open_long()
+    h.store.set_native_stop(
+        Mode.PAPER, "BTC/USDT", "seller",
+        txid=None, stop_price=Decimal("50000"), stop_qty=Decimal("1"),
+        status="wanted",
+    )
+    placed: list[object] = []
+    original = h.adapter.place_native_stop
+
+    def spy(*args, **kwargs):
+        placed.append(args)
+        return original(*args, **kwargs)
+
+    h.adapter.place_native_stop = spy
+    control.pause("crypto", "vision halt")
+    h.tick()
+    # The reducing sell cancels the stop it just rested. The call itself is
+    # the proof that pause did not skip stop maintenance.
+    assert placed, "a pause must not skip the native stop"
+    orders = list(h.store.orders(Mode.PAPER))
+    assert any(order.intent.side is Side.SELL for order in orders)
+    assert not any(order.intent.side is Side.BUY for order in orders)
+
+
 def test_a_paused_class_places_no_new_entries(harness) -> None:
     control = MemControl()
     h = harness([AlwaysBuys()], control)
@@ -361,6 +440,61 @@ def test_the_engine_acknowledges_the_request_it_carried_out(harness) -> None:
     h.tick()
     assert control.rows["crypto"]["flatten_acked_id"] == "req-abc"
     assert control.rows["crypto"]["flatten_acked_at"]
+
+
+ACKED_FLATTEN = "5796ef7697ed4aeb8fb6b8e45b382818"
+
+
+def _acked_flatten_row() -> dict[str, str]:
+    return {
+        "paused": "1",
+        "paused_at": NOW.isoformat(),
+        "paused_reason": "already flattened in September",
+        "flatten_request_id": ACKED_FLATTEN,
+        "flatten_requested_at": "2026-09-11T18:35:23.677666+00:00",
+        "flatten_reason": "Rhodey must_flatten compliance",
+        "flatten_acked_id": ACKED_FLATTEN,
+        "flatten_acked_at": "2026-09-11T18:35:42.036895+00:00",
+    }
+
+
+def test_an_acked_flatten_does_not_replay_across_restart(harness) -> None:
+    """flatten_request_id == flatten_acked_id is finished, including after the
+    process that wrote the ack is gone."""
+    control = MemControl()
+    control.rows["crypto"] = _acked_flatten_row()
+    h = harness([], control)
+    h.open_long()
+    first = h.engine._runners[AssetClass.CRYPTO].read_control()
+    assert first.flatten_pending is False
+    h.tick()
+    assert orders_placed(h) == 0
+    assert control.rows["crypto"]["flatten_acked_id"] == ACKED_FLATTEN
+    assert control.rows["crypto"]["flatten_request_id"] == ACKED_FLATTEN
+    # Restart: drop anything this process might have remembered and re-read.
+    runner = h.engine._runners[AssetClass.CRYPTO]
+    runner._flatten_acked = None
+    again = runner.read_control()
+    assert again.flatten_pending is False
+    h.tick()
+    assert orders_placed(h) == 0
+    assert control.rows["crypto"]["flatten_acked_id"] == ACKED_FLATTEN
+
+
+def test_control_writes_do_not_drop_an_acked_flatten_id(harness) -> None:
+    """Pause, a risk write, a heartbeat and an entry-halt migration keep both
+    ids. Dropping only the ack would make the old request look pending."""
+    control = MemControl()
+    control.rows["crypto"] = _acked_flatten_row()
+    h = harness([], control)
+    h.tick()
+    runner = h.engine._runners[AssetClass.CRYPTO]
+    runner._set_entry_halt("ledger_mismatch", detail={"mismatches": []})
+    h.circuit.advance(AssetClass.CRYPTO, Decimal("10000"))
+    row = control.rows["crypto"]
+    assert row["flatten_request_id"] == ACKED_FLATTEN
+    assert row["flatten_acked_id"] == ACKED_FLATTEN
+    assert row["flatten_acked_at"] == "2026-09-11T18:35:42.036895+00:00"
 
 
 def test_an_acknowledged_flatten_is_not_repeated(harness) -> None:

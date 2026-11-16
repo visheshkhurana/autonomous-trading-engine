@@ -115,8 +115,9 @@ def state_at(equity: str, *, day_key: str = "2026-08-27",
 
 
 def circuit(store: FakeStore, *, mode: Mode = Mode.LIVE,
-            when: dt.datetime = NOW, limits=None) -> RiskCircuit:
-    return RiskCircuit(store=store, mode=mode, limits=limits, clock=clock_at(when))
+            when: dt.datetime = NOW, limits=None, cash_flows=None) -> RiskCircuit:
+    return RiskCircuit(store=store, mode=mode, limits=limits, clock=clock_at(when),
+                       cash_flows=cash_flows)
 
 
 # ---------------------------------------------------------------- contract

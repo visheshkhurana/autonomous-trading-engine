@@ -46,7 +46,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from uuid import uuid4
 
-from core.risk import equity_for_drawdown
+from core.risk import ExternalCashFlow, UnpricedCashFlow, equity_for_drawdown
 from core.safety import (
     STOP_FEE_CLIP_LIMIT, ManualReservedError, StopCancelResult, StopPlaceResult,
     base_asset, engine_spendable, env_bool, key_freeze_active, non_reserved_free,
@@ -65,6 +65,7 @@ __all__ = [
     "OrderStateUnknown", "UnknownOrder", "CostBasisUnavailable",
     "FundsMovementForbidden", "is_funds_movement", "clip_spot_sell_qty",
     "QUOTE_FALLBACK", "STABLE_FACE_VALUE", "FIAT_PER_USD",
+    "parse_spot_cash_flow",
 ]
 
 # The production Kraken key has historically carried withdraw permission. This
@@ -122,6 +123,250 @@ FIAT_PER_USD: Mapping[str, Decimal] = {
     "AED": Decimal("3.6725"),   # UAE dirham, unchanged since 1997
     "SAR": Decimal("3.75"),     # Saudi riyal
 }
+
+# Spot cash that moves the account equity one-for-one. A BTC deposit is not
+# applied as if the coin count were USDT; the high-water mark is denominated
+# in the quote. Derivatives ledger types are manual futures, outside the book.
+_CASH_FLOW_TYPES = frozenset({"deposit", "withdrawal", "transfer"})
+# Only these quote assets are spot cash. Funding and futures trades are not,
+# even when Kraken denominates them in a stable.
+_SPOT_CASH_ASSETS = frozenset({"USDT", "USDC"})
+# Derivatives activity that does not move the spot balance. The cursor walks
+# past these. They are not flows and they do not latch.
+_IGNORED_DERIVATIVE_ROWS = frozenset({
+    "derivativesfundingratechange",
+    "derivativesfuturestrade",
+})
+_LEDGER_PAGE = 50
+_LEDGER_PAGE_CAP = 40
+_SKIPPED_LEDGER_STATUS = frozenset({
+    "pending", "canceled", "cancelled", "failed", "rejected",
+})
+
+
+def _ledger_label(value: Any) -> str:
+    return str(value or "").lower().replace("-", "").replace("_", "").replace(" ", "")
+
+
+# Ledger types that are fills or funding, not external cash. Anything else
+# that is not a deposit, withdrawal, or transfer is ignored. A cash type we
+# cannot price is a reject, not an ignore.
+_NON_CASH_LEDGER_TYPES = frozenset({
+    "trade", "margin", "rollover", "spend", "receive", "settled",
+    "adjustment", "staking", "sale", "dividend", "credit", "fee",
+    "rebate", "nfttrade", "nftcreatorfee", "nftrebate",
+})
+
+
+def _ledger_labels(entry: Mapping[str, Any], info: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = (
+        entry.get("type"),
+        entry.get("account"),
+        info.get("type"),
+        info.get("subtype"),
+        info.get("wallet"),
+        info.get("aclass"),
+    )
+    return tuple(_ledger_label(label) for label in raw if label)
+
+
+def _is_ignored_derivative_activity(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
+    """Funding payments and futures trades. Not spot cash, and not a halt."""
+    return any(label in _IGNORED_DERIVATIVE_ROWS for label in _ledger_labels(entry, info))
+
+
+def _is_spot_futures_transfer(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
+    """USDT/USDC moving between the spot wallet and futures."""
+    for label in _ledger_labels(entry, info):
+        if "spottofutures" in label or "futurestospot" in label:
+            return True
+    return False
+
+
+def _is_futures_or_derivatives(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
+    """Futures-wallet cash and any derivatives label.
+
+    ``wallet`` or ``account`` equal to ``futures``, or a subtype (or any
+    other label) containing ``derivatives``. These are USDT movements of
+    the spot book, not rows to skip.
+    """
+    wallet = _ledger_label(info.get("wallet"))
+    account = _ledger_label(entry.get("account") or info.get("account"))
+    if wallet == "futures" or account == "futures":
+        return True
+    return any("derivatives" in label for label in _ledger_labels(entry, info))
+
+
+def _row_refid(entry: Mapping[str, Any], info: Mapping[str, Any]) -> str:
+    return str(
+        info.get("refid") or entry.get("id") or entry.get("referenceId") or ""
+    ).strip()
+
+
+def _stable_flow(
+    entry: Mapping[str, Any], info: Mapping[str, Any], kind: str,
+) -> Optional[ExternalCashFlow]:
+    asset = str(entry.get("currency") or info.get("asset") or "").upper()
+    amount = _signed_flow_amount(entry, info, kind)
+    at = _ledger_timestamp(entry)
+    refid = _row_refid(entry, info)
+    if asset not in STABLE_FACE_VALUE or amount is None or amount == 0 or at is None or not refid:
+        return None
+    return ExternalCashFlow(refid=refid, asset=asset, amount=amount, at=at)
+
+
+def _ledger_type(entry: Mapping[str, Any], info: Mapping[str, Any]) -> str:
+    raw = _ledger_label(info.get("type") or entry.get("type"))
+    return raw
+
+
+def _ledger_timestamp(entry: Mapping[str, Any]) -> Optional[dt.datetime]:
+    raw = entry.get("timestamp")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return dt.datetime.fromtimestamp(int(raw) / 1000, tz=UTC)
+        except (TypeError, ValueError, OSError):
+            return None
+    text = entry.get("datetime")
+    if not text:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _signed_flow_amount(entry: Mapping[str, Any], info: Mapping[str, Any],
+                        kind: str) -> Optional[Decimal]:
+    """Signed equity units. Info amount is preferred when Kraken signed it."""
+    raw_info = info.get("amount")
+    direction = str(entry.get("direction") or "").lower()
+    if raw_info is not None and str(raw_info).strip() != "":
+        try:
+            signed = Decimal(str(raw_info))
+        except InvalidOperation:
+            return None
+        text = str(raw_info).strip()
+        if text.startswith("-") or text.startswith("+"):
+            return signed
+        # Unsigned info: the ledger type and direction carry the sign.
+        magnitude = abs(signed)
+    else:
+        raw = entry.get("amount")
+        if raw is None:
+            return None
+        try:
+            magnitude = abs(Decimal(str(raw)))
+        except InvalidOperation:
+            return None
+    if kind == "withdrawal" or direction == "out":
+        return -magnitude
+    if kind == "deposit" or direction == "in":
+        return magnitude
+    return None
+
+
+def classify_ledger_row(
+    entry: Mapping[str, Any],
+) -> tuple[str, Optional[ExternalCashFlow]]:
+    """``ignore``, ``flow``, or ``reject``.
+
+    ``reject`` is a deposit, withdrawal, or transfer we cannot value in the
+    equity currency, or a futures-wallet row we cannot price. The cursor
+    must stop on it. Spot trades are ``ignore``. Funding-rate changes and
+    futures trades (``derivativesfundingratechange``,
+    ``derivativesfuturestrade``) are ``ignore`` as well: no flow and no
+    latch, so the cursor walks past them. A spot-to-futures or
+    futures-to-spot transfer of USDT or USDC is a ``flow``.
+    """
+    if not isinstance(entry, Mapping):
+        return "reject", None
+    info = entry.get("info")
+    if not isinstance(info, Mapping):
+        info = {}
+    if _is_ignored_derivative_activity(entry, info):
+        return "ignore", None
+    kind = _ledger_type(entry, info)
+    status = str(entry.get("status") or info.get("status") or "ok").lower()
+    if _is_spot_futures_transfer(entry, info):
+        asset = str(entry.get("currency") or info.get("asset") or "").upper()
+        if asset not in _SPOT_CASH_ASSETS:
+            return "ignore", None
+        flow = _stable_flow(entry, info, "transfer")
+        if flow is None:
+            return "reject", None
+        return "flow", flow
+    if _is_futures_or_derivatives(entry, info):
+        if status in _SKIPPED_LEDGER_STATUS:
+            return "ignore", None
+        flow = _stable_flow(entry, info, kind or "transfer")
+        if flow is None:
+            return "reject", None
+        return "flow", flow
+    if kind in _NON_CASH_LEDGER_TYPES:
+        return "ignore", None
+    if kind not in _CASH_FLOW_TYPES:
+        # No type at all is not a row we can prove is harmless.
+        if not kind:
+            return "reject", None
+        return "ignore", None
+    if status in _SKIPPED_LEDGER_STATUS:
+        return "ignore", None
+    flow = _stable_flow(entry, info, kind)
+    if flow is None:
+        return "reject", None
+    return "flow", flow
+
+
+def parse_spot_cash_flow(entry: Mapping[str, Any]) -> Optional[ExternalCashFlow]:
+    """One ccxt ledger row as a spot cash flow, or None when it is not applied.
+
+    Kept: deposit, withdrawal, transfer, in a face-value stable. Dropped:
+    trades, and any label containing ``derivatives`` (manual Kraken Futures,
+    outside this book), not only those that start with that word. A pending
+    or cancelled row is not a flow yet. A cash row that cannot be priced is
+    not returned here; ``classify_ledger_row`` reports it as ``reject`` so
+    the cursor does not walk past it.
+    """
+    kind, flow = classify_ledger_row(entry)
+    if kind == "flow":
+        return flow
+    return None
+
+
+def _reject_unpriced(rows: Sequence[Any], acknowledged: Sequence[str]) -> None:
+    skip = {refid for refid in acknowledged if refid}
+    for row in rows:
+        kind, _flow = classify_ledger_row(row)
+        if kind != "reject":
+            continue
+        info = row.get("info") if isinstance(row, Mapping) and isinstance(row.get("info"), Mapping) else {}
+        refid = _row_refid(row, info) if isinstance(row, Mapping) else ""
+        if refid and refid in skip:
+            continue
+        shown = repr(row)
+        if len(shown) > 180:
+            shown = shown[:180] + "..."
+        raise UnpricedCashFlow(
+            f"unpriced_cash_flow: {shown}",
+            refid=refid or "unpriced-unidentified",
+        )
+
+
+def _ledger_time_ms(entry: Mapping[str, Any]) -> Optional[int]:
+    raw = entry.get("timestamp")
+    if raw is None or str(raw).strip() == "":
+        at = _ledger_timestamp(entry)
+        if at is None:
+            return None
+        return int(at.timestamp() * 1000)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 
@@ -1904,6 +2149,87 @@ class KrakenAdapter:
             + (f" ({cancel_error!r})" if cancel_error else ""),
         )
 
+    # --------------------------------------------------------------- spot ledger
+
+    def fetch_spot_cash_flows(
+        self, *, since_ms: Optional[int],
+        acknowledged_refids: Sequence[str] = (),
+    ) -> tuple[list[ExternalCashFlow], Optional[int]]:
+        """Spot deposit/withdrawal/transfer rows, plus a millisecond watermark.
+
+        ``since_ms is None`` checkpoints the cursor at the newest ledger time
+        and returns no flows. History already inside the high-water mark is
+        not applied; the operator backfill command is what adjusts the two
+        withdrawals that landed before this cursor existed. Later calls return
+        only flows at or after the watermark. A raise leaves the caller on
+        the previous mark.
+        """
+        if since_ms is None:
+            rows = self._ledger_page(None, 0)
+            _reject_unpriced(rows, acknowledged_refids)
+            newest = _newest_ms(rows)
+            if newest is None:
+                newest = int(self._now().timestamp() * 1000)
+            else:
+                # Exclusive of the checkpoint page. The next read uses an
+                # inclusive since, and these rows are already inside equity.
+                newest = newest + 1
+            return [], newest
+        return self._flows_since(since_ms, acknowledged_refids)
+
+    def _ledger_page(self, since_ms: Optional[int], offset: int) -> list[Any]:
+        params: dict[str, Any] = {}
+        if offset:
+            params["ofs"] = offset
+        raw = self._ex.fetch_ledger(None, since_ms, _LEDGER_PAGE, params)
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise TypeError(
+                f"fetch_ledger returned {type(raw).__name__}, expected a list"
+            )
+        return raw
+
+    def _flows_since(
+        self, since_ms: int, acknowledged_refids: Sequence[str] = (),
+    ) -> tuple[list[ExternalCashFlow], Optional[int]]:
+        found: list[ExternalCashFlow] = []
+        seen: set[str] = set()
+        newest: Optional[int] = since_ms
+        offset = 0
+        covered = False
+        for _ in range(_LEDGER_PAGE_CAP):
+            rows = self._ledger_page(since_ms, offset)
+            if not rows:
+                covered = True
+                break
+            times = [ms for ms in (_ledger_time_ms(row) for row in rows) if ms is not None]
+            if times:
+                page_newest = max(times)
+                newest = page_newest if newest is None else max(newest, page_newest)
+            _reject_unpriced(rows, acknowledged_refids)
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                flow = parse_spot_cash_flow(row)
+                if flow is None or flow.refid in seen:
+                    continue
+                seen.add(flow.refid)
+                found.append(flow)
+            if len(rows) < _LEDGER_PAGE:
+                covered = True
+                break
+            oldest = min(times) if times else None
+            if oldest is not None and oldest <= since_ms:
+                covered = True
+                break
+            offset += len(rows)
+        if not covered:
+            # The window was not walked back to the cursor. Do not move the
+            # watermark across a gap that may still hold a cash flow.
+            return found, since_ms
+        return found, newest
+
     # --------------------------------------------------------------- cancelling
 
     def cancel(self, order_id: str) -> bool:
@@ -1948,3 +2274,11 @@ class KrakenAdapter:
             ) from exc
         requested = _dec_opt(order.get("amount")) or Decimal("0")
         return self._map_status(order, requested)
+
+
+def _newest_ms(rows: Sequence[Any]) -> Optional[int]:
+    times = [_ledger_time_ms(row) for row in rows if isinstance(row, Mapping)]
+    present = [ms for ms in times if ms is not None]
+    if not present:
+        return None
+    return max(present)

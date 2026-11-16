@@ -152,6 +152,19 @@ def test_kraken_goes_live_only_with_venue_and_both_arm_flags(tmp_path) -> None:
         assert isinstance(crypto.adapter, KrakenAdapter)
         assert crypto.adapter is crypto.wiring.live_adapter
         assert spy.calls == []
+        assert crypto.wiring.risk._cash_flows is crypto.adapter
+    finally:
+        s.close()
+        s.store.close()
+
+
+def test_paper_kraken_does_not_read_the_live_ledger(tmp_path) -> None:
+    env = base_env(tmp_path, TRADER_CRYPTO_VENUE="kraken")
+    s = runner.build_stack(env=env, clock=lambda: NOW)
+    try:
+        crypto = s.engine._runners[AssetClass.CRYPTO]
+        assert crypto.mode is Mode.PAPER
+        assert crypto.wiring.risk._cash_flows is None
     finally:
         s.close()
         s.store.close()
