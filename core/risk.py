@@ -267,6 +267,9 @@ class RiskState:
     # source has fully checkpointed, in milliseconds.
     processed_flow_refids: str = ""
     flow_watermark_ms: str = ""
+    # ``1`` while a wired ledger cannot be reconciled. Entries stay closed
+    # and the stored day is not treated as a fresh open.
+    ledger_blind: str = ""
 
     def __post_init__(self) -> None:
         for label, value in (("high_water", self.high_water),
@@ -293,6 +296,10 @@ class RiskState:
                 f"flow_watermark_ms must be empty or an integer millisecond "
                 f"timestamp, got {self.flow_watermark_ms!r}"
             )
+        if self.ledger_blind not in {"", "0", "1"}:
+            raise ValueError(
+                f"ledger_blind must be '', '0', or '1', got {self.ledger_blind!r}"
+            )
 
     def as_row(self) -> dict[str, str]:
         """The persisted form. Every value is a string: Decimals are stringified
@@ -309,6 +316,7 @@ class RiskState:
             "hwm_rebase_json": self.hwm_rebase_json or "",
             "processed_flow_refids": self.processed_flow_refids or "",
             "flow_watermark_ms": self.flow_watermark_ms or "",
+            "ledger_blind": self.ledger_blind or "",
         }
 
     @classmethod
@@ -326,6 +334,7 @@ class RiskState:
             hwm_rebase_json=str(row.get("hwm_rebase_json") or ""),
             processed_flow_refids=str(row.get("processed_flow_refids") or ""),
             flow_watermark_ms=str(row.get("flow_watermark_ms") or ""),
+            ledger_blind=str(row.get("ledger_blind") or ""),
         )
 
 
@@ -474,8 +483,9 @@ def fold_external_cash_flows(
     ``day_starts_at is None`` shifts both, which is the intraday case when the
     caller has not named a boundary.
 
-    A flow that would make a baseline it touches non-positive is skipped and
-    named in the detail string. It is not recorded as processed. Returns
+    A flow that would make a baseline it touches non-positive is not applied.
+    Its refid is still recorded, so the same row cannot be retried into a
+    zeroed mark. Returns
     ``(high_water, day_open, rebase_json, processed_json, detail)``.
     """
     processed = _parse_refids(processed_json)
@@ -495,6 +505,8 @@ def fold_external_cash_flows(
                 f"non-positive (high_water {new_hw}, day_open {new_open}); "
                 "high-water mark not adjusted for this flow"
             )
+            seen.add(refid)
+            processed.append(refid)
             continue
         rebase_json = _append_hwm_audit(rebase_json, {
             "at": flow.at.astimezone(dt.timezone.utc).isoformat(),
@@ -722,6 +734,10 @@ class RiskCircuit:
             day_open = equity if state.day_key != day_key else adjusted_open
             rebase_json = flow_rebase
 
+        if self._cash_flows is None:
+            blind_flag = "" if state is None else (state.ledger_blind or "")
+        else:
+            blind_flag = "1" if ledger_blind else "0"
         new_state = RiskState(
             mode=self._mode,
             asset_class=asset_class,
@@ -733,6 +749,7 @@ class RiskCircuit:
             hwm_rebase_json=rebase_json,
             processed_flow_refids=processed_json,
             flow_watermark_ms=watermark,
+            ledger_blind=blind_flag,
         )
         # Deliberately unguarded: a failed write must reach the order path, not
         # be smoothed into a decision that looks persisted but is not.
@@ -913,7 +930,10 @@ def _judge(profile: AssetClassProfile, limits: RiskLimits,
         # yesterday's baseline reports the loss instead of hiding it behind an
         # unusable denominator. read() is pure, so this roll is computed, not
         # persisted; advance() persists the same roll on the order path.
-        rolled = state.day_key != today and equity > ZERO
+        # A ledger outage freezes day_key on purpose. Rolling that frozen key
+        # onto current equity would report the overnight loss as zero.
+        blind = state.ledger_blind == "1"
+        rolled = state.day_key != today and equity > ZERO and not blind
         day_open = equity if rolled else state.day_open_equity
         origin = (
             f"day rolled to {today}, baseline reset"
@@ -937,10 +957,18 @@ def _judge(profile: AssetClassProfile, limits: RiskLimits,
     action = _worse(dd_action, dl_action)
 
     driver = "drawdown" if _SEVERITY[dd_action] >= _SEVERITY[dl_action] else "daily loss"
+    # An unreadable ledger is not a flat book. OK and reduce would open
+    # risk on cash the cursor has not named. A real breach still wins, so
+    # an 11% daily loss stays a flatten rather than a pause.
+    ledger_closed = state is not None and state.ledger_blind == "1"
+    if ledger_closed and action in _ENTRY_ACTIONS:
+        action = CircuitAction.PAUSE
     reason = (
         f"{action.value}: drawdown {_as_pct(drawdown)} of high-water {high_water}, "
         f"daily loss {_as_pct(daily_loss)} ({origin}); driven by {driver}"
     )
+    if ledger_closed:
+        reason = f"ledger_blind: {reason}"
     multiplier = (
         ONE if action is CircuitAction.OK
         else limits.reduce_size_multiplier if action is CircuitAction.REDUCE

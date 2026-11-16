@@ -139,8 +139,27 @@ def _ledger_label(value: Any) -> str:
     return str(value or "").lower().replace("-", "").replace("_", "").replace(" ", "")
 
 
-def _is_derivatives_ledger(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
-    labels = (
+# Ledger types that are fills or funding, not external cash. Anything else
+# that is not a deposit, withdrawal, or transfer is ignored. A cash type we
+# cannot price is a reject, not an ignore.
+_NON_CASH_LEDGER_TYPES = frozenset({
+    "trade", "margin", "rollover", "spend", "receive", "settled",
+    "adjustment", "staking", "sale", "dividend", "credit", "fee",
+    "rebate", "nfttrade", "nftcreatorfee", "nftrebate",
+})
+
+
+class UnpricedCashFlow(RuntimeError):
+    """A cash movement the high-water mark must not step past.
+
+    Raised instead of skipping the row. The caller holds the watermark and
+    closes entries. The message starts with ``unpriced_cash_flow`` so the
+    halt is visible on the decision.
+    """
+
+
+def _ledger_labels(entry: Mapping[str, Any], info: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = (
         entry.get("type"),
         entry.get("account"),
         info.get("type"),
@@ -148,7 +167,12 @@ def _is_derivatives_ledger(entry: Mapping[str, Any], info: Mapping[str, Any]) ->
         info.get("wallet"),
         info.get("aclass"),
     )
-    return any(_ledger_label(label).startswith("derivatives") for label in labels)
+    return tuple(_ledger_label(label) for label in raw if label)
+
+
+def _is_derivatives_ledger(entry: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
+    """True when any ledger label contains ``derivatives``, not only as a prefix."""
+    return any("derivatives" in label for label in _ledger_labels(entry, info))
 
 
 def _ledger_type(entry: Mapping[str, Any], info: Mapping[str, Any]) -> str:
@@ -205,42 +229,68 @@ def _signed_flow_amount(entry: Mapping[str, Any], info: Mapping[str, Any],
     return None
 
 
-def parse_spot_cash_flow(entry: Mapping[str, Any]) -> Optional[ExternalCashFlow]:
-    """One ccxt ledger row as a spot cash flow, or None when it is not one.
+def classify_ledger_row(
+    entry: Mapping[str, Any],
+) -> tuple[str, Optional[ExternalCashFlow]]:
+    """``ignore``, ``flow``, or ``reject``.
 
-    Kept: deposit, withdrawal, transfer, in a face-value stable. Dropped:
-    trades, and any ledger type, subtype, wallet or account whose name starts
-    with ``derivatives`` (manual Kraken Futures, outside this book). A
-    pending or cancelled row is not a flow yet.
+    ``reject`` is a deposit, withdrawal, or transfer we cannot value in the
+    equity currency, or a row that is not a ledger object at all. The cursor
+    must stop on it. Trades and derivatives positions are ``ignore``.
     """
     if not isinstance(entry, Mapping):
-        return None
+        return "reject", None
     info = entry.get("info")
     if not isinstance(info, Mapping):
         info = {}
     if _is_derivatives_ledger(entry, info):
-        return None
+        return "ignore", None
     kind = _ledger_type(entry, info)
+    if kind in _NON_CASH_LEDGER_TYPES:
+        return "ignore", None
     if kind not in _CASH_FLOW_TYPES:
-        return None
+        # No type at all is not a row we can prove is harmless.
+        if not kind:
+            return "reject", None
+        return "ignore", None
     status = str(entry.get("status") or info.get("status") or "ok").lower()
     if status in _SKIPPED_LEDGER_STATUS:
-        return None
+        return "ignore", None
     asset = str(entry.get("currency") or info.get("asset") or "").upper()
-    if asset not in STABLE_FACE_VALUE:
-        return None
     amount = _signed_flow_amount(entry, info, kind)
-    if amount is None or amount == 0:
-        return None
     at = _ledger_timestamp(entry)
-    if at is None:
-        return None
     refid = str(
         info.get("refid") or entry.get("id") or entry.get("referenceId") or ""
     ).strip()
-    if not refid:
-        return None
-    return ExternalCashFlow(refid=refid, asset=asset, amount=amount, at=at)
+    if asset not in STABLE_FACE_VALUE or amount is None or amount == 0 or at is None or not refid:
+        return "reject", None
+    return "flow", ExternalCashFlow(refid=refid, asset=asset, amount=amount, at=at)
+
+
+def parse_spot_cash_flow(entry: Mapping[str, Any]) -> Optional[ExternalCashFlow]:
+    """One ccxt ledger row as a spot cash flow, or None when it is not applied.
+
+    Kept: deposit, withdrawal, transfer, in a face-value stable. Dropped:
+    trades, and any label containing ``derivatives`` (manual Kraken Futures,
+    outside this book), not only those that start with that word. A pending
+    or cancelled row is not a flow yet. A cash row that cannot be priced is
+    not returned here; ``classify_ledger_row`` reports it as ``reject`` so
+    the cursor does not walk past it.
+    """
+    kind, flow = classify_ledger_row(entry)
+    if kind == "flow":
+        return flow
+    return None
+
+
+def _reject_unpriced(rows: Sequence[Any]) -> None:
+    for row in rows:
+        kind, _flow = classify_ledger_row(row)
+        if kind == "reject":
+            shown = repr(row)
+            if len(shown) > 180:
+                shown = shown[:180] + "..."
+            raise UnpricedCashFlow(f"unpriced_cash_flow: {shown}")
 
 
 def _ledger_time_ms(entry: Mapping[str, Any]) -> Optional[int]:
@@ -2052,6 +2102,7 @@ class KrakenAdapter:
         """
         if since_ms is None:
             rows = self._ledger_page(None, 0)
+            _reject_unpriced(rows)
             newest = _newest_ms(rows)
             if newest is None:
                 newest = int(self._now().timestamp() * 1000)
@@ -2092,6 +2143,7 @@ class KrakenAdapter:
             if times:
                 page_newest = max(times)
                 newest = page_newest if newest is None else max(newest, page_newest)
+            _reject_unpriced(rows)
             for row in rows:
                 if not isinstance(row, Mapping):
                     continue

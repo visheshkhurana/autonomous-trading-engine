@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import sqlite3
 import sys
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Sequence
@@ -46,8 +47,13 @@ from core.profiles import profile_for
 from core.risk import (
     ExternalCashFlow, RiskState, fold_external_cash_flows, start_of_day_key,
 )
+from core.safety import ENTRY_HEARTBEAT_MAX_AGE_S
 from core.store import SQLitePositionStore
 from core.types import AssetClass, Mode
+
+# Same scope the engine stamps. Duplicated so this command does not import
+# the API process.
+_ENGINE_SCOPE = "__engine__"
 
 UTC = dt.timezone.utc
 
@@ -137,6 +143,65 @@ def _parse_ids(raw: str) -> set[str]:
     return {str(item) for item in parsed}
 
 
+def refuse_if_engine_live(path: str, now: dt.datetime) -> Optional[str]:
+    """Why this command must not write, or None when the engine is stopped.
+
+    A fresh ``heartbeat_at`` on the engine control row means a tick is still
+    landing. A database lock means another process is in a write. Either one
+    refuses the backfill. A missing heartbeat, or one older than the entry
+    stale threshold, is a stopped engine.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    conn = sqlite3.connect(path, timeout=0.5, isolation_level=None)
+    try:
+        conn.execute("PRAGMA busy_timeout=500")
+        try:
+            conn.execute("BEGIN EXCLUSIVE")
+        except sqlite3.OperationalError as exc:
+            return f"engine database lock: {exc}"
+        try:
+            return _heartbeat_refusal(conn, now)
+        finally:
+            conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+
+
+def _heartbeat_refusal(conn: sqlite3.Connection, now: dt.datetime) -> Optional[str]:
+    try:
+        row = conn.execute(
+            "SELECT state_json FROM engine_control WHERE scope=?",
+            (_ENGINE_SCOPE,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None or not row[0]:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except json.JSONDecodeError:
+        return "engine control row is unreadable; refusing to backfill"
+    if not isinstance(payload, dict):
+        return "engine control row is unreadable; refusing to backfill"
+    raw = payload.get("heartbeat_at")
+    if not raw:
+        return None
+    try:
+        beat = dt.datetime.fromisoformat(str(raw))
+    except ValueError:
+        return f"engine heartbeat {raw!r} is unreadable; refusing to backfill"
+    if beat.tzinfo is None or beat.utcoffset() is None:
+        return "engine heartbeat is not timezone-aware; refusing to backfill"
+    age = (now - beat.astimezone(UTC)).total_seconds()
+    if age <= ENTRY_HEARTBEAT_MAX_AGE_S:
+        return (
+            f"engine heartbeat is {age:.0f}s old; stop the engine before "
+            "applying cash-flow backfill"
+        )
+    return None
+
+
 def _parse_at(text: str) -> dt.datetime:
     parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
     if parsed.tzinfo is None or parsed.utcoffset() is None:
@@ -190,6 +255,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ))
     if not flows:
         parser.error("pass --apply-known-2026-11-14 or an explicit --refid flow")
+
+    refusal = refuse_if_engine_live(args.db, dt.datetime.now(UTC))
+    if refusal is not None:
+        print(f"not applied: {refusal}", file=sys.stderr)
+        return 1
 
     store = SQLitePositionStore(args.db)
     try:

@@ -211,6 +211,45 @@ def test_a_blind_tick_does_not_open_the_new_day_on_unreconciled_equity():
     assert recovered.daily_loss_pct == D("0")
 
 
+def test_a_frozen_day_keeps_an_eleven_percent_loss_as_a_flatten():
+    """UTC midnight must not zero daily loss while the ledger is blind.
+
+    Crypto flattens at 8% daily loss. 11% against the last certified open is
+    a flatten. Resetting that open to the post-loss equity reports a reduce
+    and leaves entries open.
+    """
+    store = FakeStore(state_at(
+        "10000", day_key="2026-11-15", asset_class=AssetClass.CRYPTO,
+    ))
+    later = dt.datetime(2026, 11, 16, 0, 30, tzinfo=UTC)
+    source = ScriptedLedger([RuntimeError("midnight outage")])
+    wired = RiskCircuit(store, Mode.LIVE, clock=lambda: later, cash_flows=source)
+    equity = D("8900")
+    decision = wired.advance(AssetClass.CRYPTO, equity)
+    assert store.writes[-1].day_key == "2026-11-15"
+    assert store.writes[-1].day_open_equity == D("10000")
+    assert decision.daily_loss_pct == D("0.11")
+    assert decision.must_flatten is True
+    assert decision.entries_allowed is False
+    again = wired.read(AssetClass.CRYPTO, equity)
+    assert again.daily_loss_pct == D("0.11")
+    assert again.must_flatten is True
+    assert again.entries_allowed is False
+
+
+def test_a_flow_that_would_wipe_the_baseline_is_remembered():
+    store = FakeStore(state_at("100"))
+    wipe = flow("wipe", "-500")
+    source = ScriptedLedger([([wipe], 1), ([wipe], 2)])
+    wired = RiskCircuit(store, Mode.LIVE, clock=lambda: NOW, cash_flows=source)
+    wired.advance(AssetClass.EQUITY, D("100"))
+    assert store.writes[-1].high_water == D("100")
+    assert json.loads(store.writes[-1].processed_flow_refids) == ["wipe"]
+    wired.advance(AssetClass.EQUITY, D("100"))
+    assert store.writes[-1].high_water == D("100")
+    assert json.loads(store.writes[-1].processed_flow_refids) == ["wipe"]
+
+
 def test_ledger_read_failure_leaves_the_high_water_mark_unchanged():
     store = FakeStore(state_at("10000"))
     wired, _source = _wired(store, [RuntimeError("ledger timeout")])
@@ -304,6 +343,62 @@ def test_backfill_command_applies_the_known_withdrawals_once(tmp_path, capsys):
     assert [item["amount"] for item in audit] == ["-10", "-4430"]
     # The second invocation found the refids and did not shift again.
     assert row.high_water == D("10029.879350497385")
+
+
+def test_backfill_refuses_a_live_engine(tmp_path, capsys):
+    """A fresh heartbeat or a held database lock means the engine is not stopped."""
+    import sqlite3
+
+    from api.server import ENGINE_SCOPE, SqliteControlStore
+
+    path = str(tmp_path / "live.db")
+    store = SQLitePositionStore(path)
+    try:
+        store.write_risk_state(Mode.LIVE, AssetClass.CRYPTO, state_at(
+            "10000", asset_class=AssetClass.CRYPTO, mode=Mode.LIVE,
+        ).as_row())
+    finally:
+        store.close()
+    args = [
+        "--db", path, "--mode", "live", "--asset-class", "crypto",
+        "--apply-known-2026-11-14",
+    ]
+    holder = sqlite3.connect(path, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        locked = main(args)
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert locked == 1
+    locked_err = capsys.readouterr().err
+    assert "lock" in locked_err
+
+    now = dt.datetime.now(UTC)
+    control = SqliteControlStore(path)
+    try:
+        control.write(ENGINE_SCOPE, {
+            "paused": "0",
+            "heartbeat_at": now.isoformat(),
+        })
+        fresh = main(args)
+        fresh_err = capsys.readouterr().err
+        control.write(ENGINE_SCOPE, {
+            "paused": "0",
+            "heartbeat_at": (now - dt.timedelta(hours=2)).isoformat(),
+        })
+    finally:
+        control.close()
+    assert fresh == 1
+    assert "heartbeat" in fresh_err
+    applied = main(args)
+    assert applied == 0
+    check = SQLitePositionStore(path)
+    try:
+        row = RiskState.from_row(check.read_risk_state(Mode.LIVE, AssetClass.CRYPTO))
+    finally:
+        check.close()
+    assert row.high_water == D("10000") - D("4440")
 
 
 def test_backfill_refuses_to_invent_a_baseline(tmp_path):

@@ -229,6 +229,46 @@ def test_parse_spot_cash_flow_keeps_spot_stables_and_drops_derivatives():
     assert parse_spot_cash_flow(_ledger_row(
         "btc-in", "deposit", "0.01", stamp, asset="BTC", info_amount="0.01",
     )) is None
+    from adapters.kraken import classify_ledger_row
+    assert classify_ledger_row(_ledger_row(
+        "d-mid", "transfer", "-1", stamp,
+        info_type="spot-to-derivatives", info_amount="-1",
+    ))[0] == "ignore"
+
+
+def test_a_btc_deposit_holds_the_watermark_and_blocks_entries():
+    """A non-stable deposit must not be skipped and then booked as a new high."""
+    from core.risk import RiskCircuit
+    from tests.test_risk import NOW as RISK_NOW
+    from tests.test_risk import FakeStore, state_at
+
+    trade = _ledger_row("trade-1", "trade", "-3", 1_000_000, info_amount="-3")
+    btc = _ledger_row(
+        "btc-in", "deposit", "0.01", 2_000_000, asset="BTC", info_amount="0.01",
+    )
+
+    class _Pages(FakeExchange):
+        def fetch_ledger(self, code=None, since=None, limit=None, params=None):
+            if since is None:
+                return [trade]
+            return [btc]
+
+    book = adapter(_Pages())
+    store = FakeStore(state_at("10000", asset_class=AssetClass.CRYPTO))
+    wired = RiskCircuit(
+        store, Mode.LIVE, clock=lambda: RISK_NOW, cash_flows=book,
+    )
+    first = wired.advance(AssetClass.CRYPTO, D("10000"))
+    assert first.entries_allowed is True
+    watermark = store.writes[-1].flow_watermark_ms
+    assert watermark == "1000001"
+    blocked = wired.advance(AssetClass.CRYPTO, D("15000"))
+    assert blocked.entries_allowed is False
+    assert "unpriced_cash_flow" in blocked.reason
+    assert "ledger_blind" in blocked.reason
+    assert store.writes[-1].high_water == D("10000")
+    assert store.writes[-1].flow_watermark_ms == watermark
+    assert store.writes[-1].ledger_blind == "1"
 
 
 def test_fetch_spot_cash_flows_checkpoints_history_then_returns_new_flows():

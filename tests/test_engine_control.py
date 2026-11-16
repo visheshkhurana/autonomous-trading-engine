@@ -198,6 +198,44 @@ def orders_placed(h: Harness) -> int:
 # pause
 # ==========================================================================
 
+class _LedgerDown:
+    def fetch_spot_cash_flows(self, *, since_ms):
+        raise RuntimeError("flat outage")
+
+
+def test_ledger_outage_blocks_entries_and_still_places_stops_and_exits(harness) -> None:
+    """A flat book with an unreadable ledger is not an open book.
+
+    Entries stop. A resting stop and a reducing exit still go out, because
+    the outage must not trap a position.
+    """
+    h = harness([AlwaysBuys(), AlwaysSells()], MemControl())
+    h.circuit._cash_flows = _LedgerDown()
+    decision = h.circuit.advance(AssetClass.CRYPTO, Decimal("5000000"))
+    assert decision.entries_allowed is False
+    assert decision.reason.startswith("ledger_blind")
+    h.open_long()
+    h.store.set_native_stop(
+        Mode.PAPER, "BTC/USDT", "seller",
+        txid=None, stop_price=Decimal("50000"), stop_qty=Decimal("1"),
+        status="wanted",
+    )
+    placed: list[object] = []
+    original = h.adapter.place_native_stop
+
+    def spy(*args, **kwargs):
+        placed.append(args)
+        return original(*args, **kwargs)
+
+    h.adapter.place_native_stop = spy
+    h.tick()
+    assert h.circuit.read(AssetClass.CRYPTO, Decimal("5000000")).entries_allowed is False
+    assert placed, "a ledger outage must not skip the native stop"
+    orders = list(h.store.orders(Mode.PAPER))
+    assert any(order.intent.side is Side.SELL for order in orders)
+    assert not any(order.intent.side is Side.BUY for order in orders)
+
+
 def test_paused_with_healthy_risk_submits_no_entry(harness) -> None:
     """Pause is the entry gate even when the risk ladder would allow the order."""
     control = MemControl()
