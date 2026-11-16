@@ -418,18 +418,64 @@ def _parse_refids(raw: str) -> list[str]:
     return [str(item) for item in parsed]
 
 
+def start_of_day_key(profile: AssetClassProfile, day_key: str) -> dt.datetime:
+    """UTC instant at which ``profile.day_key`` first returns ``day_key``.
+
+    Bisects ``day_key`` itself, the same way the API finds a daily window,
+    so this module does not keep a second copy of each class's timezone.
+    """
+    try:
+        year_s, month_s, day_s = day_key.split("-")
+        probe = dt.datetime(int(year_s), int(month_s), int(day_s), 12, tzinfo=dt.timezone.utc)
+    except ValueError as exc:
+        raise ValueError(f"day_key {day_key!r} is not a calendar date") from exc
+    if profile.day_key(probe) != day_key:
+        found = None
+        for hours in (6, -6, 18, -18, 30, -30):
+            candidate = probe + dt.timedelta(hours=hours)
+            if profile.day_key(candidate) == day_key:
+                found = candidate
+                break
+        if found is None:
+            raise ValueError(f"no instant near {day_key!r} has that day_key")
+        probe = found
+    lo = probe - dt.timedelta(days=2)
+    if profile.day_key(lo) == day_key:
+        raise ValueError(
+            f"day_key {day_key!r} is unchanged 48h earlier; no daily boundary"
+        )
+    hi = probe
+    while (hi - lo) > dt.timedelta(minutes=1):
+        mid = lo + (hi - lo) / 2
+        if profile.day_key(mid) == day_key:
+            hi = mid
+        else:
+            lo = mid
+    boundary = hi.astimezone(dt.timezone.utc).replace(second=0, microsecond=0)
+    if profile.day_key(boundary) != day_key:
+        raise ValueError(f"day boundary for {day_key!r} is not minute-aligned")
+    return boundary
+
+
 def fold_external_cash_flows(
     high_water: Decimal,
     day_open: Decimal,
     rebase_json: str,
     processed_json: str,
     flows: Sequence[ExternalCashFlow],
+    *,
+    day_starts_at: Optional[dt.datetime] = None,
 ) -> tuple[Decimal, Decimal, str, str, Optional[str]]:
-    """Shift both baselines by each unseen flow. Each refid applies once.
+    """Shift baselines by each unseen flow. Each refid applies once.
 
-    A flow that would make either baseline non-positive is skipped and named
-    in the detail string. It is not recorded as processed, and it does not
-    change the baselines. Returns
+    ``high_water`` always moves by the signed amount. ``day_open`` moves only
+    when the flow is on or after ``day_starts_at``. An earlier flow is already
+    inside the stored opening equity, and shifting it again hides later losses.
+    ``day_starts_at is None`` shifts both, which is the intraday case when the
+    caller has not named a boundary.
+
+    A flow that would make a baseline it touches non-positive is skipped and
+    named in the detail string. It is not recorded as processed. Returns
     ``(high_water, day_open, rebase_json, processed_json, detail)``.
     """
     processed = _parse_refids(processed_json)
@@ -440,8 +486,9 @@ def fold_external_cash_flows(
         refid = flow.refid.strip()
         if refid in seen:
             continue
+        in_this_day = day_starts_at is None or flow.at >= day_starts_at
         new_hw = high_water + flow.amount
-        new_open = day_open + flow.amount
+        new_open = day_open + flow.amount if in_this_day else day_open
         if new_hw <= ZERO or new_open <= ZERO:
             details.append(
                 f"external cash flow {refid} not applied: baseline would be "
@@ -558,12 +605,13 @@ class RiskCircuit:
         rebase by itself.
 
         When a cash-flow source is wired, spot deposits, withdrawals and
-        transfers shift ``high_water`` and ``day_open_equity`` by the signed
-        flow before that max(). The equity number already includes the cash,
-        so the shift keeps the cash out of P&L. Each ledger refid is stored
-        on the risk row and applied once, including across a restart. A
-        ledger read that raises leaves the previous mark alone and appends
-        the failure to the decision reason.
+        transfers shift ``high_water`` by the signed flow before that max().
+        ``day_open_equity`` moves only for a flow inside the stored day; an
+        earlier flow is already in that open. Each ledger refid is stored on
+        the risk row and applied once, including across a restart. A ledger
+        read that raises leaves both baselines and the day key where they
+        were: adopting the new equity as a high would book a deposit twice
+        when the ledger recovers. The failure is appended to the reason.
         """
         now = self._now()
         limits = self.limits_for(asset_class)
@@ -613,16 +661,29 @@ class RiskCircuit:
         flow_rebase = "" if state is None else (state.hwm_rebase_json or "")
         adjusted_hw = None if state is None else state.high_water
         adjusted_open = None if state is None else state.day_open_equity
-        flow_detail = self._fold_cash_flows(
+        day_starts = None if state is None else start_of_day_key(profile, state.day_key)
+        folded = self._fold_cash_flows(
             state, processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open,
+            day_starts,
         )
-        processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open, flow_detail = flow_detail
+        (processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open,
+         flow_detail, ledger_blind) = folded
 
         rebase_json = ""
+        stored_day = day_key
         if state is None:
             high_water = equity
             day_open = equity
             rebase_json = flow_rebase
+        elif ledger_blind:
+            # The equity may already contain a deposit the ledger has not
+            # named. Raising the mark here, or opening the new day at that
+            # equity, makes the same cash count again when the read returns.
+            high_water = state.high_water
+            day_open = state.day_open_equity
+            stored_day = state.day_key
+            basis = state.equity_basis or _BASIS_FULL
+            rebase_json = state.hwm_rebase_json
         elif state.equity_basis != basis:
             # Off→on and on→off both rebase. The equity number changed
             # because the reserve was added or removed, not because the
@@ -656,7 +717,8 @@ class RiskCircuit:
             high_water = adjusted_hw if adjusted_hw > equity else equity
             # state.day_key <= day_key here, so this only ever rolls forward.
             # An intraday flow has already moved adjusted_open. A new day
-            # opens at the equity just observed, which already includes it.
+            # opens at the equity just observed, which already includes any
+            # flow from before this boundary.
             day_open = equity if state.day_key != day_key else adjusted_open
             rebase_json = flow_rebase
 
@@ -664,7 +726,7 @@ class RiskCircuit:
             mode=self._mode,
             asset_class=asset_class,
             high_water=high_water,
-            day_key=day_key,
+            day_key=stored_day,
             day_open_equity=day_open,
             updated_at=now,
             equity_basis=basis,
@@ -688,7 +750,8 @@ class RiskCircuit:
         flow_rebase: str,
         adjusted_hw: Optional[Decimal],
         adjusted_open: Optional[Decimal],
-    ) -> tuple[str, str, str, Optional[Decimal], Optional[Decimal], Optional[str]]:
+        day_starts: Optional[dt.datetime],
+    ) -> tuple[str, str, str, Optional[Decimal], Optional[Decimal], Optional[str], bool]:
         """Apply the ledger page, or keep the stored baselines on a bad read.
 
         The first time a book has no watermark, the source is asked with
@@ -698,9 +761,13 @@ class RiskCircuit:
         against an existing baseline are applied. Flows returned before any
         baseline exists are recorded as seen and not added on top of the
         equity that is about to become the baseline.
+
+        The last element is True when the ledger could not be read. The
+        caller must not adopt the current equity as a new high in that case.
         """
         if self._cash_flows is None:
-            return processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open, None
+            return (processed_json, watermark, flow_rebase, adjusted_hw,
+                    adjusted_open, None, False)
         since = int(watermark) if watermark else None
         try:
             flows, new_wm = self._cash_flows.fetch_spot_cash_flows(since_ms=since)
@@ -708,19 +775,20 @@ class RiskCircuit:
             LOG.error("risk cash-flow ledger read failed: %s", type(exc).__name__)
             return (
                 processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open,
-                _ledger_failure_detail(exc),
+                _ledger_failure_detail(exc), True,
             )
         if not isinstance(flows, (list, tuple)):
             return (
                 processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open,
                 "external cash-flow ledger unreadable: malformed page; "
-                "high-water mark not adjusted",
+                "high-water mark not adjusted", True,
             )
         detail = None
         if state is not None and adjusted_hw is not None and adjusted_open is not None:
             adjusted_hw, adjusted_open, flow_rebase, processed_json, detail = (
                 fold_external_cash_flows(
                     adjusted_hw, adjusted_open, flow_rebase, processed_json, flows,
+                    day_starts_at=day_starts,
                 )
             )
         else:
@@ -735,7 +803,8 @@ class RiskCircuit:
                 processed_json = json.dumps(have)
         if new_wm is not None:
             watermark = str(int(new_wm))
-        return processed_json, watermark, flow_rebase, adjusted_hw, adjusted_open, detail
+        return (processed_json, watermark, flow_rebase, adjusted_hw,
+                adjusted_open, detail, False)
 
     # -------------------------------------------------------------- internals
 

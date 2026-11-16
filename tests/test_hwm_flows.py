@@ -142,6 +142,75 @@ def test_restart_mid_sequence_applies_each_flow_once():
     assert source.since == [None, 30]
 
 
+def test_a_flow_before_the_stored_day_does_not_move_day_open():
+    """The 16 Nov open already includes the 14 Nov withdrawals."""
+    store = FakeStore(state_at(
+        "14469.879350497385", day_open="9995.236160936496",
+        day_key="2026-11-16", asset_class=AssetClass.CRYPTO,
+    ))
+    withdrawn = dt.datetime(2026, 11, 14, 18, 20, 28, tzinfo=UTC)
+    clock_at = dt.datetime(2026, 11, 16, 1, 0, tzinfo=UTC)
+    source = ScriptedLedger([([flow("old", "-4440", at=withdrawn)], 1)])
+    wired = RiskCircuit(store, Mode.LIVE, clock=lambda: clock_at, cash_flows=source)
+    equity = D("9992.67")
+    decision = wired.advance(AssetClass.CRYPTO, equity)
+    written = store.writes[-1]
+    assert written.high_water == D("14469.879350497385") - D("4440")
+    assert written.day_open_equity == D("9995.236160936496")
+    assert decision.drawdown_pct == (written.high_water - equity) / written.high_water
+    assert decision.daily_loss_pct == (D("9995.236160936496") - equity) / D("9995.236160936496")
+
+
+def test_a_deposit_during_a_ledger_outage_is_applied_once():
+    store = FakeStore(state_at("10000"))
+    source = ScriptedLedger([
+        ([], 1000),
+        RuntimeError("ledger timeout"),
+        ([flow("dep", "2000")], 2000),
+    ])
+    wired = RiskCircuit(store, Mode.LIVE, clock=lambda: NOW, cash_flows=source)
+    wired.advance(AssetClass.EQUITY, D("10000"))
+    blind = wired.advance(AssetClass.EQUITY, D("12000"))
+    assert store.writes[-1].high_water == D("10000")
+    assert store.writes[-1].day_open_equity == D("10000")
+    assert "high-water mark not adjusted" in blind.reason
+    recovered = wired.advance(AssetClass.EQUITY, D("12000"))
+    assert store.writes[-1].high_water == D("12000")
+    assert store.writes[-1].day_open_equity == D("12000")
+    assert recovered.drawdown_pct == D("0")
+    assert recovered.daily_loss_pct == D("0")
+
+
+def test_a_blind_tick_does_not_open_the_new_day_on_unreconciled_equity():
+    store = FakeStore(state_at("10000", day_key="2026-08-27"))
+    # 19:00 UTC is 00:30 IST the next session, so the equity day has rolled.
+    nxt = dt.datetime(2026, 8, 27, 19, 0, tzinfo=UTC)
+    clock = {"at": NOW}
+
+    def now() -> dt.datetime:
+        return clock["at"]
+
+    source = ScriptedLedger([
+        ([], 1),
+        RuntimeError("down"),
+        ([flow("dep", "2000", at=nxt)], 2),
+    ])
+    wired = RiskCircuit(store, Mode.LIVE, clock=now, cash_flows=source)
+    wired.advance(AssetClass.EQUITY, D("10000"))
+    clock["at"] = nxt
+    wired.advance(AssetClass.EQUITY, D("12000"))
+    frozen = store.writes[-1]
+    assert frozen.day_key == "2026-08-27"
+    assert frozen.high_water == D("10000")
+    assert frozen.day_open_equity == D("10000")
+    recovered = wired.advance(AssetClass.EQUITY, D("12000"))
+    assert store.writes[-1].day_key == "2026-08-28"
+    assert store.writes[-1].high_water == D("12000")
+    assert store.writes[-1].day_open_equity == D("12000")
+    assert recovered.drawdown_pct == D("0")
+    assert recovered.daily_loss_pct == D("0")
+
+
 def test_ledger_read_failure_leaves_the_high_water_mark_unchanged():
     store = FakeStore(state_at("10000"))
     wired, _source = _wired(store, [RuntimeError("ledger timeout")])
@@ -223,9 +292,11 @@ def test_backfill_command_applies_the_known_withdrawals_once(tmp_path, capsys):
     finally:
         check.close()
     assert row.high_water == D("14469.879350497385") - D("4440")
-    assert row.day_open_equity == D("9995.236160936496") - D("4440")
+    # 16 Nov already opened after those withdrawals. The day's open stays.
+    assert row.day_open_equity == D("9995.236160936496")
     audit = [item for item in json.loads(row.hwm_rebase_json)
              if item.get("reason") == "external_cash_flow"]
+    assert all(item["old_day_open"] == item["new_day_open"] for item in audit)
     assert [item["refid"] for item in audit] == [
         "FTGEVAr-syDy6EaOEIqh66t8bwUHlx",
         "FTPJF3S-WqybEyMe4YF7HfFlQZ87uD",

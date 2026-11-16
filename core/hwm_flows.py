@@ -11,6 +11,10 @@ It is not imported by the engine, the runner, or boot. Do not schedule it.
 Stop the engine first so a tick cannot overwrite ``risk_state`` after this
 process reads it.
 
+The high-water mark moves by the signed amount. The day's opening equity
+moves only when the flow falls inside the stored day. The 14 Nov withdrawals
+are before the 16 Nov open, so they move the mark and leave that open as it is.
+
 The 14 Nov 2026 USDT withdrawals::
 
     python3 -m core.hwm_flows --db "$TRADER_DB" --mode live --asset-class crypto \\
@@ -38,7 +42,10 @@ import sys
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Sequence
 
-from core.risk import ExternalCashFlow, RiskState, fold_external_cash_flows
+from core.profiles import profile_for
+from core.risk import (
+    ExternalCashFlow, RiskState, fold_external_cash_flows, start_of_day_key,
+)
 from core.store import SQLitePositionStore
 from core.types import AssetClass, Mode
 
@@ -87,12 +94,16 @@ def apply_external_flows(
         )
     state = RiskState.from_row(row)
     before = _parse_ids(state.processed_flow_refids)
+    # The stored day's open already includes cash from before that day.
+    # The 14 Nov withdrawals land on a 16 Nov baseline that way: they move
+    # the high-water mark and leave day_open alone.
     high_water, day_open, rebase, processed, detail = fold_external_cash_flows(
         state.high_water,
         state.day_open_equity,
         state.hwm_rebase_json,
         state.processed_flow_refids or "[]",
         flows,
+        day_starts_at=start_of_day_key(profile_for(asset_class), state.day_key),
     )
     applied = [refid for refid in _parse_ids(processed) if refid not in before]
     updated = RiskState(
